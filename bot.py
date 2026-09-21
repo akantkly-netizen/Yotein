@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import asyncio
 import logging
 import uuid
@@ -8,6 +9,8 @@ import glob
 import time
 import shutil
 import concurrent.futures
+import urllib.parse
+import urllib.request
 from typing import Dict, Any, Optional, List, Tuple
 
 import yt_dlp
@@ -27,6 +30,7 @@ from telegram.ext import (
     filters,
 )
 
+# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -37,14 +41,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DOWNLOAD_DIR = "temp_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 
+# Spotify Client Credentials (Optional via env or fallback to public token generator)
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
 
 def setup_cookies_file() -> Optional[str]:
-    """Prepares and validates Instagram cookie file to bypass IP bans."""
+    """Prepares and validates Instagram cookie file to bypass IP bans and rate limits."""
     cookies_env = os.getenv("INSTAGRAM_COOKIES")
     cookie_path = "cookies.txt"
 
@@ -63,13 +71,13 @@ def setup_cookies_file() -> Optional[str]:
 
 
 def cleanup_temp_files():
-    """Removes old temporary downloaded files to prevent disk overload."""
+    """Removes old temporary downloaded files to prevent disk overload on Railway."""
     now = time.time()
     try:
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
             if os.path.isfile(filepath):
-                # Delete files older than 30 minutes
-                if now - os.path.getmtime(filepath) > 1800:
+                # Delete files older than 20 minutes
+                if now - os.path.getmtime(filepath) > 1200:
                     try:
                         os.remove(filepath)
                     except Exception:
@@ -96,7 +104,7 @@ def is_instagram_url(url: str) -> bool:
 
 
 def clean_instagram_url(url: str) -> str:
-    """Extracts the base clean Instagram post URL without tracking query parameters."""
+    """Extracts clean Instagram post URL without tracking query parameters."""
     match = re.search(r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|reels|stories)/[A-Za-z0-9_-]+)", url)
     if match:
         return match.group(1) + "/"
@@ -132,7 +140,6 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
         if match:
             found = match.group(1).strip()
             if len(found) > 2:
-                # Splitting title and artist if dash exists
                 if "-" in found:
                     parts = found.split("-", 1)
                     return parts[0].strip(), parts[1].strip()
@@ -141,7 +148,6 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
                     return parts[0].strip(), parts[1].strip()
                 return found, ""
 
-    # Fallback to first non-empty line of caption
     lines = [line.strip() for line in caption.split('\n') if line.strip() and not line.startswith('#') and not line.startswith('@')]
     if lines:
         first_line = lines[0]
@@ -155,12 +161,83 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
 def format_size(bytes_size: Optional[int]) -> str:
     """Formats raw bytes size into MB / KB readable strings."""
     if not bytes_size or bytes_size <= 0:
-        return "تخپینی"
+        return "تخمینی"
     mb = bytes_size / (1024 * 1024)
     if mb >= 1.0:
         return f"{mb:.1f} MB"
     kb = bytes_size / 1024
     return f"{int(kb)} KB"
+
+
+# --- SPOTIFY SEARCH ENGINE MODULE ---
+
+def get_spotify_token() -> Optional[str]:
+    """Retrieves access token for Spotify API."""
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+        try:
+            url = "https://accounts.spotify.com/api/token"
+            data = urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8')
+            req = urllib.request.Request(url, data=data, method='POST')
+            import base64
+            auth_header = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')).decode('utf-8')
+            req.add_header("Authorization", f"Basic {auth_header}")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res_data = json.loads(response.read().decode())
+                return res_data.get('access_token')
+        except Exception as ex:
+            logger.debug(f"Failed Spotify credentials auth: {ex}")
+
+    # Fallback to Spotify open web token generator
+    try:
+        req = urllib.request.Request("https://open.spotify.com/get_access_token", headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode())
+            return res_data.get('accessToken')
+    except Exception as ex:
+        logger.debug(f"Failed open Spotify token fetch: {ex}")
+        return None
+
+
+def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
+    """Searches Spotify database to match official track title, artist, and album details."""
+    clean_q = clean_music_query(query)
+    if not clean_q or len(clean_q) < 3:
+        return None
+
+    token = get_spotify_token()
+    if not token:
+        return None
+
+    try:
+        encoded_q = urllib.parse.quote(clean_q)
+        url = f"https://api.spotify.com/v1/search?q={encoded_q}&type=track&limit=1"
+        req = urllib.request.Request(url, headers={
+            'Authorization': f'Bearer {token}',
+            'User-Agent': 'Mozilla/5.0'
+        })
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode())
+            items = data.get('tracks', {}).get('items', [])
+            if items:
+                track = items[0]
+                track_name = track.get('name', '')
+                artists = [a.get('name', '') for a in track.get('artists', [])]
+                artist_name = ", ".join(artists) if artists else ""
+                album_name = track.get('album', {}).get('name', '')
+                spotify_url = track.get('external_urls', {}).get('spotify', '')
+                
+                logger.info(f"Spotify Matched: {artist_name} - {track_name}")
+                return {
+                    'title': track_name,
+                    'artist': artist_name,
+                    'album': album_name,
+                    'spotify_url': spotify_url
+                }
+    except Exception as e:
+        logger.debug(f"Spotify search failed for '{clean_q}': {e}")
+
+    return None
 
 
 async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
@@ -182,7 +259,7 @@ async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
             'no_warnings': True,
             'extract_flat': False,
             'nocheckcertificate': True,
-            'concurrent_fragment_downloads': 10,
+            'concurrent_fragment_downloads': 12,
             'http_headers': {
                 'User-Agent': agent,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -223,7 +300,7 @@ async def download_instagram_video(url: str, format_id: str, output_prefix: str)
         'no_warnings': True,
         'merge_output_format': 'mp4',
         'nocheckcertificate': True,
-        'concurrent_fragment_downloads': 10,
+        'concurrent_fragment_downloads': 12,
         'buffersize': 2048 * 1024,
     }
 
@@ -256,7 +333,7 @@ async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
-        'concurrent_fragment_downloads': 10,
+        'concurrent_fragment_downloads': 12,
         'nocheckcertificate': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -286,15 +363,28 @@ async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -
 
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, output_prefix: str) -> Optional[Dict[str, Any]]:
-    """Performs deep 6-stage search on YouTube Music & Google to find full original HQ track."""
+    """Performs deep 8-stage Spotify + YouTube Music + Google search pipeline to find full original HQ track."""
     queries_to_try = []
 
     clean_t = clean_music_query(track_title)
     clean_a = clean_music_query(artist_name)
     extracted_title, extracted_artist = extract_music_info_from_caption(caption)
 
+    # STEP 1: Query Spotify Database for exact official Track & Artist match
+    spotify_match = None
+    search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_artist} {extracted_title}".strip() or clean_music_query(caption[:100])
+
+    if search_seed:
+        spotify_match = search_spotify_track(search_seed)
+
+    if spotify_match:
+        sp_title = spotify_match['title']
+        sp_artist = spotify_match['artist']
+        queries_to_try.append(f"{sp_artist} {sp_title} official audio song")
+        queries_to_try.append(f"{sp_artist} {sp_title} full audio")
+
     if clean_a and clean_t:
-        queries_to_try.append(f"{clean_a} {clean_t} full audio song")
+        queries_to_try.append(f"{clean_a} {clean_t} full song audio")
         queries_to_try.append(f"{clean_a} {clean_t}")
     if clean_t:
         queries_to_try.append(f"{clean_t} official audio song")
@@ -303,10 +393,10 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     if extracted_title:
         q_ext = clean_music_query(f"{extracted_artist} {extracted_title}")
         if q_ext and q_ext not in queries_to_try:
-            queries_to_try.append(f"{q_ext} official audio")
+            queries_to_try.append(f"{q_ext} official song")
 
     if not queries_to_try and caption:
-        clean_cap = clean_music_query(caption[:100])
+        clean_cap = clean_music_query(caption[:120])
         if clean_cap:
             queries_to_try.append(f"{clean_cap} song")
 
@@ -315,7 +405,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
-        'concurrent_fragment_downloads': 10,
+        'concurrent_fragment_downloads': 12,
         'nocheckcertificate': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -346,11 +436,16 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                             video_url = entry.get('webpage_url') or entry.get('url')
                             if video_url:
                                 ydl.download([video_url])
+                                
+                                final_title = (spotify_match.get('title') if spotify_match else None) or entry.get('title', track_title or "Original Song")
+                                final_artist = (spotify_match.get('artist') if spotify_match else None) or entry.get('uploader') or entry.get('artist') or "Unknown Artist"
+
                                 return {
                                     'filepath': os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3"),
-                                    'title': entry.get('title', track_title or "Original Song"),
-                                    'uploader': entry.get('uploader') or entry.get('artist') or "Unknown Artist",
-                                    'duration': duration
+                                    'title': final_title,
+                                    'uploader': final_artist,
+                                    'duration': duration,
+                                    'spotify_url': spotify_match.get('spotify_url') if spotify_match else None
                                 }
                     return None
 
@@ -367,9 +462,9 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends greeting message on /start command."""
     welcome_text = (
-        "⚡️ **سلام! به ربات دانلود پیشرفته اینستاگرام خوش آمدید.**\n\n"
-        "من می‌تونم تمام ویدیوها، ریلزها، وپست‌های چندتایی (آلبوم) اینستاگرام رو با **کیفیت‌های مختلف** و **حجم دقیق** برات دانلود کنم.\n\n"
-        "🎵 همچنین می‌تونم **نسخه کامل موزیک اورجینال** ترانه رو برات از یوتیوب موزیک پیدا و استخراج کنم!\n\n"
+        "⚡️ **سلام! من ربات دانلود اینستا هستم.**\n\n"
+        "با من می‌تونی ویدیوها و پست‌های اینستاگرام رو **بدون محدودیت** و با **کیفیت‌های مختلف** دانلود کنی.\n\n"
+        "🎵 همچنین سیستم هوشمند متصل به **Spotify & YouTube Music** نسخه کامل موزیک اصلی پست رو برات استخراج می‌کنه!\n\n"
         "👇 **کافیه فقط لینک پست یا ریلز اینستاگرام رو برام بفرستی:**"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -441,7 +536,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Quality buttons
     for fmt in valid_formats:
-        btn_text = f"📹 کیفیت {fmt['height']}p - ({fmt['size_str']})"
+        btn_text = f"📹 {fmt['height']}p - ({fmt['size_str']})"
         callback_data = f"vid:{cache_id}:{current_slide}:{fmt['format_id']}"
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
 
@@ -466,9 +561,9 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
         InlineKeyboardButton("🎵 ویس ویدیو 320", callback_data=f"aud:{cache_id}:{current_slide}:320"),
     ])
 
-    # Full HQ original track button
+    # Spotify & YouTube Music HQ Full Track download button
     keyboard.append([
-        InlineKeyboardButton("🎧 دانلود موزیک اصلی کامل (YouTube / Google)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
+        InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی (Spotify / YouTube)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
     ])
 
     # Extra action buttons
@@ -589,7 +684,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     pass
 
     elif action_type == "fullm":
-        status_msg = await query.message.reply_text("🔎 در حال جستجوی هوشمند موزیک اصلی در Google و YouTube...")
+        status_msg = await query.message.reply_text("🟢 🔎 در حال آنالیز اثر در Spotify و جستجوی نسخه کامل...")
 
         track_title = cached_item.get("track_title", "")
         artist_name = cached_item.get("artist_name", "")
@@ -600,12 +695,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             if res and os.path.exists(res['filepath']):
                 await status_msg.edit_text("⬆️ در حال ارسال موزیک کامل با کیفیت 320kbps...")
+                sp_note = f"\n🌐 **لینک اسپاتیفای:** {res['spotify_url']}" if res.get('spotify_url') else ""
+                caption_audio = f"🎧 **موزیک کامل اورجینال:**\n🎵 **عنوان:** {res['title']}\n👤 **خواننده:** {res['uploader']}\n✨ **کیفیت:** 320kbps (HQ){sp_note}"
+                
                 with open(res['filepath'], 'rb') as audio_file:
                     await query.message.reply_audio(
                         audio=audio_file,
                         title=res['title'],
                         performer=res['uploader'],
-                        caption=f"🎧 **موزیک کامل اورجینال:**\n🎵 **عنوان:** {res['title']}\n👤 **خواننده:** {res['uploader']}\n✨ **کیفیت:** 320kbps (HQ)",
+                        caption=caption_audio,
                         parse_mode="Markdown"
                     )
                 await status_msg.delete()
