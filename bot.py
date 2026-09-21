@@ -25,7 +25,7 @@ user_data_store = {}
 
 
 def get_ydl_options():
-    """تنظیمات بهینه‌شده برای جلوگیری از بن شدن آی‌پی و ارورهای یوتیوب"""
+    """تنظیمات بهینه‌شده برای دور زدن بن و ارورها"""
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -75,12 +75,14 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     res = f.get('format_note') or f.get('resolution') or (f"{f.get('height')}p" if f.get('height') else None)
                     format_id = f.get('format_id')
 
+                    # فقط کیفیت‌های ویدیویی واقعی را لیست می‌کنیم
                     if f.get('vcodec') != 'none' and res and res not in seen_resolutions:
                         seen_resolutions.add(res)
                         keyboard.append([
                             InlineKeyboardButton(f"🎬 کیفیت {res}", callback_data=f"dl|{format_id}")
                         ])
 
+                # دکمه‌های صوتی
                 keyboard.append([
                     InlineKeyboardButton("🎧 دانلود آهنگ (128kbps)", callback_data="dl|audio_128"),
                     InlineKeyboardButton("🎵 دانلود آهنگ (320kbps)", callback_data="dl|audio_320")
@@ -169,7 +171,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }]
 
         else:
-            ydl_opts['format'] = f"{format_id}+bestaudio/best/{format_id}/best"
+            # فرمت هوشمند برای جلوگیری از ارور Requested format is not available
+            ydl_opts['format'] = f"{format_id}+bestaudio/bestvideo+bestaudio/best"
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
