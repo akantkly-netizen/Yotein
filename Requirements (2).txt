@@ -1,0 +1,4 @@
+# STREAMING_CHUNK: Adding optimized python requirements including curl_cffi for bypassing bot limits...
+python-telegram-bot>=21.0
+yt-dlp>=2024.03.10
+curl_cffi>=0.6.0
