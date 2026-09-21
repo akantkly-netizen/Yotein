@@ -112,27 +112,25 @@ def clean_instagram_url(url: str) -> str:
 
 
 def clean_music_query(raw_text: str) -> str:
-    """Cleans hashtags, mentions, links, and non-alphanumeric noise for accurate music queries."""
+    """Cleans hashtags, mentions, URLs, and control characters while preserving global Unicode characters (German, Russian, French, Turkish, Asian, Arabic, Persian, etc.)."""
     if not raw_text:
         return ""
     text = re.sub(r'https?://\S+|www\.\S+', '', raw_text)
     text = re.sub(r'[@#]\w+', '', text)
-    # Remove emojis and unwanted symbols
-    text = re.sub(r'[^\w\s\d]', ' ', text)
+    # Retain all Unicode word characters (\w in Python 3 covers all languages & scripts)
+    text = re.sub(r'[^\w\s\d]', ' ', text, flags=re.UNICODE)
     return ' '.join(text.split()).strip()
 
 
 def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
-    """Extracts song title and artist using keyword patterns in multi-language captions."""
+    """Extracts song title and artist using global multi-language keyword patterns (German, French, Spanish, Russian, Turkish, Italian, Persian, Arabic, English)."""
     if not caption:
         return "", ""
 
     patterns = [
-        r'(?:موزیک|آهنگ|ترانه|خواننده|موسیقی|Song|Music|Track|Singer|By)[\s:-]+([^\n#@]+)',
-        r'🎵\s*([^\n#@]+)',
-        r'🎧\s*([^\n#@]+)',
-        r'🎼\s*([^\n#@]+)',
-        r'🎶\s*([^\n#@]+)'
+        # Multi-lingual keywords for song / music / track / artist / singer
+        r'(?:موزیک|آهنگ|ترانه|خواننده|موسیقی|Song|Music|Track|Singer|Artist|By|Musik|Lied|Sänger|Musique|Chanson|Música|Canción|Песня|Музыка|Исполнитель|Müzik|Şarkı|Sanatçı|Musica|Canzone|Группа|Soundtrack|OST)[\s:-]+([^\n#@]+)',
+        r'[🎵🎧🎼🎶🔊💿📻]\s*([^\n#@]+)',
     ]
 
     for pat in patterns:
@@ -140,19 +138,27 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
         if match:
             found = match.group(1).strip()
             if len(found) > 2:
-                if "-" in found:
-                    parts = found.split("-", 1)
-                    return parts[0].strip(), parts[1].strip()
-                elif "–" in found:
-                    parts = found.split("–", 1)
-                    return parts[0].strip(), parts[1].strip()
+                for sep in ["-", "–", "—", "|", "~"]:
+                    if sep in found:
+                        parts = found.split(sep, 1)
+                        return parts[0].strip(), parts[1].strip()
                 return found, ""
+
+    # Check for direct "Artist - Track" or "Track - Artist" anywhere in caption
+    delimiters = [r'\s+[-–—|~]\s+']
+    for line in caption.split('\n'):
+        line_clean = re.sub(r'https?://\S+|[@#]\w+', '', line).strip()
+        if 5 <= len(line_clean) <= 100:
+            for sep in delimiters:
+                parts = re.split(sep, line_clean, maxsplit=1)
+                if len(parts) == 2 and len(parts[0]) > 2 and len(parts[1]) > 2:
+                    return parts[0].strip(), parts[1].strip()
 
     lines = [line.strip() for line in caption.split('\n') if line.strip() and not line.startswith('#') and not line.startswith('@')]
     if lines:
         first_line = lines[0]
         first_line = re.sub(r'https?://\S+', '', first_line).strip()
-        if 3 <= len(first_line) <= 80:
+        if 3 <= len(first_line) <= 90:
             return first_line, ""
 
     return "", ""
@@ -200,9 +206,9 @@ def get_spotify_token() -> Optional[str]:
 
 
 def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
-    """Searches Spotify database to match official track title, artist, and album details."""
+    """Searches Spotify database (global multi-lingual support) to match official track title, artist, and album details."""
     clean_q = clean_music_query(query)
-    if not clean_q or len(clean_q) < 3:
+    if not clean_q or len(clean_q) < 2:
         return None
 
     token = get_spotify_token()
@@ -363,14 +369,14 @@ async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -
 
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, output_prefix: str) -> Optional[Dict[str, Any]]:
-    """Performs deep 8-stage Spotify + YouTube Music + Google search pipeline to find full original HQ track."""
+    """Performs deep multi-stage Spotify + YouTube Music + Google search pipeline across all global languages."""
     queries_to_try = []
 
     clean_t = clean_music_query(track_title)
     clean_a = clean_music_query(artist_name)
     extracted_title, extracted_artist = extract_music_info_from_caption(caption)
 
-    # STEP 1: Query Spotify Database for exact official Track & Artist match
+    # STEP 1: Query Spotify Database for exact official Track & Artist match (Universal Multi-lingual Search)
     spotify_match = None
     search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_artist} {extracted_title}".strip() or clean_music_query(caption[:100])
 
@@ -380,20 +386,20 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     if spotify_match:
         sp_title = spotify_match['title']
         sp_artist = spotify_match['artist']
-        queries_to_try.append(f"{sp_artist} {sp_title} official audio song")
-        queries_to_try.append(f"{sp_artist} {sp_title} full audio")
+        queries_to_try.append(f"{sp_artist} {sp_title} official audio")
+        queries_to_try.append(f"{sp_artist} {sp_title}")
 
     if clean_a and clean_t:
         queries_to_try.append(f"{clean_a} {clean_t} full song audio")
         queries_to_try.append(f"{clean_a} {clean_t}")
     if clean_t:
-        queries_to_try.append(f"{clean_t} official audio song")
-        queries_to_try.append(f"{clean_t} audio")
+        queries_to_try.append(f"{clean_t} official song")
+        queries_to_try.append(f"{clean_t}")
 
     if extracted_title:
         q_ext = clean_music_query(f"{extracted_artist} {extracted_title}")
         if q_ext and q_ext not in queries_to_try:
-            queries_to_try.append(f"{q_ext} official song")
+            queries_to_try.append(f"{q_ext} official")
 
     if not queries_to_try and caption:
         clean_cap = clean_music_query(caption[:120])
