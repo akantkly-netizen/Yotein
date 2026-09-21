@@ -69,7 +69,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard = []
                 seen_resolutions = set()
 
-                # استخراج تمام کیفیت‌های ویدیویی موجود
+                # استخراج تمام کیفیت‌های ویدیویی تک‌فایلی/ترکیبی
                 for f in formats:
                     res = f.get('format_note') or f.get('resolution') or (f"{f.get('height')}p" if f.get('height') else None)
                     format_id = f.get('format_id')
@@ -85,9 +85,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("🎧 دانلود آهنگ (128kbps)", callback_data="dl|audio_128"),
                     InlineKeyboardButton("🎵 دانلود آهنگ (320kbps)", callback_data="dl|audio_320")
                 ])
-                keyboard.append([
-                    InlineKeyboardButton("✨ بهترین کیفیت ویدیو", callback_data="dl|best")
-                ])
 
                 user_data_store[user_id] = {'url': text, 'title': title}
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -98,10 +95,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"👇 **کیفیت مورد نظر را انتخاب کنید:**"
                 )
 
-                # حذف پیام اولیه
                 await msg.delete()
 
-                # ارسال کاور (Thumbnail) به همراه کپشن و دکمه‌ها
                 if thumbnail:
                     try:
                         await update.message.reply_photo(
@@ -152,10 +147,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await query.message.reply_text("⚡ در حال دانلود و پردازش فایل... لطفاً منتظر بمانید.")
 
         file_prefix = f"download_{user_id}"
-        file_path = f"{file_prefix}.mp4"
 
         ydl_opts = {
-            'outtmpl': file_prefix + '.%(ext)s',
+            'outtmpl': f"{file_prefix}.%(ext)s",
             'max_filesize': 2000 * 1024 * 1024,
             'quiet': True,
             'age_limit': 99,
@@ -172,7 +166,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'preferredcodec': 'mp3',
                 'preferredquality': '128',
             }]
-            file_path = f"{file_prefix}.mp3"
 
         # دانلود صوتی 320
         elif format_id == "audio_320":
@@ -182,12 +175,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'preferredcodec': 'mp3',
                 'preferredquality': '320',
             }]
-            file_path = f"{file_prefix}.mp3"
 
-        # دانلود ویدیو
+        # دانلود ویدیو تک‌فرمت یا ترکیبی
         else:
-            ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id != "best" else "bestvideo+bestaudio/best"
-            file_path = f"{file_prefix}.mp4"
+            ydl_opts['format'] = f"{format_id}+bestaudio/best/{format_id}/best"
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -202,7 +193,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if actual_file and os.path.exists(actual_file):
                 with open(actual_file, 'rb') as f:
-                    if actual_file.endswith(".mp3"):
+                    if actual_file.endswith((".mp3", ".m4a", ".webm", ".ogg")):
                         await context.bot.send_audio(
                             chat_id=user_id,
                             audio=f,
