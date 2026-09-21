@@ -1,4 +1,3 @@
-STREAMING_CHUNK: Configuring system packages and environment for Railway...
 ​[phases.setup]
 nixPkgs = ["python311", "ffmpeg"]
 ​[phases.install]
