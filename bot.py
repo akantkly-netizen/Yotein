@@ -164,6 +164,22 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
     return "", ""
 
 
+def estimate_format_filesize(fmt: Dict[str, Any], duration: float) -> Optional[int]:
+    """Calculates filesize from direct byte fields or estimates it from bitrate and duration."""
+    filesize = fmt.get('filesize') or fmt.get('filesize_approx')
+    if filesize and filesize > 0:
+        return filesize
+
+    # Estimate using bitrate (tbr in kbps) and duration in seconds
+    tbr = fmt.get('tbr') or ((fmt.get('vbr') or 0) + (fmt.get('abr') or 0))
+    if tbr and tbr > 0 and duration and duration > 0:
+        # kilobits per second -> bytes = (kbps * 1000 / 8) * duration
+        estimated_bytes = int((tbr * 1000 / 8) * duration)
+        return estimated_bytes
+
+    return None
+
+
 def format_size(bytes_size: Optional[int]) -> str:
     """Formats raw bytes size into MB / KB readable strings."""
     if not bytes_size or bytes_size <= 0:
@@ -173,6 +189,55 @@ def format_size(bytes_size: Optional[int]) -> str:
         return f"{mb:.1f} MB"
     kb = bytes_size / 1024
     return f"{int(kb)} KB"
+
+
+def extract_resolution_height(fmt: Dict[str, Any]) -> int:
+    """Extracts resolution height integer from height, width, resolution string, or format_note."""
+    height = fmt.get('height')
+    if height and isinstance(height, int) and height > 0:
+        return height
+
+    # Fallback to parsing resolution string e.g., "1080x1920" or "720x1280"
+    resolution = fmt.get('resolution') or ""
+    if "x" in resolution:
+        try:
+            parts = resolution.lower().split("x")
+            return min(int(parts[0]), int(parts[1]))  # Shortest dimension is standard height
+        except Exception:
+            pass
+
+    # Fallback to parsing format_note e.g., "1080p", "720p"
+    format_note = fmt.get('format_note') or ""
+    match = re.search(r'(\d{3,4})p?', format_note)
+    if match:
+        return int(match.group(1))
+
+    # Check width if available (e.g., vertical reels 1080x1920)
+    width = fmt.get('width')
+    if width and isinstance(width, int):
+        if width >= 1080:
+            return 1080
+        elif width >= 720:
+            return 720
+        elif width >= 480:
+            return 480
+        elif width >= 360:
+            return 360
+
+    return 0
+
+
+def format_quality_label(height: int) -> str:
+    """Generates user-friendly quality labels for heights."""
+    if height >= 1080:
+        return f"📹 {height}p (Full HD)"
+    elif height >= 720:
+        return f"📹 {height}p (HD)"
+    elif height >= 480:
+        return f"📹 {height}p (SD)"
+    elif height > 0:
+        return f"📹 {height}p"
+    return "📹 کیفیت استاندارد"
 
 
 # --- SPOTIFY SEARCH ENGINE MODULE ---
@@ -477,7 +542,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming links, extracts qualities, thumbnails, carousel slides, and formats keyboard."""
+    """Processes incoming links, extracts all available qualities, estimated file sizes, thumbnails, carousel slides, and formats keyboard."""
     url = update.message.text.strip()
 
     if not is_instagram_url(url):
@@ -505,6 +570,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     main_item = entries[current_slide] if is_album else info
 
     formats = main_item.get('formats', [])
+    duration = float(main_item.get('duration') or info.get('duration') or 0)
     thumbnail = main_item.get('thumbnail') or info.get('thumbnail', '')
     raw_caption = info.get('description') or info.get('title') or "ویدیو اینستاگرام"
 
@@ -519,30 +585,35 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     short_caption = raw_caption[:500] + "..." if len(raw_caption) > 500 else raw_caption
 
-    # Extract distinct video qualities
+    # Advanced Multi-Quality Extraction Algorithm
     valid_formats = []
     seen_heights = set()
 
     for f in formats:
-        height = f.get('height')
         vcodec = f.get('vcodec', 'none')
+        # Skip audio-only formats in video loop
+        if vcodec == 'none':
+            continue
 
-        if height and vcodec != 'none' and height not in seen_heights:
+        height = extract_resolution_height(f)
+        if height > 0 and height not in seen_heights:
             seen_heights.add(height)
-            filesize = f.get('filesize') or f.get('filesize_approx')
+            size_bytes = estimate_format_filesize(f, duration)
             valid_formats.append({
-                'format_id': f.get('format_id'),
+                'format_id': f.get('format_id', 'best'),
                 'height': height,
-                'size_str': format_size(filesize)
+                'label': format_quality_label(height),
+                'size_str': format_size(size_bytes)
             })
 
+    # Sort formats from highest to lowest resolution
     valid_formats.sort(key=lambda x: x['height'], reverse=True)
 
     keyboard = []
 
-    # Quality buttons
+    # Build quality selection buttons
     for fmt in valid_formats:
-        btn_text = f"📹 {fmt['height']}p - ({fmt['size_str']})"
+        btn_text = f"{fmt['label']} - ({fmt['size_str']})"
         callback_data = f"vid:{cache_id}:{current_slide}:{fmt['format_id']}"
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
 
