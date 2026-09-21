@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 import glob
+import concurrent.futures
 from typing import Dict, Any, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,6 +33,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # حافظه موقت برای ذخیره متاداده‌های پست
 MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# ایجاد ThreadPoolExecutor با ۱۰ ورکر اختصاصی برای دانلود و استخراج همزمان و بدون گلوگاه
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 
 def setup_cookies_file() -> Optional[str]:
@@ -82,7 +86,7 @@ def clean_instagram_url(url: str) -> str:
 
 async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
     """
-    استخراج متاداده پست اینستاگرام با تنظیمات پیشرفته جهت دور زدن Bot Detection
+    استخراج متاداده پست اینستاگرام با تنظیمات سرعت بالا و چندنخی
     """
     clean_url = clean_instagram_url(url)
     cookie_file = setup_cookies_file()
@@ -91,6 +95,8 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'nocheckcertificate': True,
+        'concurrent_fragment_downloads': 8,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -106,7 +112,7 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(clean_url, download=False)
 
-        info = await loop.run_in_executor(None, _fetch)
+        info = await loop.run_in_executor(executor, _fetch)
         return info
     except Exception as e:
         logger.error(f"خطا در دریافت اطلاعات از لینک {clean_url}: {e}")
@@ -114,7 +120,7 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def download_media_file(url: str, format_id: str, output_prefix: str) -> Optional[str]:
-    """دانلود فایل ویدیو با فرمت مشخص شده"""
+    """دانلود فایل ویدیو با فرمت مشخص شده و ۸ اتصال همزمان برای حداکثر سرعت"""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
@@ -126,6 +132,9 @@ async def download_media_file(url: str, format_id: str, output_prefix: str) -> O
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
+        'nocheckcertificate': True,
+        'concurrent_fragment_downloads': 8,
+        'buffersize': 1024 * 1024,
     }
 
     if cookie_file:
@@ -138,7 +147,7 @@ async def download_media_file(url: str, format_id: str, output_prefix: str) -> O
                 info = ydl.extract_info(url, download=True)
                 return ydl.prepare_filename(info)
 
-        await loop.run_in_executor(None, _download)
+        await loop.run_in_executor(executor, _download)
 
         matching_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{output_prefix}.*"))
         if matching_files:
@@ -150,13 +159,15 @@ async def download_media_file(url: str, format_id: str, output_prefix: str) -> O
 
 
 async def download_audio_file(url: str, bitrate: str, output_prefix: str) -> Optional[str]:
-    """استخراج فایل MP3 از ویدیو اینستاگرام"""
+    """استخراج سریع فایل MP3 از ویدیو اینستاگرام"""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
+        'concurrent_fragment_downloads': 8,
+        'nocheckcertificate': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -176,7 +187,7 @@ async def download_audio_file(url: str, bitrate: str, output_prefix: str) -> Opt
                 ydl.extract_info(url, download=True)
                 return os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3")
 
-        await loop.run_in_executor(None, _download)
+        await loop.run_in_executor(executor, _download)
         final_mp3 = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3")
         return final_mp3 if os.path.exists(final_mp3) else None
     except Exception as e:
@@ -186,7 +197,7 @@ async def download_audio_file(url: str, bitrate: str, output_prefix: str) -> Opt
 
 async def download_full_track_from_youtube(query: str, output_prefix: str) -> Optional[Dict[str, Any]]:
     """
-    جستجوی هوشمند و دانلود نسخه کامل و اورجینال موزیک از سرویس‌های یوتیوب/یوتیوب موزیک
+    جستجوی بسیار سریع و دانلود نسخه کامل موزیک از سرویس‌های موسیقی
     """
     search_query = f"ytsearch1:{query} full audio song"
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
@@ -194,6 +205,8 @@ async def download_full_track_from_youtube(query: str, output_prefix: str) -> Op
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
+        'concurrent_fragment_downloads': 8,
+        'nocheckcertificate': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -218,7 +231,7 @@ async def download_full_track_from_youtube(query: str, output_prefix: str) -> Op
                     }
                 return None
 
-        result = await loop.run_in_executor(None, _search_and_download)
+        result = await loop.run_in_executor(executor, _search_and_download)
         if result and os.path.exists(result['filepath']):
             return result
         return None
