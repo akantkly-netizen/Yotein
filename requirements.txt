@@ -1,3 +1,0 @@
-# STREAMING_CHUNK: Specifying project dependencies...
-python-telegram-bot>=21.0
-yt-dlp>=2024.01.01
