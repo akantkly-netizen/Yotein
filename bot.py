@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ساختار ایموجی‌های پرمیوم (انیمیشنی) تلگرام
-# می‌توانید emoji-idها را با ID استیکرها یا ایموجی‌های اختصاصی خود جایگزین کنید
 PREMIUM_EMOJIS = {
     "DOWNLOAD": '<tg-emoji emoji-id="5368324170671202286">⚡</tg-emoji>',
     "MUSIC": '<tg-emoji emoji-id="5368324170671202286">🎵</tg-emoji>',
@@ -65,6 +64,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'no_warnings': True,
             'age_limit': 99,  # دور زدن محدودیت سنی
         }
+
+        # اضافه کردن فایل کوکی در صورت وجود
+        if os.path.exists("cookies.txt"):
+            ydl_opts['cookiefile'] = 'cookies.txt'
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -157,6 +160,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'age_limit': 99,
         }
 
+        # اضافه کردن فایل کوکی در صورت وجود
+        if os.path.exists("cookies.txt"):
+            ydl_opts['cookiefile'] = 'cookies.txt'
+
         # دانلود فقط صوت (MP3)
         if format_id == "bestaudio":
             file_path = f"{file_prefix}.mp3"
@@ -215,6 +222,9 @@ async def search_music(update: Update, query_text: str):
 
     search_query = f"ytsearch5:{query_text} audio"
     ydl_opts = {'quiet': True, 'extract_flat': True}
+
+    if os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = 'cookies.txt'
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
