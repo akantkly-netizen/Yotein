@@ -4,10 +4,8 @@ import asyncio
 import logging
 import uuid
 import glob
-import shutil
-import tempfile
-from typing import Dict, Any, Optional, List
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from typing import Dict, Any, Optional
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -82,7 +80,6 @@ def clean_instagram_url(url: str) -> str:
     return url
 
 
-
 async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
     """
     استخراج متاداده پست اینستاگرام با تنظیمات پیشرفته جهت دور زدن Bot Detection
@@ -90,7 +87,6 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
     clean_url = clean_instagram_url(url)
     cookie_file = setup_cookies_file()
 
-    # تنظیمات هوشمند yt-dlp برای شبیه‌سازی مرورگر واقعی
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -99,7 +95,6 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
-        'concurrent_fragment_downloads': 5,
     }
 
     if cookie_file:
@@ -118,13 +113,11 @@ async def extract_instagram_info(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-
 async def download_media_file(url: str, format_id: str, output_prefix: str) -> Optional[str]:
-    """دانلود فایل ویدیو با بهترین ترکیب یا فرمت مشخص شده"""
+    """دانلود فایل ویدیو با فرمت مشخص شده"""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
-    # انتخاب فرمت هوشمند (ویدیو همراه با صدا)
     fmt_spec = format_id if format_id != "best" else "bestvideo[vcodec^=avc]+bestaudio/best"
 
     ydl_opts = {
@@ -147,7 +140,6 @@ async def download_media_file(url: str, format_id: str, output_prefix: str) -> O
 
         await loop.run_in_executor(None, _download)
 
-        # جستجوی فایل خروجی دقیق
         matching_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{output_prefix}.*"))
         if matching_files:
             return matching_files[0]
@@ -158,7 +150,7 @@ async def download_media_file(url: str, format_id: str, output_prefix: str) -> O
 
 
 async def download_audio_file(url: str, bitrate: str, output_prefix: str) -> Optional[str]:
-    """استخراج فایل MP3 با بیت‌ریت دلخواه با کمک FFmpeg"""
+    """استخراج فایل MP3 از ویدیو اینستاگرام"""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
@@ -192,6 +184,48 @@ async def download_audio_file(url: str, bitrate: str, output_prefix: str) -> Opt
         return None
 
 
+async def download_full_track_from_youtube(query: str, output_prefix: str) -> Optional[Dict[str, Any]]:
+    """
+    جستجوی هوشمند و دانلود نسخه کامل و اورجینال موزیک از سرویس‌های یوتیوب/یوتیوب موزیک
+    """
+    search_query = f"ytsearch1:{query} full audio song"
+    output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_template,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '320',
+        }],
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'auto',
+    }
+
+    loop = asyncio.get_event_loop()
+    try:
+        def _search_and_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(search_query, download=True)
+                if 'entries' in info and len(info['entries']) > 0:
+                    entry = info['entries'][0]
+                    return {
+                        'filepath': os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3"),
+                        'title': entry.get('title', query),
+                        'uploader': entry.get('uploader', 'Unknown Artist'),
+                    }
+                return None
+
+        result = await loop.run_in_executor(None, _search_and_download)
+        if result and os.path.exists(result['filepath']):
+            return result
+        return None
+    except Exception as e:
+        logger.error(f"خطا در پیدا کردن موزیک کامل برای {query}: {e}")
+        return None
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """پاسخ به دستور /start"""
@@ -220,7 +254,6 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     cache_id = str(uuid.uuid4())[:8]
 
-    # پردازش در صورت وجود پست چندتایی (Carousel)
     entries = info.get('entries')
     main_item = entries[0] if entries else info
 
@@ -228,10 +261,19 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     thumbnail = main_item.get('thumbnail') or info.get('thumbnail', '')
     raw_caption = info.get('description') or info.get('title') or "ویدیو اینستاگرام"
 
-    # آماده‌سازی خلاصه کپشن
+    # استخراج نام تراک یا موزیک استفاده شده
+    track_title = main_item.get('track') or main_item.get('alt_title') or ""
+    artist_name = main_item.get('artist') or main_item.get('creator') or ""
+    
+    if track_title:
+        full_music_query = f"{artist_name} {track_title}".strip()
+    else:
+        # در صورت عدم وجود نام تراک مستقیم، خط اول کپشن را استفاده می‌کنیم
+        first_line = raw_caption.split('\n')[0][:50]
+        full_music_query = re.sub(r'#\w+|[^\w\s]', '', first_line).strip()
+
     short_caption = raw_caption[:600] + "..." if len(raw_caption) > 600 else raw_caption
 
-    # استخراج و مرتب‌سازی رزولوشن‌های ویدیو
     valid_formats = []
     seen_heights = set()
 
@@ -248,12 +290,11 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                 'size_str': format_size(filesize)
             })
 
-    # مرتب‌سازی از کیفیت پایین به بالا
     valid_formats.sort(key=lambda x: x['height'])
 
     keyboard = []
 
-    # ساخت دکمه‌های ویدیو
+    # دکمه‌های ویدیو
     for fmt in valid_formats:
         btn_text = f"📹 دانلود کیفیت {fmt['height']}p - ({fmt['size_str']})"
         callback_data = f"vid:{cache_id}:{fmt['format_id']}"
@@ -264,13 +305,19 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("📹 دانلود ویدیو با بهترین کیفیت", callback_data=f"vid:{cache_id}:best")
         ])
 
-    # دکمه‌های استخراج صوتی
+    # دکمه‌های استخراج صوتی ویدیو
     keyboard.append([
-        InlineKeyboardButton("🎵 دانلود آهنگ 128", callback_data=f"aud:{cache_id}:128"),
-        InlineKeyboardButton("🎵 دانلود آهنگ 320", callback_data=f"aud:{cache_id}:320"),
+        InlineKeyboardButton("🎵 ویس ویدیو 128", callback_data=f"aud:{cache_id}:128"),
+        InlineKeyboardButton("🎵 ویس ویدیو 320", callback_data=f"aud:{cache_id}:320"),
     ])
 
-    # دکمه‌های کمکی (کاور و کپشن)
+    # دکمه اختصاصی دانلود کامل موزیک اصلی از Spotify / YouTube Music
+    if full_music_query:
+        keyboard.append([
+            InlineKeyboardButton("🎧 دانلود موزیک اصلی کامل (Spotify/YouTube)", callback_data=f"fullm:{cache_id}:hq")
+        ])
+
+    # دکمه‌های کمکی
     extra_buttons = []
     if thumbnail:
         extra_buttons.append(InlineKeyboardButton("🖼 کاور ویدیو", callback_data=f"img:{cache_id}:thumb"))
@@ -280,11 +327,12 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     if extra_buttons:
         keyboard.append(extra_buttons)
 
-    # ذخیره در حافظه موقت
+    # ذخیره در کش
     MEDIA_CACHE[cache_id] = {
         "url": url,
         "caption": raw_caption,
-        "thumbnail": thumbnail
+        "thumbnail": thumbnail,
+        "music_query": full_music_query
     }
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -312,9 +360,8 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مدیریت کلیک روی دکمه‌های کیفیت ویدیو، آهنگ، کاور و کپشن"""
+    """مدیریت کلیک روی دکمه‌ها"""
     query = update.callback_query
     await query.answer()
 
@@ -322,9 +369,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if len(data) < 3:
         return
 
-    action_type = data[0]   # 'vid', 'aud', 'img', 'cap'
-    cache_id = data[1]      # شناسه کش
-    param = data[2]         # format_id, bitrate, thumb, full
+    action_type = data[0]   # 'vid', 'aud', 'fullm', 'img', 'cap'
+    cache_id = data[1]      
+    param = data[2]         
 
     cached_data = MEDIA_CACHE.get(cache_id)
     if not cached_data:
@@ -339,7 +386,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(f"📝 **کپشن کامل:**\n\n{cached_data['caption']}")
         return
 
-    # ارسال عکس کاور
+    # ارسال کاور
     if action_type == "img":
         if cached_data.get("thumbnail"):
             await query.message.reply_photo(
@@ -369,7 +416,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
 
-    # دانلود آهنگ / صدا
+    # دانلود ویس/آهنگ ویدیو
     elif action_type == "aud":
         status_msg = await query.message.reply_text(f"⏳ در حال استخراج فایل صوتی با کیفیت {param}kbps...")
         filepath = await download_audio_file(url, param, file_prefix)
@@ -391,6 +438,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
 
+    # دانلود نسخه کامل آهنگ اصلی از یوتیوب/اسپاتیفای
+    elif action_type == "fullm":
+        music_query = cached_data.get("music_query")
+        if not music_query:
+            await query.message.reply_text("❌ نام آهنگ قابل تشخیص نبود.")
+            return
+
+        status_msg = await query.message.reply_text(f"🔎 در حال جستجو و دانلود نسخه کامل موزیک `{music_query}` از دیتابیس Spotify/YouTube...")
+        
+        result = await download_full_track_from_youtube(music_query, file_prefix)
+
+        try:
+            if result and os.path.exists(result['filepath']):
+                await status_msg.edit_text("⬆️ در حال ارسال فایل کامل موزیک با کیفیت 320kbps...")
+                with open(result['filepath'], 'rb') as audio_file:
+                    await query.message.reply_audio(
+                        audio=audio_file,
+                        title=result['title'],
+                        performer=result['uploader'],
+                        caption=f"🎧 **موزیک کامل اورجینال یافت شد:**\n🎵 {result['title']}\n👤 {result['uploader']}\n✨ کیفیت: 320kbps (HQ)",
+                        parse_mode="Markdown"
+                    )
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ متأسفانه نسخه کامل این موزیک در دیتابیس یافت نشد.")
+        finally:
+            if result and os.path.exists(result['filepath']):
+                os.remove(result['filepath'])
 
 
 def main():
