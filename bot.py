@@ -117,18 +117,17 @@ def clean_music_query(raw_text: str) -> str:
         return ""
     text = re.sub(r'https?://\S+|www\.\S+', '', raw_text)
     text = re.sub(r'[@#]\w+', '', text)
-    # Retain all Unicode word characters (\w in Python 3 covers all languages & scripts)
+    # Retain all Unicode word characters (\w covers all languages & scripts)
     text = re.sub(r'[^\w\s\d]', ' ', text, flags=re.UNICODE)
     return ' '.join(text.split()).strip()
 
 
 def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
-    """Extracts song title and artist using global multi-language keyword patterns (German, French, Spanish, Russian, Turkish, Italian, Persian, Arabic, English)."""
+    """Extracts song title and artist using global multi-language keyword patterns."""
     if not caption:
         return "", ""
 
     patterns = [
-        # Multi-lingual keywords for song / music / track / artist / singer
         r'(?:موزیک|آهنگ|ترانه|خواننده|موسیقی|Song|Music|Track|Singer|Artist|By|Musik|Lied|Sänger|Musique|Chanson|Música|Canción|Песня|Музыка|Исполнитель|Müzik|Şarkı|Sanatçı|Musica|Canzone|Группа|Soundtrack|OST)[\s:-]+([^\n#@]+)',
         r'[🎵🎧🎼🎶🔊💿📻]\s*([^\n#@]+)',
     ]
@@ -144,7 +143,6 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
                         return parts[0].strip(), parts[1].strip()
                 return found, ""
 
-    # Check for direct "Artist - Track" or "Track - Artist" anywhere in caption
     delimiters = [r'\s+[-–—|~]\s+']
     for line in caption.split('\n'):
         line_clean = re.sub(r'https?://\S+|[@#]\w+', '', line).strip()
@@ -170,10 +168,8 @@ def estimate_format_filesize(fmt: Dict[str, Any], duration: float) -> Optional[i
     if filesize and filesize > 0:
         return filesize
 
-    # Estimate using bitrate (tbr in kbps) and duration in seconds
     tbr = fmt.get('tbr') or ((fmt.get('vbr') or 0) + (fmt.get('abr') or 0))
     if tbr and tbr > 0 and duration and duration > 0:
-        # kilobits per second -> bytes = (kbps * 1000 / 8) * duration
         estimated_bytes = int((tbr * 1000 / 8) * duration)
         return estimated_bytes
 
@@ -197,22 +193,19 @@ def extract_resolution_height(fmt: Dict[str, Any]) -> int:
     if height and isinstance(height, int) and height > 0:
         return height
 
-    # Fallback to parsing resolution string e.g., "1080x1920" or "720x1280"
     resolution = fmt.get('resolution') or ""
     if "x" in resolution:
         try:
             parts = resolution.lower().split("x")
-            return min(int(parts[0]), int(parts[1]))  # Shortest dimension is standard height
+            return min(int(parts[0]), int(parts[1]))
         except Exception:
             pass
 
-    # Fallback to parsing format_note e.g., "1080p", "720p"
     format_note = fmt.get('format_note') or ""
     match = re.search(r'(\d{3,4})p?', format_note)
     if match:
         return int(match.group(1))
 
-    # Check width if available (e.g., vertical reels 1080x1920)
     width = fmt.get('width')
     if width and isinstance(width, int):
         if width >= 1080:
@@ -259,7 +252,6 @@ def get_spotify_token() -> Optional[str]:
         except Exception as ex:
             logger.debug(f"Failed Spotify credentials auth: {ex}")
 
-    # Fallback to Spotify open web token generator
     try:
         req = urllib.request.Request("https://open.spotify.com/get_access_token", headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -271,7 +263,7 @@ def get_spotify_token() -> Optional[str]:
 
 
 def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
-    """Searches Spotify database (global multi-lingual support) to match official track title, artist, and album details."""
+    """Searches Spotify database to match official track title, artist, and album details."""
     clean_q = clean_music_query(query)
     if not clean_q or len(clean_q) < 2:
         return None
@@ -434,14 +426,13 @@ async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -
 
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, output_prefix: str) -> Optional[Dict[str, Any]]:
-    """Performs deep multi-stage Spotify + YouTube Music + Google search pipeline across all global languages."""
+    """Performs deep multi-stage Spotify + YouTube Music search pipeline."""
     queries_to_try = []
 
     clean_t = clean_music_query(track_title)
     clean_a = clean_music_query(artist_name)
     extracted_title, extracted_artist = extract_music_info_from_caption(caption)
 
-    # STEP 1: Query Spotify Database for exact official Track & Artist match (Universal Multi-lingual Search)
     spotify_match = None
     search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_artist} {extracted_title}".strip() or clean_music_query(caption[:100])
 
@@ -502,7 +493,6 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                         if not entry:
                             continue
                         duration = entry.get('duration', 0)
-                        # Filter out short reels (<45s) and too long mixes (>15m)
                         if 45 <= duration <= 900:
                             video_url = entry.get('webpage_url') or entry.get('url')
                             if video_url:
@@ -542,7 +532,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming links, extracts all available qualities, estimated file sizes, thumbnails, carousel slides, and formats keyboard."""
+    """Processes incoming links, extracts qualities, thumbnails, and carousel slides."""
     url = update.message.text.strip()
 
     if not is_instagram_url(url):
@@ -561,7 +551,6 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     cache_id = str(uuid.uuid4())[:8]
 
-    # Carousel / Album parsing
     entries = info.get('entries')
     is_album = bool(entries and len(entries) > 1)
     total_slides = len(entries) if is_album else 1
@@ -585,13 +574,11 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     short_caption = raw_caption[:500] + "..." if len(raw_caption) > 500 else raw_caption
 
-    # Advanced Multi-Quality Extraction Algorithm
     valid_formats = []
     seen_heights = set()
 
     for f in formats:
         vcodec = f.get('vcodec', 'none')
-        # Skip audio-only formats in video loop
         if vcodec == 'none':
             continue
 
@@ -606,12 +593,10 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                 'size_str': format_size(size_bytes)
             })
 
-    # Sort formats from highest to lowest resolution
     valid_formats.sort(key=lambda x: x['height'], reverse=True)
 
     keyboard = []
 
-    # Build quality selection buttons
     for fmt in valid_formats:
         btn_text = f"{fmt['label']} - ({fmt['size_str']})"
         callback_data = f"vid:{cache_id}:{current_slide}:{fmt['format_id']}"
@@ -622,7 +607,6 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("📹 دانلود ویدیو (بهترین کیفیت)", callback_data=f"vid:{cache_id}:{current_slide}:best")
         ])
 
-    # Carousel slide navigation if album
     if is_album:
         nav_row = []
         if current_slide > 0:
@@ -632,18 +616,15 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
             nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"slide:{cache_id}:{current_slide + 1}"))
         keyboard.append(nav_row)
 
-    # Voice / Audio extraction buttons
     keyboard.append([
         InlineKeyboardButton("🎵 ویس ویدیو 128", callback_data=f"aud:{cache_id}:{current_slide}:128"),
         InlineKeyboardButton("🎵 ویس ویدیو 320", callback_data=f"aud:{cache_id}:{current_slide}:320"),
     ])
 
-    # Spotify & YouTube Music HQ Full Track download button
     keyboard.append([
         InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی (Spotify / YouTube)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
     ])
 
-    # Extra action buttons
     extra_row = []
     if thumbnail:
         extra_row.append(InlineKeyboardButton("🖼 کاور اصلی", callback_data=f"img:{cache_id}:{current_slide}"))
@@ -653,7 +634,6 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     if extra_row:
         keyboard.append(extra_row)
 
-    # Store media in cache
     MEDIA_CACHE[cache_id] = {
         "url": url,
         "info": info,
@@ -691,7 +671,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline button clicks for video, audio, full track, slides, and caption."""
+    """Handles inline button clicks."""
     query = update.callback_query
     await query.answer()
 
@@ -803,6 +783,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(f"📜 **کپشن کامل:**\n\n{full_cap}")
 
 
+async def post_init(application: Application):
+    """Executes on startup to drop pending updates and release active webhooks from old bot instances."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Successfully dropped pending updates and cleared old active connections.")
+    except Exception as ex:
+        logger.warning(f"Failed to clear old connections on startup: {ex}")
+
+
 def main():
     """Main entry point for starting Telegram bot application."""
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
@@ -811,14 +800,14 @@ def main():
 
     logger.info("Starting Telegram Instagram Downloader Bot...")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_instagram_link))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Run bot polling loop
+    # Run bot polling loop with drop_pending_updates=True
     app.run_polling(drop_pending_updates=True)
 
 
