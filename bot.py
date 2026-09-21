@@ -12,50 +12,52 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# بارگذاری متغیرهای محیطی
 load_dotenv()
 
-# تنظیم لاگ‌ها
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# دریافت توکن ربات
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# حافظه موقت برای نگهداری لینک‌ها
 user_data_store = {}
 
 
+def get_ydl_options():
+    """تنظیمات بهینه‌شده برای جلوگیری از بن شدن آی‌پی و ارورهای یوتیوب"""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'age_limit': 99,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'mweb']
+            }
+        }
+    }
+    if os.path.exists("cookies.txt"):
+        opts['cookiefile'] = 'cookies.txt'
+    return opts
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فرمان /start"""
     welcome_text = (
         "⚡ **سلام! به ربات دانلودر خوش آمدید.**\n\n"
-        "🔗 **دانلود ویدیو:** لینک اینستاگرام یا یوتیوب را بفرستید تا کیفیت‌های مختلف را دریافت کنید.\n"
-        "🎵 **جستجوی آهنگ:** نام آهنگ یا خواننده را بفرستید تا در سرویس‌های موزیک جستجو شود."
+        "🔗 **دانلود ویدیو:** لینک اینستاگرام یا یوتیوب را بفرستید.\n"
+        "🎵 **جستجوی آهنگ:** نام آهنگ یا خواننده را بفرستید."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش لینک ویدیو یا متن جستجو"""
     text = update.message.text.strip()
     user_id = update.message.from_user.id
 
-    # بررسی لینک‌های یوتیوب یا اینستاگرام
     if any(domain in text for domain in ["youtube.com", "youtu.be", "instagram.com"]):
         msg = await update.message.reply_text("🔎 در حال دریافت اطلاعات ویدیو و کیفیت‌ها...")
 
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'age_limit': 99,
-        }
-
-        if os.path.exists("cookies.txt"):
-            ydl_opts['cookiefile'] = 'cookies.txt'
+        ydl_opts = get_ydl_options()
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -69,7 +71,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard = []
                 seen_resolutions = set()
 
-                # استخراج تمام کیفیت‌های ویدیویی تک‌فایلی/ترکیبی
                 for f in formats:
                     res = f.get('format_note') or f.get('resolution') or (f"{f.get('height')}p" if f.get('height') else None)
                     format_id = f.get('format_id')
@@ -80,7 +81,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             InlineKeyboardButton(f"🎬 کیفیت {res}", callback_data=f"dl|{format_id}")
                         ])
 
-                # افزودن گزینه‌های صوتی با کیفیت 128 و 320
                 keyboard.append([
                     InlineKeyboardButton("🎧 دانلود آهنگ (128kbps)", callback_data="dl|audio_128"),
                     InlineKeyboardButton("🎵 دانلود آهنگ (320kbps)", callback_data="dl|audio_320")
@@ -123,12 +123,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ خطایی در استخراج اطلاعات رخ داد:\n`{str(e)}`", parse_mode="Markdown")
 
     else:
-        # جستجوی موزیک
         await search_music(update, text)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش دکمه‌های انتخاب کیفیت"""
     query = update.callback_query
     await query.answer()
 
@@ -148,17 +146,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         file_prefix = f"download_{user_id}"
 
-        ydl_opts = {
+        ydl_opts = get_ydl_options()
+        ydl_opts.update({
             'outtmpl': f"{file_prefix}.%(ext)s",
             'max_filesize': 2000 * 1024 * 1024,
-            'quiet': True,
-            'age_limit': 99,
-        }
+        })
 
-        if os.path.exists("cookies.txt"):
-            ydl_opts['cookiefile'] = 'cookies.txt'
-
-        # دانلود صوتی 128
         if format_id == "audio_128":
             ydl_opts['format'] = 'bestaudio/best'
             ydl_opts['postprocessors'] = [{
@@ -167,7 +160,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'preferredquality': '128',
             }]
 
-        # دانلود صوتی 320
         elif format_id == "audio_320":
             ydl_opts['format'] = 'bestaudio/best'
             ydl_opts['postprocessors'] = [{
@@ -176,7 +168,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'preferredquality': '320',
             }]
 
-        # دانلود ویدیو تک‌فرمت یا ترکیبی
         else:
             ydl_opts['format'] = f"{format_id}+bestaudio/best/{format_id}/best"
 
@@ -184,7 +175,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            # پیدا کردن فایل دانلود شده
             actual_file = None
             for f in os.listdir("."):
                 if f.startswith(file_prefix):
@@ -217,14 +207,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_music(update: Update, query_text: str):
-    """جستجوی سریع موزیک در سرویس‌های موسیقی"""
     msg = await update.message.reply_text("🎵 در حال جستجوی موزیک...")
 
     search_query = f"ytsearch5:{query_text} audio"
-    ydl_opts = {'quiet': True, 'extract_flat': True}
-
-    if os.path.exists("cookies.txt"):
-        ydl_opts['cookiefile'] = 'cookies.txt'
+    ydl_opts = get_ydl_options()
+    ydl_opts['extract_flat'] = True
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
