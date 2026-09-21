@@ -112,12 +112,11 @@ def clean_instagram_url(url: str) -> str:
 
 
 def clean_music_query(raw_text: str) -> str:
-    """Cleans hashtags, mentions, URLs, and control characters while preserving global Unicode characters (German, Russian, French, Turkish, Asian, Arabic, Persian, etc.)."""
+    """Cleans hashtags, mentions, URLs, and control characters while preserving global Unicode characters."""
     if not raw_text:
         return ""
     text = re.sub(r'https?://\S+|www\.\S+', '', raw_text)
     text = re.sub(r'[@#]\w+', '', text)
-    # Retain all Unicode word characters (\w covers all languages & scripts)
     text = re.sub(r'[^\w\s\d]', ' ', text, flags=re.UNICODE)
     return ' '.join(text.split()).strip()
 
@@ -349,43 +348,60 @@ async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def download_instagram_video(url: str, format_id: str, output_prefix: str) -> Optional[str]:
-    """Downloads requested video quality with multi-threaded fragment downloads."""
+async def download_instagram_video(url: str, param: str, output_prefix: str) -> Optional[str]:
+    """Downloads requested video quality using smart multi-stage format specs and robust fallback."""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
-    fmt_spec = format_id if (format_id and format_id != "best") else "bestvideo[vcodec^=avc]+bestaudio/best"
-
-    ydl_opts = {
-        'format': fmt_spec,
-        'outtmpl': output_template,
-        'quiet': True,
-        'no_warnings': True,
-        'merge_output_format': 'mp4',
-        'nocheckcertificate': True,
-        'concurrent_fragment_downloads': 12,
-        'buffersize': 2048 * 1024,
-    }
-
-    if cookie_file:
-        ydl_opts['cookiefile'] = cookie_file
+    # Smart Format Specifiers List
+    format_specs = []
+    if param and param.isdigit():
+        height = param
+        format_specs.append(f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best")
+        format_specs.append(f"b[height<={height}]/best")
+    elif param and param != "best":
+        format_specs.append(f"{param}+bestaudio/best")
+        format_specs.append(param)
+    
+    format_specs.append("bestvideo+bestaudio/best")
+    format_specs.append("best")
 
     loop = asyncio.get_event_loop()
-    try:
+
+    for fmt in format_specs:
+        ydl_opts = {
+            'format': fmt,
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'merge_output_format': 'mp4',
+            'nocheckcertificate': True,
+            'concurrent_fragment_downloads': 12,
+            'buffersize': 2048 * 1024,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            }
+        }
+
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+
         def _download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return ydl.prepare_filename(info)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    return ydl.prepare_filename(info)
+            except Exception as ex:
+                logger.debug(f"Video download failed with format '{fmt}': {ex}")
+                return None
 
         await loop.run_in_executor(executor, _download)
 
         matching = glob.glob(os.path.join(DOWNLOAD_DIR, f"{output_prefix}.*"))
         if matching:
             return matching[0]
-        return None
-    except Exception as e:
-        logger.error(f"Error downloading video format {format_id}: {e}")
-        return None
+
+    return None
 
 
 async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -> Optional[str]:
@@ -587,7 +603,6 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
             seen_heights.add(height)
             size_bytes = estimate_format_filesize(f, duration)
             valid_formats.append({
-                'format_id': f.get('format_id', 'best'),
                 'height': height,
                 'label': format_quality_label(height),
                 'size_str': format_size(size_bytes)
@@ -599,7 +614,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     for fmt in valid_formats:
         btn_text = f"{fmt['label']} - ({fmt['size_str']})"
-        callback_data = f"vid:{cache_id}:{current_slide}:{fmt['format_id']}"
+        callback_data = f"vid:{cache_id}:{current_slide}:{fmt['height']}"
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
 
     if not keyboard:
@@ -701,16 +716,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         try:
             if filepath and os.path.exists(filepath):
+                filesize = os.path.getsize(filepath)
+                if filesize > 50 * 1024 * 1024:
+                    await status_msg.edit_text("❌ حجم ویدیو بیشتر از محدودیّت ۵۰ مگابایت تلگرام است.")
+                    return
+
                 await status_msg.edit_text("⬆️ در حال آپلود ویدیو به تلگرام...")
                 with open(filepath, 'rb') as video_file:
                     await query.message.reply_video(
                         video=video_file,
                         caption="✨ دانلود شده توسط ربات اینستاگرام",
-                        supports_streaming=True
+                        supports_streaming=True,
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=300
                     )
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ خطا در دانلود ویدیو. ممکن است لینک منقضی شده باشد.")
+                await status_msg.edit_text("❌ خطا در دانلود ویدیو. ممکن است لینک منقضی شده یا دسترسی ویدیو محدود باشد.")
+        except Exception as e:
+            logger.error(f"Error uploading video: {e}")
+            await status_msg.edit_text("❌ خطا در ارسال ویدیو به تلگرام.")
         finally:
             if filepath and os.path.exists(filepath):
                 try:
@@ -728,7 +754,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 with open(filepath, 'rb') as audio_file:
                     await query.message.reply_audio(
                         audio=audio_file,
-                        caption=f"🎵 ویس استخراج شده با کیفیت {param}kbps"
+                        caption=f"🎵 ویس استخراج شده با کیفیت {param}kbps",
+                        read_timeout=300,
+                        write_timeout=300
                     )
                 await status_msg.delete()
             else:
@@ -761,7 +789,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         title=res['title'],
                         performer=res['uploader'],
                         caption=caption_audio,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        read_timeout=300,
+                        write_timeout=300
                     )
                 await status_msg.delete()
             else:
