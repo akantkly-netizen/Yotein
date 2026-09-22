@@ -37,6 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MediaDownloaderBot")
 
+# Global Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DOWNLOAD_DIR = "temp_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -46,7 +47,6 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 
-# Spotify Client Credentials (Optional via env or fallback to public token generator)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
@@ -76,7 +76,6 @@ def cleanup_temp_files():
     try:
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
             if os.path.isfile(filepath):
-                # Delete files older than 15 minutes
                 if now - os.path.getmtime(filepath) > 900:
                     try:
                         os.remove(filepath)
@@ -255,8 +254,6 @@ def format_quality_label(height: int) -> str:
     return "📹 کیفیت استاندارد"
 
 
-# --- SPOTIFY SEARCH ENGINE MODULE ---
-
 def get_spotify_token() -> Optional[str]:
     """Retrieves access token for Spotify API."""
     if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
@@ -325,14 +322,76 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
     return None
 
 
+async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
+    """Fallback extractor using multi-instance Cobalt nodes when Cloud IPs are blocked."""
+    instances = [
+        "https://api.cobalt.tools",
+        "https://cobalt-api.kwiatekm.pl",
+        "https://api.cobalt.redna.dev",
+        "https://co.wuk.sh"
+    ]
+    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
+    payload = json.dumps({"url": url}).encode('utf-8')
+    loop = asyncio.get_event_loop()
+
+    def _call_instance(api_url: str):
+        try:
+            req = urllib.request.Request(f"{api_url}/api/json", data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            logger.debug(f"Cobalt node '{api_url}' request error: {e}")
+        return None
+
+    for inst in instances:
+        res = await loop.run_in_executor(executor, lambda: _call_instance(inst))
+        if res:
+            status = res.get("status")
+            if status in ["stream", "redirect"]:
+                media_url = res.get("url")
+                if media_url:
+                    return {
+                        "direct_url": media_url,
+                        "title": "ویدیوی استخراج شده",
+                        "description": "استخراج شده با موتور کلود پشتیبان",
+                        "formats": [{"url": media_url, "ext": "mp4", "height": 720, "vcodec": "h264"}],
+                        "duration": 60,
+                        "thumbnail": None
+                    }
+            elif status == "picker":
+                picker = res.get("picker", [])
+                entries = []
+                for p in picker:
+                    p_url = p.get("url")
+                    if p_url:
+                        entries.append({
+                            "direct_url": p_url,
+                            "formats": [{"url": p_url, "ext": "mp4" if p.get("type") == "video" else "jpg", "height": 720, "vcodec": "h264" if p.get("type") == "video" else "none"}]
+                        })
+                if entries:
+                    return {
+                        "entries": entries,
+                        "title": "آلبوم استخراج شده",
+                        "description": "پست چندتایی"
+                    }
+
+    return None
+
+
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Fetches Instagram/YouTube media metadata using ultra-robust multi-client strategies to bypass Cloud IP Blocks."""
+    """Fetches Instagram/YouTube media metadata using multi-strategy clients + Cobalt fallback."""
     clean_url = clean_media_url(url)
     cookie_file = setup_cookies_file()
 
-    # Advanced Multi-Strategy Configurations to bypass Cloud Server IP Blocking
     strategies = [
-        # Strategy 1: Android Client (Primary bypass for YouTube Datacenter IP blocking)
+        # Strategy 1: Android Client
         {
             'impersonate': 'chrome',
             'http_headers': {
@@ -345,7 +404,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 'instagram': {'api': 'graphql'}
             }
         },
-        # Strategy 2: iOS Native Mobile Client headers
+        # Strategy 2: iOS Native Mobile Client
         {
             'impersonate': 'safari',
             'http_headers': {
@@ -358,7 +417,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 'youtube': {'player_client': ['ios', 'web']},
             }
         },
-        # Strategy 3: TV Embedded Client Strategy
+        # Strategy 3: Smart TV Client Strategy
         {
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) SmartTV Safari/537.42',
@@ -366,17 +425,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             },
             'extractor_args': {
                 'youtube': {'player_client': ['tv', 'mweb']},
-            }
-        },
-        # Strategy 4: Fallback Desktop Chrome
-        {
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'X-IG-App-ID': '1217981644879628',
-            },
-            'extractor_args': {
-                'youtube': {'player_client': ['web', 'android']},
             }
         }
     ]
@@ -405,20 +453,40 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     return ydl.extract_info(clean_url, download=False)
             except Exception as ex:
-                logger.debug(f"Extraction strategy failed: {ex}")
+                logger.debug(f"yt-dlp extraction strategy failed: {ex}")
                 return None
 
         result = await loop.run_in_executor(executor, _fetch)
         if result:
             return result
 
+    # Fallback to Cobalt API Node Extractor if yt-dlp was Cloud IP Blocked
+    logger.info("Attempting Cobalt API Node fallback...")
+    cobalt_res = await fetch_cobalt_fallback_info(clean_url)
+    if cobalt_res:
+        return cobalt_res
+
     return None
 
 
-async def download_media_video(url: str, param: str, output_prefix: str) -> Optional[str]:
-    """Downloads requested video quality using multi-stage format specs and robust fallback."""
+async def download_media_video(url: str, param: str, output_prefix: str, direct_url: Optional[str] = None) -> Optional[str]:
+    """Downloads requested video quality using multi-stage format specs or direct stream."""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
+
+    # If direct CDN stream URL was provided by Cobalt fallback
+    if direct_url:
+        target_path = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp4")
+        try:
+            req = urllib.request.Request(direct_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            with urllib.request.urlopen(req, timeout=120) as resp, open(target_path, 'wb') as out_file:
+                shutil.copyfileobj(resp, out_file)
+            if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                return target_path
+        except Exception as e:
+            logger.error(f"Failed direct CDN download: {e}")
 
     format_specs = []
     if param and param.isdigit():
@@ -611,7 +679,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends exact custom greeting message on /start command."""
+    """Sends custom greeting message on /start command."""
     welcome_text = (
         "درود به روی ماهت 🧘🏾🌚\n"
         "من ربات دانلودرم 🧸\n\n"
@@ -653,6 +721,7 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = float(main_item.get('duration') or info.get('duration') or 0)
     thumbnail = main_item.get('thumbnail') or info.get('thumbnail', '')
     raw_caption = info.get('description') or info.get('title') or "ویدیو / پست"
+    direct_url = main_item.get('direct_url') or info.get('direct_url')
 
     track_title = main_item.get('track') or main_item.get('alt_title') or ""
     artist_name = main_item.get('artist') or main_item.get('creator') or main_item.get('uploader') or ""
@@ -726,6 +795,7 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     MEDIA_CACHE[cache_id] = {
         "url": url,
+        "direct_url": direct_url,
         "info": info,
         "caption": raw_caption,
         "thumbnail": thumbnail,
@@ -783,11 +853,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     url = cached_item["url"]
+    direct_url = cached_item.get("direct_url")
     file_prefix = f"file_{uuid.uuid4().hex[:6]}"
 
     if action_type == "vid":
         status_msg = await query.message.reply_text("⏳ در حال دانلود ویدیو... لطفاً صبور باشید.")
-        filepath = await download_media_video(url, param, file_prefix)
+        filepath = await download_media_video(url, param, file_prefix, direct_url=direct_url)
 
         try:
             if filepath and os.path.exists(filepath):
