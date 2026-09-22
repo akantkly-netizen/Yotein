@@ -60,41 +60,84 @@ _spotify_access_token: Optional[str] = None
 _spotify_token_expires_at: float = 0.0
 
 
-def get_spotify_token() -> Optional[str]:
-    """Retrieves or refreshes Spotify API access token."""
-    global _spotify_access_token, _spotify_token_expires_at
-    if _spotify_access_token and time.time() < _spotify_token_expires_at:
-        return _spotify_access_token
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return None
-    try:
-        auth_bytes = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')
-        auth_header = base64.b64encode(auth_bytes).decode('utf-8')
-        req = urllib.request.Request(
-            "https://accounts.spotify.com/api/token",
-            data=urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8'),
-            headers={
-                'Authorization': f'Basic {auth_header}',
-                'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=6) as response:
-            data = json.loads(response.read().decode())
-            _spotify_access_token = data.get('access_token')
-            expires_in = data.get('expires_in', 3600)
-            _spotify_token_expires_at = time.time() + expires_in - 60
-            return _spotify_access_token
-    except Exception as e:
-        logger.debug(f"Spotify token retrieval failed: {e}")
-        return None
-
+# ---------------------------------------------------------------------------
+# Helper Utility Functions & Cleaners
+# ---------------------------------------------------------------------------
 
 def sanitize_telegram_text(text: str) -> str:
     """Sanitizes text to avoid HTML/Markdown parsing breakage in Telegram."""
     if not text:
         return ""
     return text.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+
+
+def is_supported_url(text: str) -> bool:
+    """Checks if input string contains a supported video/media URL."""
+    if not text or not isinstance(text, str):
+        return False
+    patterns = [
+        r'https?://(?:www\.)?instagram\.com/',
+        r'https?://(?:www\.)?instagr\.am/',
+        r'https?://(?:www\.)?youtube\.com/',
+        r'https?://youtu\.be/',
+        r'https?://(?:open\.)?spotify\.com/'
+    ]
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def is_instagram_url(url: str) -> bool:
+    return bool(re.search(r'https?://(?:www\.)?instagr(?:am\.com|\.am)', url, re.IGNORECASE))
+
+
+def is_youtube_url(url: str) -> bool:
+    return bool(re.search(r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)', url, re.IGNORECASE))
+
+
+def is_spotify_url(url: str) -> bool:
+    return bool(re.search(r'https?://(?:open\.)?spotify\.com', url, re.IGNORECASE))
+
+
+def clean_media_url(url: str) -> str:
+    """Removes tracking query params from media URLs."""
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url.strip())
+    # Keep path clean for IG / YT
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+
+
+def setup_cookies_file() -> Optional[str]:
+    """Retrieves cookies path if available."""
+    cookie_path = os.getenv("COOKIES_FILE", "cookies.txt")
+    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 10:
+        return cookie_path
+    return None
+
+
+def cleanup_temp_files():
+    """Removes leftover media files in temp directory older than 30 minutes."""
+    try:
+        now = time.time()
+        for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+            if os.path.isfile(filepath):
+                if now - os.path.getmtime(filepath) > 1800:
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.debug(f"Cleanup error: {e}")
+
+
+def clean_expired_cache():
+    """Cleans in-memory MEDIA_CACHE."""
+    now = time.time()
+    expired_keys = [
+        k for k, v in MEDIA_CACHE.items()
+        if now - v.get("timestamp", 0) > CACHE_EXPIRATION_SECONDS
+    ]
+    for k in expired_keys:
+        MEDIA_CACHE.pop(k, None)
 
 
 def extract_resolution_height(format_dict: Dict[str, Any]) -> int:
@@ -162,7 +205,6 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
     if not caption:
         return "", ""
     
-    # Check for Mashup patterns (e.g. Song A x Song B)
     mashup_match = re.search(r"([A-Za-z0-9\s]{2,25})\s*(?:[x×X]|vs|VS|\/)\s*([A-Za-z0-9\s]{2,25})", caption)
     if mashup_match:
         g1, g2 = clean_music_query(mashup_match.group(1)), clean_music_query(mashup_match.group(2))
@@ -183,12 +225,267 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
     return clean_cap[:60], ""
 
 
+# ---------------------------------------------------------------------------
+# Multi-Engine Music Discovery APIs (Spotify, iTunes, Deezer)
+# ---------------------------------------------------------------------------
+
+def get_spotify_token() -> Optional[str]:
+    """Retrieves or refreshes Spotify API access token."""
+    global _spotify_access_token, _spotify_token_expires_at
+    if _spotify_access_token and time.time() < _spotify_token_expires_at:
+        return _spotify_access_token
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    try:
+        auth_bytes = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')
+        auth_header = base64.b64encode(auth_bytes).decode('utf-8')
+        req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8'),
+            headers={
+                'Authorization': f'Basic {auth_header}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode())
+            _spotify_access_token = data.get('access_token')
+            expires_in = data.get('expires_in', 3600)
+            _spotify_token_expires_at = time.time() + expires_in - 60
+            return _spotify_access_token
+    except Exception as e:
+        logger.debug(f"Spotify token retrieval failed: {e}")
+        return None
+
+
+def search_spotify_track(query: str) -> Optional[Dict[str, Any]]:
+    """Searches Spotify Web API for track details."""
+    token = get_spotify_token()
+    if not token or not query:
+        return None
+    try:
+        q_enc = urllib.parse.quote(query)
+        req_url = f"https://api.spotify.com/v1/search?q={q_enc}&type=track&limit=1"
+        req = urllib.request.Request(req_url, headers={'Authorization': f'Bearer {token}'})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                items = data.get('tracks', {}).get('items', [])
+                if items:
+                    tr = items[0]
+                    artists = ", ".join([a.get('name', '') for a in tr.get('artists', [])])
+                    album_art = tr.get('album', {}).get('images', [{}])[0].get('url', '')
+                    return {
+                        'title': tr.get('name', ''),
+                        'artist': artists,
+                        'album': tr.get('album', {}).get('name', ''),
+                        'cover': album_art,
+                        'spotify_url': tr.get('external_urls', {}).get('spotify', ''),
+                        'source': 'Spotify Engine'
+                    }
+    except Exception as e:
+        logger.debug(f"Spotify search error: {e}")
+    return None
+
+
+def search_itunes_track(query: str) -> Optional[Dict[str, Any]]:
+    """Searches Apple Music / iTunes Store API for track details."""
+    if not query:
+        return None
+    try:
+        q_enc = urllib.parse.quote(query)
+        req_url = f"https://itunes.apple.com/search?term={q_enc}&entity=song&limit=1"
+        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                results = data.get('results', [])
+                if results:
+                    tr = results[0]
+                    cover_hq = tr.get('artworkUrl100', '').replace('100x100bb', '1000x1000bb')
+                    return {
+                        'title': tr.get('trackName', ''),
+                        'artist': tr.get('artistName', ''),
+                        'album': tr.get('collectionName', ''),
+                        'genre': tr.get('primaryGenreName', ''),
+                        'cover': cover_hq,
+                        'source': 'Apple Music Engine'
+                    }
+    except Exception as e:
+        logger.debug(f"iTunes search error: {e}")
+    return None
+
+
+def search_deezer_track(query: str) -> Optional[Dict[str, Any]]:
+    """Searches Deezer Music API for track details."""
+    if not query:
+        return None
+    try:
+        q_enc = urllib.parse.quote(query)
+        req_url = f"https://api.deezer.com/search?q={q_enc}&limit=1"
+        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                items = data.get('data', [])
+                if items:
+                    tr = items[0]
+                    return {
+                        'title': tr.get('title', ''),
+                        'artist': tr.get('artist', {}).get('name', ''),
+                        'album': tr.get('album', {}).get('title', ''),
+                        'cover': tr.get('album', {}).get('cover_xl') or tr.get('album', {}).get('cover_medium', ''),
+                        'preview': tr.get('preview', ''),
+                        'source': 'Deezer Engine'
+                    }
+    except Exception as e:
+        logger.debug(f"Deezer search error: {e}")
+    return None
+
+
+def search_multi_engine_track(query: str) -> Optional[Dict[str, Any]]:
+    """Query Deezer, iTunes, and Spotify engines simultaneously for highest accuracy."""
+    clean_q = clean_music_query(query)
+    if not clean_q:
+        return None
+
+    # Priority 1: Spotify
+    sp_res = search_spotify_track(clean_q)
+    if sp_res:
+        return sp_res
+
+    # Priority 2: iTunes / Apple Music
+    it_res = search_itunes_track(clean_q)
+    if it_res:
+        return it_res
+
+    # Priority 3: Deezer
+    dz_res = search_deezer_track(clean_q)
+    if dz_res:
+        return dz_res
+
+    return None
+
+
+def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
+    """Extracts Spotify track info via oEmbed API."""
+    try:
+        req_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(url)}"
+        req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                full_title = data.get('title', '')
+                parts = full_title.split(' - ')
+                title = parts[0] if len(parts) > 0 else full_title
+                artist = parts[1] if len(parts) > 1 else "Spotify Artist"
+                return {
+                    'title': title,
+                    'artist': artist,
+                    'thumbnail': data.get('thumbnail_url', '')
+                }
+    except Exception as e:
+        logger.debug(f"Spotify oEmbed error: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Direct Scrapers for Instagram Fallbacks
+# ---------------------------------------------------------------------------
+
+def extract_instagram_dd_info(url: str) -> Optional[Dict[str, Any]]:
+    """Scrapes DDInstagram endpoint for reel/video media."""
+    try:
+        dd_url = url.replace("instagram.com", "ddinstagram.com").replace("instagr.am", "ddinstagram.com")
+        req = urllib.request.Request(dd_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            video_match = re.search(r'<meta property="og:video" content="([^"]+)"', html)
+            thumb_match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+            desc_match = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+
+            if video_match:
+                v_url = video_match.group(1).replace("&amp;", "&")
+                thumb = thumb_match.group(1) if thumb_match else None
+                desc = desc_match.group(1) if desc_match else "ویدیو اینستاگرام"
+                return {
+                    "direct_url": v_url,
+                    "title": "ویدیو اینستاگرام",
+                    "description": desc,
+                    "thumbnail": thumb,
+                    "formats": [{"url": v_url, "ext": "mp4", "height": 720, "vcodec": "h264"}],
+                    "duration": 60
+                }
+    except Exception as e:
+        logger.debug(f"DDInstagram scraper error: {e}")
+    return None
+
+
+def extract_instagram_embed_info(url: str) -> Optional[Dict[str, Any]]:
+    """Scrapes Instagram embed endpoint."""
+    try:
+        embed_url = f"{url.rstrip('/')}/embed/captioned/"
+        req = urllib.request.Request(embed_url, headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            video_match = re.search(r'video_url\\":\\"([^"]+)\\"', html)
+            if video_match:
+                v_url = video_match.group(1).replace('\\u0026', '&').replace('\\/', '/')
+                return {
+                    "direct_url": v_url,
+                    "title": "ویدیو اینستاگرام",
+                    "description": "پست اینستاگرام",
+                    "formats": [{"url": v_url, "ext": "mp4", "height": 720, "vcodec": "h264"}],
+                    "duration": 60
+                }
+    except Exception as e:
+        logger.debug(f"Instagram embed scraper error: {e}")
+    return None
+
+
+async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
+    """Calls Cobalt API node fallback."""
+    cobalt_instances = ["https://api.cobalt.tools/api/json", "https://cobalt.qaz.im/api/json"]
+    payload = json.dumps({"url": url, "vQuality": "720"}).encode('utf-8')
+
+    loop = asyncio.get_event_loop()
+    for instance in cobalt_instances:
+        def _call():
+            try:
+                req = urllib.request.Request(
+                    instance, data=payload,
+                    headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    if resp.status == 200:
+                        return json.loads(resp.read().decode('utf-8'))
+            except Exception:
+                return None
+
+        data = await loop.run_in_executor(executor, _call)
+        if data and 'url' in data:
+            return {
+                "direct_url": data['url'],
+                "title": "رسانه استخراج شده",
+                "description": "استخراج شده با موتور کمکی",
+                "formats": [{"url": data['url'], "ext": "mp4", "height": 720, "vcodec": "h264"}],
+                "duration": 60
+            }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Shazam Audio Recognition Engine
+# ---------------------------------------------------------------------------
+
 def generate_audio_chunks(input_path: str) -> List[Tuple[str, str]]:
     """Generates multiple sliced and speed-normalized WAV chunks for multi-track & mix detection."""
     if not os.path.exists(input_path):
         return []
 
-    generated_files: List[Tuple[str, str]] = [] # List of (filepath, description)
+    generated_files: List[Tuple[str, str]] = []
     try:
         cmd_duration = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -197,14 +494,10 @@ def generate_audio_chunks(input_path: str) -> List[Tuple[str, str]]:
         res = subprocess.run(cmd_duration, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         duration = float(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else 30.0
 
-        # Define key time offsets to scan for DJ Mixes / Reels (Beginning, Middle 1, Middle 2, End)
         offsets = [0.0]
-        if duration > 15:
-            offsets.append(duration * 0.3)
-        if duration > 30:
-            offsets.append(duration * 0.6)
-        if duration > 45:
-            offsets.append(duration * 0.8)
+        if duration > 15: offsets.append(duration * 0.3)
+        if duration > 30: offsets.append(duration * 0.6)
+        if duration > 45: offsets.append(duration * 0.8)
 
         for idx, start_t in enumerate(offsets):
             crop_dur = 12.0
@@ -254,7 +547,6 @@ async def recognize_audio_shazam(filepath: str) -> Optional[Dict[str, Any]]:
 
     detected_tracks: List[Dict[str, Any]] = []
     seen_track_keys = set()
-
     loop = asyncio.get_event_loop()
 
     for chunk_path, label in chunk_items:
@@ -275,7 +567,6 @@ async def recognize_audio_shazam(filepath: str) -> Optional[Dict[str, Any]]:
                     logger.debug(f"ShazamIO error for {label}: {e}")
 
             if not track_info:
-                # Fallback Direct REST Request
                 def _raw_shazam_request(c_path):
                     try:
                         with open(c_path, 'rb') as f:
@@ -314,26 +605,28 @@ async def recognize_audio_shazam(filepath: str) -> Optional[Dict[str, Any]]:
                     pass
 
     if detected_tracks:
-        # Primary Track
         main_track = detected_tracks[0]
         return {
             'title': main_track['title'],
             'artist': main_track['artist'],
             'genre': main_track.get('genre', 'نامشخص'),
-            'all_tracks': detected_tracks, # Holds all detected songs in DJ mix/mashup
+            'all_tracks': detected_tracks,
             'is_mix': len(detected_tracks) > 1
         }
 
     return None
 
 
+# ---------------------------------------------------------------------------
+# Extraction & Download Pipelines
+# ---------------------------------------------------------------------------
+
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
     """Multi-tiered Extraction Pipeline ensuring maximum success without errors."""
     clean_url = clean_media_url(url)
 
-    # Tier 0: Direct Spotify Track URL Handler
     if is_spotify_url(clean_url):
-        logger.info("Extracting Spotify metadata via oEmbed...")
+        logger.info("Extracting Spotify metadata...")
         sp_info = extract_spotify_info_oembed(clean_url)
         if sp_info:
             return {
@@ -351,7 +644,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
     cookie_file = setup_cookies_file()
     loop = asyncio.get_event_loop()
 
-    # Tier 1: yt-dlp Extraction with Rotating Player Clients & Mobile User-Agents
     strategies = [
         {
             'http_headers': {
@@ -365,7 +657,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         {
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-                'Accept': '*/*',
             },
             'extractor_args': {
                 'youtube': {'player_client': ['ios', 'web']},
@@ -394,33 +685,26 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     return ydl.extract_info(clean_url, download=False)
             except Exception as ex:
-                logger.debug(f"yt-dlp extraction strategy failed: {ex}")
+                logger.debug(f"yt-dlp strategy failed: {ex}")
                 return None
 
         result = await loop.run_in_executor(executor, _fetch)
         if result:
             return result
 
-    # Tier 2: DDInstagram Proxy Scraper (For Instagram URLs)
     if is_instagram_url(clean_url):
-        logger.info("Attempting DDInstagram Proxy Scraper...")
         dd_res = await loop.run_in_executor(executor, lambda: extract_instagram_dd_info(clean_url))
         if dd_res:
             return dd_res
 
-        # Tier 3: Instagram Embed Scraper
-        logger.info("Attempting Instagram Embed Scraper...")
         embed_res = await loop.run_in_executor(executor, lambda: extract_instagram_embed_info(clean_url))
         if embed_res:
             return embed_res
 
-    # Tier 4: Cobalt Multi-Node Extractor Fallback
-    logger.info("Attempting Cobalt API Node fallback...")
     cobalt_res = await fetch_cobalt_fallback_info(clean_url)
     if cobalt_res:
         return cobalt_res
 
-    # Tier 5: Direct Stream Fallback Guarantee
     if is_instagram_url(clean_url) or is_youtube_url(clean_url):
         return {
             "direct_url": clean_url,
@@ -443,7 +727,7 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
         target_path = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp4")
         try:
             req = urllib.request.Request(direct_url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
             with urllib.request.urlopen(req, timeout=180) as resp, open(target_path, 'wb') as out_file:
                 shutil.copyfileobj(resp, out_file)
@@ -475,12 +759,8 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
             'merge_output_format': 'mp4',
             'nocheckcertificate': True,
             'concurrent_fragment_downloads': 16,
-            'buffersize': 4096 * 1024,
-            'extractor_args': {
-                'youtube': {'player_client': ['android', 'ios', 'mweb']},
-            },
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 Mobile Safari/537.36',
             }
         }
 
@@ -543,29 +823,27 @@ async def download_media_audio(url: str, bitrate: str, output_prefix: str) -> Op
 
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, output_prefix: str) -> Optional[Dict[str, Any]]:
-    """Ultra-resilient YouTube Music & YouTube search & download pipeline."""
+    """Multi-Engine Search & YouTube Music Audio Downloader Pipeline."""
     queries_to_try = []
 
-    # Direct YouTube / YouTube Music link check
+    # Check direct link
     if is_youtube_url(caption or track_title):
-        direct_yt_url = clean_media_url(caption or track_title)
-        queries_to_try.append(direct_yt_url)
+        queries_to_try.append(clean_media_url(caption or track_title))
 
     clean_t = clean_music_query(track_title)
     clean_a = clean_music_query(artist_name)
     extracted_title, extracted_artist = extract_music_info_from_caption(caption)
 
-    spotify_match = None
     search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_artist} {extracted_title}".strip() or clean_music_query(caption[:100])
 
-    if search_seed and len(search_seed) >= 3:
-        spotify_match = search_spotify_track(search_seed)
+    # 1. Multi-Engine Query Discovery (Deezer + iTunes + Spotify)
+    multi_match = search_multi_engine_track(search_seed)
 
-    if spotify_match:
-        sp_title = spotify_match['title']
-        sp_artist = spotify_match['artist']
-        queries_to_try.append(f"{sp_artist} {sp_title} audio")
-        queries_to_try.append(f"{sp_artist} {sp_title} official music video")
+    if multi_match:
+        m_title = multi_match['title']
+        m_artist = multi_match['artist']
+        queries_to_try.append(f"{m_artist} {m_title} audio")
+        queries_to_try.append(f"{m_artist} {m_title} official song")
 
     if clean_a and clean_t:
         queries_to_try.append(f"{clean_a} {clean_t} audio")
@@ -579,11 +857,6 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         q_ext = clean_music_query(f"{extracted_artist} {extracted_title}")
         if q_ext and q_ext not in queries_to_try:
             queries_to_try.append(f"{q_ext} audio")
-
-    if not queries_to_try and caption:
-        clean_cap = clean_music_query(caption[:120])
-        if clean_cap:
-            queries_to_try.append(f"{clean_cap} song")
 
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
     cookie_file = setup_cookies_file()
@@ -605,7 +878,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
             'youtube': {'player_client': ['android', 'ios', 'mweb']},
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 Mobile Safari/537.36',
         }
     }
 
@@ -618,8 +891,12 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         try:
             def _search():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    target = search_q if search_q.startswith("http") else f"ytsearch5:{search_q}"
+                    target = search_q if search_q.startswith("http") else f"ytmsearch5:{search_q}"
                     info = ydl.extract_info(target, download=False)
+                    if not info:
+                        target = f"ytsearch5:{search_q}"
+                        info = ydl.extract_info(target, download=False)
+                    
                     if not info:
                         return None
 
@@ -636,15 +913,16 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                             if video_url:
                                 ydl.download([video_url])
 
-                                final_title = (spotify_match.get('title') if spotify_match else None) or entry.get('title') or track_title or "Original Song"
-                                final_artist = (spotify_match.get('artist') if spotify_match else None) or entry.get('uploader') or entry.get('artist') or artist_name or "Unknown Artist"
+                                final_title = (multi_match.get('title') if multi_match else None) or entry.get('title') or track_title or "Original Song"
+                                final_artist = (multi_match.get('artist') if multi_match else None) or entry.get('uploader') or entry.get('artist') or artist_name or "Unknown Artist"
 
                                 return {
                                     'filepath': os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3"),
                                     'title': final_title,
                                     'uploader': final_artist,
                                     'duration': duration,
-                                    'spotify_url': spotify_match.get('spotify_url') if spotify_match else None
+                                    'spotify_url': multi_match.get('spotify_url') if multi_match else None,
+                                    'engine': multi_match.get('source') if multi_match else 'YouTube Music Engine'
                                 }
                     return None
 
@@ -658,20 +936,24 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     return None
 
 
+# ---------------------------------------------------------------------------
+# Telegram Bot Command Handlers
+# ---------------------------------------------------------------------------
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends custom greeting message on /start command."""
     welcome_text = (
         "درود به روی ماهت 🧘🏾🌚\n"
-        "من ربات دانلودر و تشخیص هوشمند موزیک هستم 🧸\n\n"
+        "من ربات دانلودر و موتور جستجوی هوشمند موسیقی هستم 🧸\n\n"
         "با من می‌تونی ویدئوها، موزیک‌ها و پست‌های هر پلتفرمی رو بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
-        "همچنین ابزار اختصاصی **تشخیص هوشمند بیت و موزیک (Shazam)** برام فعال شده تا دقیق‌ترین رمیکس‌ها، فونک‌ها (Phonk) و موزیک‌های اسلو رو برات پیدا کنم! 🎧🔥\n\n"
-        "کافیه فقط لینک پست یا حتی یک وویس/ویدیو برام بفرستی 🧸"
+        "همچنین ربات به **قدرتمندترین موتورهای شناساگر موسیقی (Shazam, Deezer, Apple Music, Spotify)** متصل شده تا تمام رمیکس‌ها، بیت‌ها و موزیک‌های اسلو رو برات پیدا کنه! 🎧🔥\n\n"
+        "کافیه فقط لینک پست، آهنگ، یا یک وویس/ویدیو برام بفرستی 🧸"
     )
     await update.message.reply_text(welcome_text)
 
 
 async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming Instagram and YouTube links safely without crashing."""
+    """Processes incoming Instagram, YouTube, and Spotify links."""
     url = update.message.text.strip()
 
     if not is_supported_url(url):
@@ -772,11 +1054,11 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     keyboard.append([
-        InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی (Spotify / YouTube)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
+        InlineKeyboardButton("🎧 جستجو و دانلود آهنگ اصلی (Multi-Engine)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
     ])
 
     keyboard.append([
-        InlineKeyboardButton("🔍 تشخیص هوشمند موزیک و بیت (Shazam)", callback_data=f"shazam:{cache_id}:{current_slide}")
+        InlineKeyboardButton("🔍 تشخیص هوشمند موزیک و بیت (Shazam Pro)", callback_data=f"shazam:{cache_id}:{current_slide}")
     ])
 
     extra_row = []
@@ -852,292 +1134,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     cached_item = MEDIA_CACHE.get(cache_id)
-    if not cached_item:
-        await query.message.reply_text("❌ نشست این پست منقضی شده است. لطفاً دوباره لینک را ارسال کنید.")
-        return
 
-    url = cached_item["url"]
-    direct_url = cached_item.get("direct_url")
-    file_prefix = f"file_{uuid.uuid4().hex[:6]}"
-
-    if action_type == "vid":
-        status_msg = await query.message.reply_text("⏳ در حال دانلود ویدیو... لطفاً صبور باشید.")
-        filepath = await download_media_video(url, param, file_prefix, direct_url=direct_url)
-
-        try:
-            if filepath and os.path.exists(filepath):
-                filesize = os.path.getsize(filepath)
-                if filesize > 50 * 1024 * 1024:
-                    await status_msg.edit_text("❌ حجم ویدیو بیشتر از محدودیّت ۵۰ مگابایت تلگرام است.")
-                    return
-
-                await status_msg.edit_text("⬆️ در حال آپلود ویدیو به تلگرام...")
-                with open(filepath, 'rb') as video_file:
-                    await query.message.reply_video(
-                        video=video_file,
-                        caption="✨ دانلود شده توسط ربات دانلودر",
-                        supports_streaming=True,
-                        read_timeout=300,
-                        write_timeout=300,
-                        connect_timeout=300
-                    )
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ خطا در دانلود ویدیو. در حال پردازش مجدد...")
-        except Exception as e:
-            logger.error(f"Error uploading video: {e}")
-            await status_msg.edit_text("❌ خطا در ارسال ویدیو به تلگرام.")
-        finally:
-            if filepath and os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-
-    elif action_type == "aud":
-        status_msg = await query.message.reply_text(f"⏳ در حال استخراج ویس با کیفیت {param}kbps...")
-        filepath = await download_media_audio(url, param, file_prefix)
-
-        try:
-            if filepath and os.path.exists(filepath):
-                await status_msg.edit_text("⬆️ در حال ارسال فایل صوتی...")
-                with open(filepath, 'rb') as audio_file:
-                    await query.message.reply_audio(
-                        audio=audio_file,
-                        caption=f"🎵 ویس استخراج شده با کیفیت {param}kbps",
-                        read_timeout=300,
-                        write_timeout=300
-                    )
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ خطا در استخراج فایل صوتی.")
-        finally:
-            if filepath and os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-
-    elif action_type == "shazam":
-        status_msg = await query.message.reply_text("🔍 🎧 در حال اسکن عمیق چندمرحله‌ای صوت و تشخیص میکس‌ها با Shazam Fingerprint...")
-        filepath = await download_media_audio(url, "128", file_prefix)
-
-        if filepath and os.path.exists(filepath):
-            shazam_res = await recognize_audio_shazam(filepath)
-
-            if shazam_res:
-                s_title = shazam_res['title']
-                s_artist = shazam_res['artist']
-                s_genre = shazam_res.get('genre', 'نامشخص')
-                all_detected = shazam_res.get('all_tracks', [])
-
-                if len(all_detected) > 1:
-                    mix_text = "🔥 **این پست یک میکس/مَش‌آپ چندهنگه است! لیست آهنگ‌های کشف‌شده:**\n\n"
-                    for idx, trk in enumerate(all_detected, 1):
-                        mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **اثر:** {trk['artist']}\n\n"
-                    
-                    mix_text += "🟢 در حال دریافت و دانلود آهنگ اصلی اول..."
-                    await status_msg.edit_text(mix_text)
-                else:
-                    await status_msg.edit_text(f"🎯 **موزیک/بیت دقیق شناسایی شد!**\n\n🎵 عنوان: {s_title}\n👤 اثر: {s_artist}\n🎸 سبک: {s_genre}\n\n🟢 در حال دانلود نسخه کامل 320kbps...")
-
-                # Send each detected track in the mix
-                for idx, trk in enumerate(all_detected[:3]): # Download top detected songs
-                    cur_title = trk['title']
-                    cur_artist = trk['artist']
-                    full_res = await search_and_download_full_track(cur_title, cur_artist, f"{cur_title} {cur_artist}", f"shz_{idx}_{file_prefix}")
-
-                    if full_res and os.path.exists(full_res['filepath']):
-                        caption_audio = f"🔥 موزیک کامل ({idx if len(all_detected) > 1 else 'Shazam Match'}):\n🎵 عنوان: {cur_title}\n👤 خواننده: {cur_artist}\n✨ کیفیت: 320kbps (HQ)"
-                        with open(full_res['filepath'], 'rb') as audio_file:
-                            await query.message.reply_audio(
-                                audio=audio_file,
-                                title=cur_title,
-                                performer=cur_artist,
-                                caption=caption_audio
-                            )
-                        if os.path.exists(full_res['filepath']):
-                            try:
-                                os.remove(full_res['filepath'])
-                            except Exception:
-                                pass
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ نتوانستیم بیت دقیق را با شزام تشخیص دهیم. در حال تلاش از طریق موتور جستجوی ثانویه...")
-                res = await search_and_download_full_track(cached_item.get("track_title", ""), cached_item.get("artist_name", ""), cached_item.get("caption", ""), file_prefix)
-                if res and os.path.exists(res['filepath']):
-                    with open(res['filepath'], 'rb') as audio_file:
-                        await query.message.reply_audio(audio=audio_file, caption="🎧 موزیک پیدا شده")
-                    await status_msg.delete()
-
-            if filepath and os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-        else:
-            await status_msg.edit_text("❌ خطا در استخراج صوت جهت آنالیز شزام.")
-
-    elif action_type == "fullm":
-        status_msg = await query.message.reply_text("🟢 🔎 در حال آنالیز اثر در Spotify و جستجوی نسخه کامل...")
-
-        track_title = cached_item.get("track_title", "")
-        artist_name = cached_item.get("artist_name", "")
-        caption = cached_item.get("caption", "")
-
-        res = await search_and_download_full_track(track_title, artist_name, caption, file_prefix)
-
-        try:
-            if res and os.path.exists(res['filepath']):
-                await status_msg.edit_text("⬆️ در حال ارسال موزیک کامل با کیفیت 320kbps...")
-                sp_note = f"\n🌐 لینک اسپاتیفای: {res['spotify_url']}" if res.get('spotify_url') else ""
-                caption_audio = f"🎧 موزیک کامل اورجینال:\n🎵 عنوان: {res['title']}\n👤 خواننده: {res['uploader']}\n✨ کیفیت: 320kbps (HQ){sp_note}"
-
-                with open(res['filepath'], 'rb') as audio_file:
-                    await query.message.reply_audio(
-                        audio=audio_file,
-                        title=res['title'],
-                        performer=res['uploader'],
-                        caption=caption_audio,
-                        read_timeout=300,
-                        write_timeout=300
-                    )
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ متأسفانه نسخه کامل این موزیک یافت نشد.")
-        finally:
-            if res and os.path.exists(res['filepath']):
-                try:
-                    os.remove(res['filepath'])
-                except Exception:
-                    pass
-
-    elif action_type == "img":
-        thumb_url = cached_item.get("thumbnail")
-        if thumb_url:
-            await query.message.reply_photo(photo=thumb_url, caption="🖼 کاور با کیفیت اصلی")
-
-    elif action_type == "cap":
-        full_cap = cached_item.get("caption", "بدون کپشن")
-        clean_full_cap = sanitize_telegram_text(full_cap)
-        await query.message.reply_text(f"📜 کپشن کامل:\n\n{clean_full_cap}")
-
-
-async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows users to send direct Voice/Audio files to identify music & beats via Shazam."""
-    msg = update.message
-    file_obj = msg.audio or msg.voice
-
-    if not file_obj:
-        return
-
-    status_msg = await msg.reply_text("🔍 🎧 در حال دریافت فایل صوتی و آنالیز عمیق میکس با Shazam...")
-    temp_path = os.path.join(DOWNLOAD_DIR, f"direct_{uuid.uuid4().hex[:6]}.mp3")
-
-    try:
-        tg_file = await file_obj.get_file()
-        await tg_file.download_to_drive(temp_path)
-
-        shazam_res = await recognize_audio_shazam(temp_path)
-
-        if shazam_res:
-            s_title = shazam_res['title']
-            s_artist = shazam_res['artist']
-            s_genre = shazam_res.get('genre', 'نامشخص')
-            all_detected = shazam_res.get('all_tracks', [])
-
-            if len(all_detected) > 1:
-                mix_text = "🔥 **این ویس شامل میکس چند آهنگ است! لیست آهنگ‌ها:**\n\n"
-                for idx, trk in enumerate(all_detected, 1):
-                    mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **اثر:** {trk['artist']}\n\n"
-                
-                mix_text += "🟢 در حال ارسال آهنگ‌های کامل..."
-                await status_msg.edit_text(mix_text)
-            else:
-                await status_msg.edit_text(f"🎯 **موزیک/بیت دقیق شناسایی شد!**\n\n🎵 عنوان: {s_title}\n👤 اثر: {s_artist}\n🎸 سبک: {s_genre}\n\n🟢 در حال دانلود نسخه کامل 320kbps...")
-
-            for idx, trk in enumerate(all_detected[:3]):
-                cur_title = trk['title']
-                cur_artist = trk['artist']
-                full_res = await search_and_download_full_track(cur_title, cur_artist, cur_title, f"shz_dir_{idx}_{uuid.uuid4().hex[:4]}")
-
-                if full_res and os.path.exists(full_res['filepath']):
-                    caption_audio = f"🔥 موزیک کامل (Shazam Match):\n🎵 عنوان: {cur_title}\n👤 خواننده: {cur_artist}\n✨ کیفیت: 320kbps (HQ)"
-                    with open(full_res['filepath'], 'rb') as audio_file:
-                        await msg.reply_audio(
-                            audio=audio_file,
-                            title=cur_title,
-                            performer=cur_artist,
-                            caption=caption_audio
-                        )
-                    if os.path.exists(full_res['filepath']):
-                        try:
-                            os.remove(full_res['filepath'])
-                        except Exception:
-                            pass
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text("❌ متأسفانه اثری از این صوت در دیتابیس شزام پیدا نشد.")
-
-    except Exception as ex:
-        logger.error(f"Error handling direct audio message: {ex}")
-        await status_msg.edit_text("❌ خطا در پردازش فایل صوتی.")
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-
-async def handle_direct_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles direct video files sent by user and prompts with an interactive decision menu."""
-    msg = update.message
-    video_obj = msg.video or msg.video_note or msg.document
-    if not video_obj:
-        return
-
-    cache_id = f"vfile_{uuid.uuid4().hex[:8]}"
-    
-    MEDIA_CACHE[cache_id] = {
-        "type": "video_file",
-        "file_id": video_obj.file_id,
-        "duration": getattr(video_obj, "duration", 0),
-        "file_name": getattr(video_obj, "file_name", "video.mp4"),
-        "timestamp": time.time()
-    }
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🎵 جدا کردن فایل صوتی (MP3)", callback_data=f"vopt:extract_audio:{cache_id}"),
-            InlineKeyboardButton("🔍 تشخیص آهنگ اصلی / رمیکس", callback_data=f"vopt:shazam:{cache_id}")
-        ],
-        [
-            InlineKeyboardButton("👤 شناسایی هنرمند و جزئیات موزیک", callback_data=f"vopt:artist:{cache_id}"),
-            InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی 320", callback_data=f"vopt:full_music:{cache_id}")
-        ]
-    ]
-
-    caption = (
-        "🎬 **ویدیو دریافت شد!**\n\n"
-        "لطفاً کاری که می‌خواهید انجام دهم را انتخاب کنید:"
-    )
-
-    await msg.reply_text(
-        text=caption,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-
-    if not file_obj:
-    elif action_type == "cap":
-        full_cap = cached_item.get("caption", "بدون کپشن")
-        clean_full_cap = sanitize_telegram_text(full_cap)
-        await query.message.reply_text(f"📜 کپشن کامل:\n\n{clean_full_cap}")
-
-    elif action_type == "vopt":
-        sub_action = data_parts[1]
+    # Handle Video Options Menu Callbacks
+    if action_type == "vopt":
+        sub_action = cache_id
         v_cache_id = data_parts[2]
         cached_vid = MEDIA_CACHE.get(v_cache_id)
 
@@ -1185,7 +1185,7 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                             pass
 
         elif sub_action in ["shazam", "artist", "full_music"]:
-            status_msg = await query.message.reply_text("🔍 🎧 در حال استخراج صوت و آنالیز عمیق هوشمند (Shazam)...")
+            status_msg = await query.message.reply_text("🔍 🎧 در حال استخراج صوت و آنالیز عمیق با موتور Shazam & Multi-Engine...")
             try:
                 tg_file = await context.bot.get_file(file_id)
                 await tg_file.download_to_drive(temp_video_path)
@@ -1207,20 +1207,18 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                         is_mix = shazam_res.get('is_mix', False)
 
                         if sub_action == "artist":
+                            multi_match = search_multi_engine_track(f"{s_artist} {s_title}")
                             text = (
                                 f"👤 **مشخصات هنرمند و اثر شناسایی‌شده:**\n\n"
                                 f"🎤 **هنرمند / خواننده:** {s_artist}\n"
                                 f"🎵 **عنوان اثر:** {s_title}\n"
                                 f"🎸 **سبک موسیقی:** {s_genre}\n"
-                                f"🔀 **نوع اثر:** {'میکس / رمیکس چندتایی' if is_mix else 'آهنگ اصلی / رمیکس'}\n"
+                                f"🌐 **موتور شناساگر:** Shazam Pro Engine\n"
                             )
-                            if len(all_detected) > 1:
-                                text += "\n📜 **سایر ترک‌های موجود در این میکس:**\n"
-                                for idx, trk in enumerate(all_detected[1:], 2):
-                                    text += f"{idx}. {trk['artist']} - {trk['title']}\n"
+                            if multi_match and multi_match.get('album'):
+                                text += f"💿 **آلبوم:** {multi_match['album']}\n"
 
-                            sp_info = get_spotify_token()
-                            await status_msg.edit_text(text, parse_mode="Markdown")
+                            await status_msg.edit_text(text)
 
                         elif sub_action == "shazam":
                             if is_mix:
@@ -1228,15 +1226,14 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                                 for idx, trk in enumerate(all_detected, 1):
                                     mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **هنرمند:** {trk['artist']}\n\n"
                                 mix_text += "🟢 در حال دریافت و ارسال فایل کامل ۳۲۰ این آهنگ‌ها..."
-                                await status_msg.edit_text(mix_text, parse_mode="Markdown")
+                                await status_msg.edit_text(mix_text)
                             else:
                                 await status_msg.edit_text(
                                     f"🎯 **آهنگ/رمیکس شناسایی شد!**\n\n"
                                     f"🎵 **عنوان:** {s_title}\n"
                                     f"👤 **هنرمند:** {s_artist}\n"
                                     f"🎸 **سبک:** {s_genre}\n\n"
-                                    f"🟢 در حال دانلود نسخه کامل 320kbps...",
-                                    parse_mode="Markdown"
+                                    f"🟢 در حال دانلود نسخه کامل 320kbps..."
                                 )
 
                             for idx, trk in enumerate(all_detected[:3]):
@@ -1275,7 +1272,7 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                                 await status_msg.edit_text("❌ متأسفانه نسخه کامل این موزیک یافت نشد.")
 
                     else:
-                        await status_msg.edit_text("❌ نتوانستیم اثری از این موزیک در دیتابیس شزام پیدا کنیم.")
+                        await status_msg.edit_text("❌ نتوانستیم اثری از این موزیک در دیتابیس پیدا کنیم.")
                 else:
                     await status_msg.edit_text("❌ خطا در استخراج صوت ویدیو.")
 
@@ -1289,9 +1286,180 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                             os.remove(p)
                         except Exception:
                             pass
+        return
+
+    if not cached_item:
+        await query.message.reply_text("❌ نشست این پست منقضی شده است. لطفاً دوباره لینک را ارسال کنید.")
+        return
+
+    url = cached_item["url"]
+    direct_url = cached_item.get("direct_url")
+    file_prefix = f"file_{uuid.uuid4().hex[:6]}"
+
+    if action_type == "vid":
+        status_msg = await query.message.reply_text("⏳ در حال دانلود ویدیو... لطفاً صبور باشید.")
+        filepath = await download_media_video(url, param, file_prefix, direct_url=direct_url)
+
+        try:
+            if filepath and os.path.exists(filepath):
+                filesize = os.path.getsize(filepath)
+                if filesize > 50 * 1024 * 1024:
+                    await status_msg.edit_text("❌ حجم ویدیو بیشتر از محدودیّت ۵۰ مگابایت تلگرام است.")
+                    return
+
+                await status_msg.edit_text("⬆️ در حال آپلود ویدیو به تلگرام...")
+                with open(filepath, 'rb') as video_file:
+                    await query.message.reply_video(
+                        video=video_file,
+                        caption="✨ دانلود شده توسط ربات دانلودر",
+                        supports_streaming=True
+                    )
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ خطا در دانلود ویدیو.")
+        except Exception as e:
+            logger.error(f"Error uploading video: {e}")
+            await status_msg.edit_text("❌ خطا در ارسال ویدیو به تلگرام.")
+        finally:
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+
+    elif action_type == "aud":
+        status_msg = await query.message.reply_text(f"⏳ در حال استخراج ویس با کیفیت {param}kbps...")
+        filepath = await download_media_audio(url, param, file_prefix)
+
+        try:
+            if filepath and os.path.exists(filepath):
+                await status_msg.edit_text("⬆️ در حال ارسال فایل صوتی...")
+                with open(filepath, 'rb') as audio_file:
+                    await query.message.reply_audio(
+                        audio=audio_file,
+                        caption=f"🎵 ویس استخراج شده با کیفیت {param}kbps"
+                    )
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ خطا در استخراج فایل صوتی.")
+        finally:
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+
+    elif action_type == "shazam":
+        status_msg = await query.message.reply_text("🔍 🎧 در حال اسکن عمیق چندمرحله‌ای صوت و تشخیص میکس‌ها با Shazam Pro Fingerprint...")
+        filepath = await download_media_audio(url, "128", file_prefix)
+
+        if filepath and os.path.exists(filepath):
+            shazam_res = await recognize_audio_shazam(filepath)
+
+            if shazam_res:
+                s_title = shazam_res['title']
+                s_artist = shazam_res['artist']
+                s_genre = shazam_res.get('genre', 'نامشخص')
+                all_detected = shazam_res.get('all_tracks', [])
+
+                if len(all_detected) > 1:
+                    mix_text = "🔥 **این پست یک میکس/مَش‌آپ چندهنگه است! لیست آهنگ‌های کشف‌شده:**\n\n"
+                    for idx, trk in enumerate(all_detected, 1):
+                        mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **اثر:** {trk['artist']}\n\n"
+                    mix_text += "🟢 در حال دریافت و دانلود آهنگ اصلی اول..."
+                    await status_msg.edit_text(mix_text)
+                else:
+                    await status_msg.edit_text(f"🎯 **موزیک/بیت دقیق شناسایی شد!**\n\n🎵 عنوان: {s_title}\n👤 اثر: {s_artist}\n🎸 سبک: {s_genre}\n\n🟢 در حال دانلود نسخه کامل 320kbps...")
+
+                for idx, trk in enumerate(all_detected[:3]):
+                    cur_title = trk['title']
+                    cur_artist = trk['artist']
+                    full_res = await search_and_download_full_track(cur_title, cur_artist, f"{cur_title} {cur_artist}", f"shz_{idx}_{file_prefix}")
+
+                    if full_res and os.path.exists(full_res['filepath']):
+                        caption_audio = f"🔥 موزیک کامل (Shazam Match):\n🎵 عنوان: {cur_title}\n👤 خواننده: {cur_artist}\n✨ کیفیت: 320kbps (HQ)"
+                        with open(full_res['filepath'], 'rb') as audio_file:
+                            await query.message.reply_audio(
+                                audio=audio_file,
+                                title=cur_title,
+                                performer=cur_artist,
+                                caption=caption_audio
+                            )
+                        if os.path.exists(full_res['filepath']):
+                            try:
+                                os.remove(full_res['filepath'])
+                            except Exception:
+                                pass
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ نتوانستیم بیت دقیق را با شزام تشخیص دهیم. در حال تلاش با موتورهای ثانویه...")
+                res = await search_and_download_full_track(cached_item.get("track_title", ""), cached_item.get("artist_name", ""), cached_item.get("caption", ""), file_prefix)
+                if res and os.path.exists(res['filepath']):
+                    with open(res['filepath'], 'rb') as audio_file:
+                        await query.message.reply_audio(audio=audio_file, caption="🎧 موزیک پیدا شده با موتور جستجو")
+                    await status_msg.delete()
+
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+        else:
+            await status_msg.edit_text("❌ خطا در استخراج صوت جهت آنالیز.")
+
+    elif action_type == "fullm":
+        status_msg = await query.message.reply_text("🟢 🔎 در حال آنالیز اثر با موتورهای چندگانه (Spotify, iTunes, Deezer)...")
+
+        track_title = cached_item.get("track_title", "")
+        artist_name = cached_item.get("artist_name", "")
+        caption = cached_item.get("caption", "")
+
+        res = await search_and_download_full_track(track_title, artist_name, caption, file_prefix)
+
+        try:
+            if res and os.path.exists(res['filepath']):
+                await status_msg.edit_text("⬆️ در حال ارسال موزیک کامل با کیفیت 320kbps...")
+                sp_note = f"\n🌐 لینک اسپاتیفای: {res['spotify_url']}" if res.get('spotify_url') else ""
+                eng_note = f"\n⚡ موتور جستجو: {res.get('engine', 'Multi-Engine')}"
+                caption_audio = f"🎧 موزیک کامل اورجینال:\n🎵 عنوان: {res['title']}\n👤 خواننده: {res['uploader']}\n✨ کیفیت: 320kbps (HQ){eng_note}{sp_note}"
+
+                with open(res['filepath'], 'rb') as audio_file:
+                    await query.message.reply_audio(
+                        audio=audio_file,
+                        title=res['title'],
+                        performer=res['uploader'],
+                        caption=caption_audio
+                    )
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ متأسفانه نسخه کامل این موزیک یافت نشد.")
+        finally:
+            if res and os.path.exists(res['filepath']):
+                try:
+                    os.remove(res['filepath'])
+                except Exception:
+                    pass
+
+    elif action_type == "img":
+        thumb_url = cached_item.get("thumbnail")
+        if thumb_url:
+            await query.message.reply_photo(photo=thumb_url, caption="🖼 کاور با کیفیت اصلی")
+
+    elif action_type == "cap":
+        full_cap = cached_item.get("caption", "بدون کپشن")
+        clean_full_cap = sanitize_telegram_text(full_cap)
+        await query.message.reply_text(f"📜 کپشن کامل:\n\n{clean_full_cap}")
 
 
-    status_msg = await msg.reply_text("🔍 🎧 در حال دریافت فایل صوتی و آنالیز عمیق میکس با Shazam...")
+async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows users to send direct Voice/Audio files to identify music & beats via Shazam Pro & Multi-Engine."""
+    msg = update.message
+    file_obj = msg.audio or msg.voice
+
+    if not file_obj:
+        return
+
+    status_msg = await msg.reply_text("🔍 🎧 در حال دریافت فایل صوتی و آنالیز عمیق میکس با Shazam Pro & Multi-Engine...")
     temp_path = os.path.join(DOWNLOAD_DIR, f"direct_{uuid.uuid4().hex[:6]}.mp3")
 
     try:
@@ -1307,10 +1475,9 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
             all_detected = shazam_res.get('all_tracks', [])
 
             if len(all_detected) > 1:
-                mix_text = "🔥 **این ویس/ویدیو شامل میکس چند آهنگ است! لیست آهنگ‌ها:**\n\n"
+                mix_text = "🔥 **این ویس شامل میکس چند آهنگ است! لیست آهنگ‌ها:**\n\n"
                 for idx, trk in enumerate(all_detected, 1):
                     mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **اثر:** {trk['artist']}\n\n"
-                
                 mix_text += "🟢 در حال ارسال آهنگ‌های کامل..."
                 await status_msg.edit_text(mix_text)
             else:
@@ -1337,7 +1504,7 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                             pass
             await status_msg.delete()
         else:
-            await status_msg.edit_text("❌ متأسفانه اثری از این صوت در دیتابیس شزام پیدا نشد.")
+            await status_msg.edit_text("❌ متأسفانه اثری از این صوت در دیتابیس پیدا نشد.")
 
     except Exception as ex:
         logger.error(f"Error handling direct audio message: {ex}")
@@ -1348,6 +1515,45 @@ async def handle_direct_video_message(update: Update, context: ContextTypes.DEFA
                 os.remove(temp_path)
             except Exception:
                 pass
+
+
+async def handle_direct_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles direct video files sent by user and prompts with an interactive decision menu."""
+    msg = update.message
+    video_obj = msg.video or msg.video_note or msg.document
+    if not video_obj:
+        return
+
+    cache_id = f"vfile_{uuid.uuid4().hex[:8]}"
+
+    MEDIA_CACHE[cache_id] = {
+        "type": "video_file",
+        "file_id": video_obj.file_id,
+        "duration": getattr(video_obj, "duration", 0),
+        "file_name": getattr(video_obj, "file_name", "video.mp4"),
+        "timestamp": time.time()
+    }
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 جدا کردن فایل صوتی (MP3 320)", callback_data=f"vopt:extract_audio:{cache_id}"),
+            InlineKeyboardButton("🔍 تشخیص آهنگ اصلی / رمیکس", callback_data=f"vopt:shazam:{cache_id}")
+        ],
+        [
+            InlineKeyboardButton("👤 شناسایی هنرمند و آلبوم", callback_data=f"vopt:artist:{cache_id}"),
+            InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی 320", callback_data=f"vopt:full_music:{cache_id}")
+        ]
+    ]
+
+    caption = (
+        "🎬 **ویدیو دریافت شد!**\n\n"
+        "لطفاً کاری که می‌خواهید انجام دهم را انتخاب کنید:"
+    )
+
+    await msg.reply_text(
+        text=caption,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def post_init(application: Application):
@@ -1365,7 +1571,7 @@ def main():
         logger.error("BOT_TOKEN variable is not set. Please specify BOT_TOKEN in environment.")
         sys.exit(1)
 
-    logger.info("Starting Telegram Media Downloader Bot...")
+    logger.info("Starting Telegram Media & Multi-Engine Music Downloader Bot...")
 
     setup_cookies_file()
 
