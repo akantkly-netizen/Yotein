@@ -35,7 +35,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("InstagramDownloaderBot")
+logger = logging.getLogger("MediaDownloaderBot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 DOWNLOAD_DIR = "temp_downloads"
@@ -52,8 +52,8 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 
 def setup_cookies_file() -> Optional[str]:
-    """Prepares and validates Instagram cookie file to bypass IP bans and rate limits."""
-    cookies_env = os.getenv("INSTAGRAM_COOKIES")
+    """Prepares and validates Instagram/YouTube cookie file if supplied."""
+    cookies_env = os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT")
     cookie_path = "cookies.txt"
 
     if cookies_env:
@@ -62,7 +62,7 @@ def setup_cookies_file() -> Optional[str]:
                 f.write(cookies_env.strip())
             return cookie_path
         except Exception as e:
-            logger.error(f"Error writing INSTAGRAM_COOKIES env: {e}")
+            logger.error(f"Error writing cookies env: {e}")
 
     if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
         return cookie_path
@@ -71,13 +71,13 @@ def setup_cookies_file() -> Optional[str]:
 
 
 def cleanup_temp_files():
-    """Removes old temporary downloaded files to prevent disk overload on Railway."""
+    """Removes old temporary downloaded files to prevent disk overload."""
     now = time.time()
     try:
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
             if os.path.isfile(filepath):
-                # Delete files older than 20 minutes
-                if now - os.path.getmtime(filepath) > 1200:
+                # Delete files older than 15 minutes
+                if now - os.path.getmtime(filepath) > 900:
                     try:
                         os.remove(filepath)
                     except Exception:
@@ -98,14 +98,14 @@ def clean_expired_cache():
 
 
 def is_instagram_url(url: str) -> bool:
-    """Validates if input text is an Instagram reel/post/tv/story link."""
-    pattern = r"(https?://)?(www\.)?(instagram\.com|instagr\.am)/(p|reel|tv|reels|stories)/[A-Za-z0-9_-]+"
+    """Validates if input text is an Instagram reel/post/tv/story/share link."""
+    pattern = r"(https?://)?(www\.)?(instagram\.com|instagr\.am)/(p|reel|reels|tv|stories|share)/[A-Za-z0-9_\-\.]+"
     return bool(re.search(pattern, url))
 
 
 def is_youtube_url(url: str) -> bool:
     """Validates if input text is a YouTube video/shorts/music link."""
-    pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/(watch\?v=|shorts/|live/|embed/|[A-Za-z0-9_-]+)"
+    pattern = r"(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/(watch\?v=|shorts/|live/|embed/|v/|[A-Za-z0-9_-]+)"
     return bool(re.search(pattern, url))
 
 
@@ -114,12 +114,24 @@ def is_supported_url(url: str) -> bool:
     return is_instagram_url(url) or is_youtube_url(url)
 
 
-def clean_instagram_url(url: str) -> str:
-    """Extracts clean Instagram post URL without tracking query parameters."""
-    match = re.search(r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|reels|stories)/[A-Za-z0-9_-]+)", url)
-    if match:
-        return match.group(1) + "/"
-    return url
+def clean_media_url(url: str) -> str:
+    """Extracts clean URL without tracking query parameters."""
+    if is_instagram_url(url):
+        match = re.search(r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|reels|stories|share)/[A-Za-z0-9_\-\.]+)", url)
+        if match:
+            return match.group(1) + "/"
+    elif is_youtube_url(url):
+        url = url.strip()
+        if "youtube.com/shorts/" in url:
+            shorts_id = url.split("shorts/")[1].split("?")[0].split("/")[0]
+            return f"https://www.youtube.com/shorts/{shorts_id}"
+        elif "youtu.be/" in url:
+            yt_id = url.split("youtu.be/")[1].split("?")[0].split("/")[0]
+            return f"https://www.youtube.com/watch?v={yt_id}"
+        elif "watch?v=" in url:
+            yt_id = url.split("watch?v=")[1].split("&")[0]
+            return f"https://www.youtube.com/watch?v={yt_id}"
+    return url.strip()
 
 
 def clean_music_query(raw_text: str) -> str:
@@ -313,33 +325,62 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
     return None
 
 
-async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Fetches Instagram media metadata using multiple user-agent fallback strategies."""
-    clean_url = clean_instagram_url(url)
+async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
+    """Fetches Instagram/YouTube media metadata using multi-strategy fallbacks and IG App ID bypass."""
+    clean_url = clean_media_url(url)
     cookie_file = setup_cookies_file()
 
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    # Advanced Multi-Strategy Configurations to bypass Cloud Server IP Blocking
+    strategies = [
+        # Strategy 1: Desktop Chrome with Instagram App ID & YouTube Android client
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'X-IG-App-ID': '936619743392459',
+                'Sec-Fetch-Mode': 'navigate',
+            },
+            'extractor_args': {
+                'youtube': {'player_client': ['android', 'web', 'mweb']},
+            }
+        },
+        # Strategy 2: iOS Mobile Safari header set
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'X-IG-App-ID': '936619743392459',
+            },
+            'extractor_args': {
+                'youtube': {'player_client': ['ios', 'web']},
+            }
+        },
+        # Strategy 3: Android Instagram App / Mobile browser set
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'X-IG-App-ID': '1217981644879628',
+            }
+        }
     ]
 
     loop = asyncio.get_event_loop()
 
-    for agent in user_agents:
+    for strat in strategies:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
             'nocheckcertificate': True,
             'concurrent_fragment_downloads': 12,
-            'http_headers': {
-                'User-Agent': agent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-Fetch-Mode': 'navigate',
-            },
+            'http_headers': strat.get('http_headers', {}),
         }
+
+        if 'extractor_args' in strat:
+            ydl_opts['extractor_args'] = strat['extractor_args']
 
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
@@ -349,7 +390,7 @@ async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     return ydl.extract_info(clean_url, download=False)
             except Exception as ex:
-                logger.debug(f"Strategy failed with UA {agent[:30]}: {ex}")
+                logger.debug(f"Extraction strategy failed: {ex}")
                 return None
 
         result = await loop.run_in_executor(executor, _fetch)
@@ -359,22 +400,21 @@ async def extract_instagram_info_robust(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def download_instagram_video(url: str, param: str, output_prefix: str) -> Optional[str]:
-    """Downloads requested video quality using smart multi-stage format specs and robust fallback."""
+async def download_media_video(url: str, param: str, output_prefix: str) -> Optional[str]:
+    """Downloads requested video quality using multi-stage format specs and robust fallback."""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
-    # Smart Format Specifiers List
     format_specs = []
     if param and param.isdigit():
         height = param
-        format_specs.append(f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best")
+        format_specs.append(f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best")
         format_specs.append(f"b[height<={height}]/best")
     elif param and param != "best":
         format_specs.append(f"{param}+bestaudio/best")
         format_specs.append(param)
     
-    format_specs.append("bestvideo+bestaudio/best")
+    format_specs.append("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
     format_specs.append("best")
 
     loop = asyncio.get_event_loop()
@@ -391,6 +431,7 @@ async def download_instagram_video(url: str, param: str, output_prefix: str) -> 
             'buffersize': 2048 * 1024,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                'X-IG-App-ID': '936619743392459',
             }
         }
 
@@ -415,8 +456,8 @@ async def download_instagram_video(url: str, param: str, output_prefix: str) -> 
     return None
 
 
-async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -> Optional[str]:
-    """Extracts MP3 audio track from Instagram video with high-speed FFmpeg conversion."""
+async def download_media_audio(url: str, bitrate: str, output_prefix: str) -> Optional[str]:
+    """Extracts MP3 audio track from video with high-speed FFmpeg conversion."""
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
@@ -432,6 +473,9 @@ async def download_instagram_audio(url: str, bitrate: str, output_prefix: str) -
         }],
         'quiet': True,
         'no_warnings': True,
+        'http_headers': {
+            'X-IG-App-ID': '936619743392459',
+        }
     }
 
     if cookie_file:
@@ -548,18 +592,18 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends custom greeting message on /start command."""
+    """Sends exact custom greeting message on /start command."""
     welcome_text = (
         "درود به روی ماهت 🧘🏾🌚\n"
         "من ربات دانلودرم 🧸\n\n"
-        "با من می‌تونی ویدو ها، موزیک ها و پست های هر پلتفرمی (اینستاگرام و یوتیوب) رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
+        "با من می‌تونی ویدئو ها، موزیک ها و پست های هر پلتفرمی رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
         "و همچنین میتونی موزیک پست دلخواهت را با استفاده از من پیدا و دانلود کنی 🧘🏾🎧\n\n"
         "کافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸"
     )
     await update.message.reply_text(welcome_text)
 
 
-async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes incoming Instagram and YouTube links, extracts qualities, thumbnails, and carousel slides."""
     url = update.message.text.strip()
 
@@ -571,7 +615,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
 
     status_msg = await update.message.reply_text("🔎 در حال بررسی لینک و استخراج کیفیت‌ها...")
 
-    info = await extract_instagram_info_robust(url)
+    info = await extract_media_info_robust(url)
 
     if not info:
         await status_msg.edit_text("❌ متأسفانه دریافت اطلاعات پست/ویدیو با خطا مواجه شد. از عمومی (Public) بودن لینک اطمینان حاصل کنید.")
@@ -589,7 +633,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     formats = main_item.get('formats', [])
     duration = float(main_item.get('duration') or info.get('duration') or 0)
     thumbnail = main_item.get('thumbnail') or info.get('thumbnail', '')
-    raw_caption = info.get('description') or info.get('title') or "ویدیو اینستاگرام"
+    raw_caption = info.get('description') or info.get('title') or "ویدیو / پست"
 
     track_title = main_item.get('track') or main_item.get('alt_title') or ""
     artist_name = main_item.get('artist') or main_item.get('creator') or main_item.get('uploader') or ""
@@ -724,7 +768,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action_type == "vid":
         status_msg = await query.message.reply_text("⏳ در حال دانلود ویدیو... لطفاً صبور باشید.")
-        filepath = await download_instagram_video(url, param, file_prefix)
+        filepath = await download_media_video(url, param, file_prefix)
 
         try:
             if filepath and os.path.exists(filepath):
@@ -737,7 +781,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 with open(filepath, 'rb') as video_file:
                     await query.message.reply_video(
                         video=video_file,
-                        caption="✨ دانلود شده توسط ربات اینستاگرام",
+                        caption="✨ دانلود شده توسط ربات دانلودر",
                         supports_streaming=True,
                         read_timeout=300,
                         write_timeout=300,
@@ -758,7 +802,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action_type == "aud":
         status_msg = await query.message.reply_text(f"⏳ در حال استخراج ویس با کیفیت {param}kbps...")
-        filepath = await download_instagram_audio(url, param, file_prefix)
+        filepath = await download_media_audio(url, param, file_prefix)
 
         try:
             if filepath and os.path.exists(filepath):
@@ -840,13 +884,13 @@ def main():
         logger.error("BOT_TOKEN variable is not set. Please specify BOT_TOKEN in environment.")
         sys.exit(1)
 
-    logger.info("Starting Telegram Instagram Downloader Bot...")
+    logger.info("Starting Telegram Media Downloader Bot...")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_instagram_link))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_link))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Run bot polling loop with drop_pending_updates=True
