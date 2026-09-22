@@ -19,8 +19,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaVideo,
 )
 from telegram.ext import (
     Application,
@@ -50,46 +48,13 @@ CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
-# Default Built-in Session Cookies for Instagram & YouTube Bypass
-DEFAULT_COOKIES = """# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-# This is a generated file! Do not edit.
-
-.youtube.com	TRUE	/	TRUE	1821521893	__Secure-1PSIDTS	sidts-CjQBXMw41axWxy1_iwaoyoJTcoSESyvpPilfGnTvw9zihET_7fvUmYCkptO6LNtgo8Bj9Jg6EAA
-.youtube.com	TRUE	/	TRUE	1821521893	__Secure-3PSIDTS	sidts-CjQBXMw41axWxy1_iwaoyoJTcoSESyvpPilfGnTvw9zihET_7fvUmYCkptO6LNtgo8Bj9Jg6EAA
-.youtube.com	TRUE	/	FALSE	1824545893	HSID	A6i8JY6Jj7VqYYpHY
-.youtube.com	TRUE	/	TRUE	1824545893	SSID	Ab8dJjKwgP6a8t2A5
-.youtube.com	TRUE	/	FALSE	1824545893	APISID	VaxbSzjfsbEFfe_j/AmWeubSebAnIXDnOR
-.youtube.com	TRUE	/	TRUE	1824545893	SAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
-.youtube.com	TRUE	/	TRUE	1824545893	__Secure-1PAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
-.youtube.com	TRUE	/	TRUE	1824545893	__Secure-3PAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
-.youtube.com	TRUE	/	FALSE	1824545893	SID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSDQVKeiawTJt047FoKigF1QACgYKASsSARYSFQHGX2MitNKcH5JAVQkjBmScuuyI4BoVAUF8yKrZrOVY8hbG-S9wjR6hxWA_0076
-.youtube.com	TRUE	/	TRUE	1824545893	__Secure-1PSID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSss3iql16fPzyiYHRuQCfRQACgYKAbYSARYSFQHGX2MiaG-N3FIVCrgCeCBb-N-VCRoVAUF8yKpfXctJ3NEvTemCz87jnD570076
-.youtube.com	TRUE	/	TRUE	1824545893	__Secure-3PSID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSKbb6ztFTWj1APC5pAFGn3AACgYKAQUSARYSFQHGX2MiaQ8dSzA7UsbGZK3AxSlC-RoVAUF8yKoNbx-nYP-IMz1zq7m0hRbC0076
-.youtube.com	TRUE	/	TRUE	1824547852	PREF	f6=40000000&tz=Asia.Tehran
-.youtube.com	TRUE	/	TRUE	1824546073	LOGIN_INFO	AFmmF2swRQIhAMii8v8LP04PGUE_rZk-qgUsV9BVJe-YCr4UJqzN69vFAiBtNOTPzqxpXLOCmF4eq1I4zE7OGJRQueLUzqajrL1H0Q:QUQ3MjNmeFVOZ0gtYmk5Q2h2cHVhenpxa0hSbFBJOEEyR013SDNPd3BxZjZIaDNnb3R2U3NySUt0ZlF0OTB1NXU4Y3FrZW1XVl9iQ25rMWpiOHRJODhodlpkSEZLcjJOV0wxOUpGLTdkM0hlUzltNlB3YTduTjgwa0k0U2tMc0g2OHBsdGZFN3R0VkRMTkRhcTdSUWJvazBNUEtnS1dkUkZn
-.youtube.com	TRUE	/	FALSE	1821523851	SIDCC	AKEyXzVTi5VqKbEJQpuTn6RFK3KSkUvw5-OgKsCJAa5fSXYLrHwaHiYtah6yUmCRZbXC0gpNxQ
-.youtube.com	TRUE	/	TRUE	1821523851	__Secure-1PSIDCC	AKEyXzVaDHqc8VxeSpdhkNRxRTDIE2H0QLYrpjmBwkOh09MmTQeHXYWWqu_MZkcc54XTOaewog
-.youtube.com	TRUE	/	TRUE	1821523851	__Secure-3PSIDCC	AKEyXzX1_Um3DIPAndnt_GMMPWTP6ihATHQ49QMJke36Z6O-CT3MdWyxj0L3PVn1UeVUoJlIIg
-.youtube.com	TRUE	/	TRUE	1789988493	CONSISTENCY	AJDB8J9j4Akp-HPNtMgmseuKKA_UZ-0JznT47U8w15VE1eH15Ufkyb6p2YiTu5spzXn6khR2AFFwrPqGY7IxvkWmAIrFJqhvrRmTXJStcFUJqRK310kpfd4GXGk
-.instagram.com	TRUE	/	TRUE	1824546188	datr	iwWxahgifpSI8W3ZcDJN7B71
-.instagram.com	TRUE	/	TRUE	1821522188	ig_did	27C9E16A-C367-4A1C-865C-FE721F819333
-.instagram.com	TRUE	/	TRUE	1790591148	dpr	2.75
-.instagram.com	TRUE	/	TRUE	1824546192	mid	arEFiwABAAHu3QQds6ZiCPSOgEsv
-.instagram.com	TRUE	/	TRUE	1790591148	wd	393x736
-.instagram.com	TRUE	/	TRUE	1824546363	csrftoken	ubJNUlzYcdmPRrGnXVIRmY4u3DcGmBAZ
-.instagram.com	TRUE	/	TRUE	1797762363	ds_user_id	27024601837
-.instagram.com	TRUE	/	TRUE	1821522344	sessionid	27024601837%3AAtkh4ITUO7wEyu%3A25%3AAYkJ6dvp9GgTGsiuZmGArYVg9EMsqWT3zbW43rBwqw
-.instagram.com	TRUE	/	TRUE	0	rur	VCN%2C17841426935128075%2C1791195965%3A01ff6acb7c96532219f15453ea6ced48fc08cba53b98d1c8c754b3b0d9d0b291edef0e9a
-"""
-
 
 def setup_cookies_file() -> Optional[str]:
-    """Prepares and validates Instagram/YouTube cookie file directly using built-in or environment cookies."""
-    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT") or DEFAULT_COOKIES
+    """Prepares cookie file ONLY if valid cookies are explicitly provided in environment variables."""
+    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT")
     cookie_path = "cookies.txt"
 
-    if cookies_env:
+    if cookies_env and len(cookies_env.strip()) > 20:
         try:
             with open(cookie_path, "w", encoding="utf-8") as f:
                 f.write(cookies_env.strip())
@@ -97,8 +62,12 @@ def setup_cookies_file() -> Optional[str]:
         except Exception as e:
             logger.error(f"Error writing cookies env: {e}")
 
-    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
-        return cookie_path
+    # If old invalid cookies file exists, remove it to prevent request poisoning
+    if os.path.exists(cookie_path):
+        try:
+            os.remove(cookie_path)
+        except Exception:
+            pass
 
     return None
 
@@ -340,8 +309,7 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
                 artist_name = ", ".join(artists) if artists else ""
                 album_name = track.get('album', {}).get('name', '')
                 spotify_url = track.get('external_urls', {}).get('spotify', '')
-                
-                logger.info(f"Spotify Matched: {artist_name} - {track_name}")
+
                 return {
                     'title': track_name,
                     'artist': artist_name,
@@ -354,45 +322,104 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def extract_instagram_dd_info(url: str) -> Optional[Dict[str, Any]]:
+    """Bypasses Instagram blocks using DDInstagram / VxInstagram proxy scraper."""
+    try:
+        match = re.search(r"instagram\.com/(?:p|reel|reels|tv|stories|share)/([A-Za-z0-9_\-]+)", url)
+        if not match:
+            return None
+        shortcode = match.group(1)
+
+        dd_url = f"https://ddinstagram.com/reel/{shortcode}/"
+
+        req = urllib.request.Request(dd_url, headers={
+            'User-Agent': 'TelegramBot (like TwitterBot/1.0)',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        })
+
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+
+        video_match = re.search(r'<meta\s+(?:property|name)=["\']og:video(?::secure_url)?["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not video_match:
+            video_match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:video(?::secure_url)?["\']', html, re.IGNORECASE)
+
+        image_match = re.search(r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not image_match:
+            image_match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']', html, re.IGNORECASE)
+
+        desc_match = re.search(r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not desc_match:
+            desc_match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:description["\']', html, re.IGNORECASE)
+
+        video_url = video_match.group(1).replace("&amp;", "&") if video_match else None
+        image_url = image_match.group(1).replace("&amp;", "&") if image_match else None
+        caption = desc_match.group(1) if desc_match else "ویدیوی اینستاگرام"
+
+        if video_url:
+            logger.info("Successfully extracted via DDInstagram Proxy!")
+            return {
+                "direct_url": video_url,
+                "title": caption[:100] if caption else "ویدیوی اینستاگرام",
+                "description": caption,
+                "formats": [
+                    {"url": video_url, "ext": "mp4", "height": 1080, "vcodec": "h264"},
+                    {"url": video_url, "ext": "mp4", "height": 720, "vcodec": "h264"},
+                    {"url": video_url, "ext": "mp4", "height": 480, "vcodec": "h264"}
+                ],
+                "duration": 60,
+                "thumbnail": image_url
+            }
+        elif image_url:
+            return {
+                "direct_url": image_url,
+                "title": caption[:100] if caption else "تصویر اینستاگرام",
+                "description": caption,
+                "formats": [
+                    {"url": image_url, "ext": "jpg", "height": 1080, "vcodec": "none"}
+                ],
+                "duration": 0,
+                "thumbnail": image_url
+            }
+    except Exception as e:
+        logger.debug(f"DDInstagram scraper error: {e}")
+
+    return None
+
+
 def extract_instagram_embed_info(url: str) -> Optional[Dict[str, Any]]:
-    """Bypasses Cloud IP blocks on Instagram by scraping the public /embed/captioned/ page."""
+    """Scrapes Instagram embed endpoint for media URLs."""
     try:
         match = re.search(r"instagram\.com/(?:p|reel|reels|tv|stories|share)/([A-Za-z0-9_\-]+)", url)
         if not match:
             return None
         shortcode = match.group(1)
         embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        
+
         req = urllib.request.Request(embed_url, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode('utf-8', errors='ignore')
-            
+
         video_urls = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
         if not video_urls:
             video_urls = re.findall(r'<meta\s+property="og:video"\s+content="([^"]+)"', html)
-            
+
         display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html)
         if not display_urls:
             display_urls = re.findall(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
-            
+
         caption_match = re.search(r'<div\s+class="Caption"[^>]*>(.*?)</div>', html, re.DOTALL)
         caption = ""
         if caption_match:
             caption = re.sub(r'<[^>]+>', '', caption_match.group(1)).strip()
-        else:
-            cap_match = re.search(r'"caption"\s*:\s*"([^"]+)"', html)
-            if cap_match:
-                try:
-                    caption = cap_match.group(1).encode().decode('unicode_escape', errors='ignore')
-                except Exception:
-                    caption = cap_match.group(1)
 
         clean_video_urls = [v.replace('\\/', '/').replace('\\u0026', '&') for v in video_urls]
         clean_display_urls = [d.replace('\\/', '/').replace('\\u0026', '&') for d in display_urls]
-        
+
         if clean_video_urls:
             direct_v_url = clean_video_urls[0]
             thumb = clean_display_urls[0] if clean_display_urls else None
@@ -426,33 +453,33 @@ def extract_instagram_embed_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
-    """Fallback extractor using multi-instance Cobalt nodes when Cloud IPs are blocked."""
+    """Fallback extractor using multi-instance Cobalt nodes."""
     instances = [
         "https://api.cobalt.tools",
         "https://cobalt-api.kwiatekm.pl",
         "https://api.cobalt.redna.dev",
         "https://co.wuk.sh"
     ]
-    
+
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
-    
+
     payload = json.dumps({"url": url}).encode('utf-8')
     loop = asyncio.get_event_loop()
 
     def _call_instance(api_url: str):
         try:
             req = urllib.request.Request(f"{api_url}/", data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode('utf-8'))
         except Exception:
             try:
                 req = urllib.request.Request(f"{api_url}/api/json", data=payload, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     if resp.status == 200:
                         return json.loads(resp.read().decode('utf-8'))
             except Exception as e:
@@ -495,48 +522,30 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Fetches Instagram/YouTube media metadata using multi-strategy clients + Embed Scraper + Cobalt fallback."""
+    """Robust multi-layer extraction pipeline."""
     clean_url = clean_media_url(url)
     cookie_file = setup_cookies_file()
 
     loop = asyncio.get_event_loop()
 
-    # Strategy 1: yt-dlp Extraction with Cookies
+    # Layer 1: yt-dlp Extraction without poisoned cookies
     strategies = [
-        # Strategy A: Android Client with Session Cookies
         {
-            'impersonate': 'chrome',
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'X-IG-App-ID': '936619743392459',
             },
             'extractor_args': {
-                'youtube': {'player_client': ['android', 'ios', 'mweb']},
-                'instagram': {'api': 'graphql'}
+                'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
             }
         },
-        # Strategy B: iOS Mobile Client
         {
-            'impersonate': 'safari',
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
                 'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'X-IG-App-ID': '936619743392459',
             },
             'extractor_args': {
                 'youtube': {'player_client': ['ios', 'web']},
-            }
-        },
-        # Strategy C: Smart TV Client
-        {
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) SmartTV Safari/537.42',
-                'Accept-Language': 'en-US,en;q=0.9',
-            },
-            'extractor_args': {
-                'youtube': {'player_client': ['tv', 'mweb']},
             }
         }
     ]
@@ -549,7 +558,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             'nocheckcertificate': True,
             'concurrent_fragment_downloads': 16,
             'http_headers': strat.get('http_headers', {}),
-            'impersonate': strat.get('impersonate'),
         }
 
         if 'extractor_args' in strat:
@@ -570,14 +578,20 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         if result:
             return result
 
-    # Strategy 2: Instagram Embed Scraper for Instagram Links
+    # Layer 2: DDInstagram Proxy Scraper (For Instagram URLs)
     if is_instagram_url(clean_url):
+        logger.info("Attempting DDInstagram Proxy Scraper...")
+        dd_res = await loop.run_in_executor(executor, lambda: extract_instagram_dd_info(clean_url))
+        if dd_res:
+            return dd_res
+
+        # Layer 3: Instagram Embed Scraper
         logger.info("Attempting Instagram Embed Scraper...")
         embed_res = await loop.run_in_executor(executor, lambda: extract_instagram_embed_info(clean_url))
         if embed_res:
             return embed_res
 
-    # Strategy 3: Cobalt Node Extractor Fallback
+    # Layer 4: Cobalt Multi-Node Extractor Fallback
     logger.info("Attempting Cobalt API Node fallback...")
     cobalt_res = await fetch_cobalt_fallback_info(clean_url)
     if cobalt_res:
@@ -591,12 +605,12 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
-    # Direct CDN Stream handling
+    # Direct CDN Stream handling if extracted from proxy/embed
     if direct_url:
         target_path = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp4")
         try:
             req = urllib.request.Request(direct_url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
             })
             with urllib.request.urlopen(req, timeout=180) as resp, open(target_path, 'wb') as out_file:
                 shutil.copyfileobj(resp, out_file)
@@ -613,7 +627,7 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
     elif param and param != "best":
         format_specs.append(f"{param}+bestaudio/best")
         format_specs.append(param)
-    
+
     format_specs.append("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
     format_specs.append("best")
 
@@ -629,13 +643,11 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
             'nocheckcertificate': True,
             'concurrent_fragment_downloads': 16,
             'buffersize': 4096 * 1024,
-            'impersonate': 'chrome',
             'extractor_args': {
                 'youtube': {'player_client': ['android', 'ios', 'mweb']},
             },
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
-                'X-IG-App-ID': '936619743392459',
             }
         }
 
@@ -677,9 +689,6 @@ async def download_media_audio(url: str, bitrate: str, output_prefix: str) -> Op
         }],
         'quiet': True,
         'no_warnings': True,
-        'http_headers': {
-            'X-IG-App-ID': '936619743392459',
-        }
     }
 
     if cookie_file:
@@ -738,7 +747,6 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
             queries_to_try.append(f"{clean_cap} song")
 
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
-
     cookie_file = setup_cookies_file()
 
     ydl_opts = {
@@ -777,7 +785,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                             video_url = entry.get('webpage_url') or entry.get('url')
                             if video_url:
                                 ydl.download([video_url])
-                                
+
                                 final_title = (spotify_match.get('title') if spotify_match else None) or entry.get('title', track_title or "Original Song")
                                 final_artist = (spotify_match.get('artist') if spotify_match else None) or entry.get('uploader') or entry.get('artist') or "Unknown Artist"
 
@@ -813,7 +821,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming Instagram and YouTube links, extracts qualities, thumbnails, and carousel slides."""
+    """Processes incoming Instagram and YouTube links."""
     url = update.message.text.strip()
 
     if not is_supported_url(url):
@@ -1050,7 +1058,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await status_msg.edit_text("⬆️ در حال ارسال موزیک کامل با کیفیت 320kbps...")
                 sp_note = f"\n🌐 **لینک اسپاتیفای:** {res['spotify_url']}" if res.get('spotify_url') else ""
                 caption_audio = f"🎧 **موزیک کامل اورجینال:**\n🎵 **عنوان:** {res['title']}\n👤 **خواننده:** {res['uploader']}\n✨ **کیفیت:** 320kbps (HQ){sp_note}"
-                
+
                 with open(res['filepath'], 'rb') as audio_file:
                     await query.message.reply_audio(
                         audio=audio_file,
@@ -1098,17 +1106,14 @@ def main():
 
     logger.info("Starting Telegram Media Downloader Bot...")
 
-    # Ensure cookie file is written on main thread boot
     setup_cookies_file()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_link))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Run bot polling loop with drop_pending_updates=True
     app.run_polling(drop_pending_updates=True)
 
 
