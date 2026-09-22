@@ -1024,12 +1024,272 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows users to send direct Voice/Audio/Video files to identify music & beats via Shazam."""
+    """Allows users to send direct Voice/Audio files to identify music & beats via Shazam."""
     msg = update.message
-    file_obj = msg.audio or msg.voice or msg.video
+    file_obj = msg.audio or msg.voice
 
     if not file_obj:
         return
+
+    status_msg = await msg.reply_text("🔍 🎧 در حال دریافت فایل صوتی و آنالیز عمیق میکس با Shazam...")
+    temp_path = os.path.join(DOWNLOAD_DIR, f"direct_{uuid.uuid4().hex[:6]}.mp3")
+
+    try:
+        tg_file = await file_obj.get_file()
+        await tg_file.download_to_drive(temp_path)
+
+        shazam_res = await recognize_audio_shazam(temp_path)
+
+        if shazam_res:
+            s_title = shazam_res['title']
+            s_artist = shazam_res['artist']
+            s_genre = shazam_res.get('genre', 'نامشخص')
+            all_detected = shazam_res.get('all_tracks', [])
+
+            if len(all_detected) > 1:
+                mix_text = "🔥 **این ویس شامل میکس چند آهنگ است! لیست آهنگ‌ها:**\n\n"
+                for idx, trk in enumerate(all_detected, 1):
+                    mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **اثر:** {trk['artist']}\n\n"
+                
+                mix_text += "🟢 در حال ارسال آهنگ‌های کامل..."
+                await status_msg.edit_text(mix_text)
+            else:
+                await status_msg.edit_text(f"🎯 **موزیک/بیت دقیق شناسایی شد!**\n\n🎵 عنوان: {s_title}\n👤 اثر: {s_artist}\n🎸 سبک: {s_genre}\n\n🟢 در حال دانلود نسخه کامل 320kbps...")
+
+            for idx, trk in enumerate(all_detected[:3]):
+                cur_title = trk['title']
+                cur_artist = trk['artist']
+                full_res = await search_and_download_full_track(cur_title, cur_artist, cur_title, f"shz_dir_{idx}_{uuid.uuid4().hex[:4]}")
+
+                if full_res and os.path.exists(full_res['filepath']):
+                    caption_audio = f"🔥 موزیک کامل (Shazam Match):\n🎵 عنوان: {cur_title}\n👤 خواننده: {cur_artist}\n✨ کیفیت: 320kbps (HQ)"
+                    with open(full_res['filepath'], 'rb') as audio_file:
+                        await msg.reply_audio(
+                            audio=audio_file,
+                            title=cur_title,
+                            performer=cur_artist,
+                            caption=caption_audio
+                        )
+                    if os.path.exists(full_res['filepath']):
+                        try:
+                            os.remove(full_res['filepath'])
+                        except Exception:
+                            pass
+            await status_msg.delete()
+        else:
+            await status_msg.edit_text("❌ متأسفانه اثری از این صوت در دیتابیس شزام پیدا نشد.")
+
+    except Exception as ex:
+        logger.error(f"Error handling direct audio message: {ex}")
+        await status_msg.edit_text("❌ خطا در پردازش فایل صوتی.")
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
+async def handle_direct_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles direct video files sent by user and prompts with an interactive decision menu."""
+    msg = update.message
+    video_obj = msg.video or msg.video_note or msg.document
+    if not video_obj:
+        return
+
+    cache_id = f"vfile_{uuid.uuid4().hex[:8]}"
+    
+    MEDIA_CACHE[cache_id] = {
+        "type": "video_file",
+        "file_id": video_obj.file_id,
+        "duration": getattr(video_obj, "duration", 0),
+        "file_name": getattr(video_obj, "file_name", "video.mp4"),
+        "timestamp": time.time()
+    }
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 جدا کردن فایل صوتی (MP3)", callback_data=f"vopt:extract_audio:{cache_id}"),
+            InlineKeyboardButton("🔍 تشخیص آهنگ اصلی / رمیکس", callback_data=f"vopt:shazam:{cache_id}")
+        ],
+        [
+            InlineKeyboardButton("👤 شناسایی هنرمند و جزئیات موزیک", callback_data=f"vopt:artist:{cache_id}"),
+            InlineKeyboardButton("🎧 دانلود کامل موزیک اصلی 320", callback_data=f"vopt:full_music:{cache_id}")
+        ]
+    ]
+
+    caption = (
+        "🎬 **ویدیو دریافت شد!**\n\n"
+        "لطفاً کاری که می‌خواهید انجام دهم را انتخاب کنید:"
+    )
+
+    await msg.reply_text(
+        text=caption,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+    if not file_obj:
+    elif action_type == "cap":
+        full_cap = cached_item.get("caption", "بدون کپشن")
+        clean_full_cap = sanitize_telegram_text(full_cap)
+        await query.message.reply_text(f"📜 کپشن کامل:\n\n{clean_full_cap}")
+
+    elif action_type == "vopt":
+        sub_action = data_parts[1]
+        v_cache_id = data_parts[2]
+        cached_vid = MEDIA_CACHE.get(v_cache_id)
+
+        if not cached_vid:
+            await query.message.reply_text("❌ اطلاعات این ویدیو منقضی شده است. لطفاً مجدداً ویدیو را ارسال کنید.")
+            return
+
+        file_id = cached_vid.get("file_id")
+        file_prefix = f"vid_opt_{uuid.uuid4().hex[:6]}"
+        temp_video_path = os.path.join(DOWNLOAD_DIR, f"{file_prefix}.mp4")
+        temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{file_prefix}.mp3")
+
+        if sub_action == "extract_audio":
+            status_msg = await query.message.reply_text("⏳ در حال دریافت ویدیو و استخراج فایل صوتی با کیفیت 320kbps...")
+            try:
+                tg_file = await context.bot.get_file(file_id)
+                await tg_file.download_to_drive(temp_video_path)
+
+                cmd = [
+                    "ffmpeg", "-y", "-i", temp_video_path,
+                    "-vn", "-acodec", "libmp3lame", "-b:a", "320k",
+                    temp_audio_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+
+                if os.path.exists(temp_audio_path):
+                    await status_msg.edit_text("⬆️ در حال ارسال فایل صوتی استخراج‌شده...")
+                    with open(temp_audio_path, 'rb') as audio_file:
+                        await query.message.reply_audio(
+                            audio=audio_file,
+                            caption="🎵 **فایل صوتی استخراج‌شده از ویدیو (320kbps)**\n✨ استخراج شده توسط ربات هوشمند"
+                        )
+                    await status_msg.delete()
+                else:
+                    await status_msg.edit_text("❌ خطا در تبدیل و استخراج صوت.")
+            except Exception as e:
+                logger.error(f"Error extracting audio from video: {e}")
+                await status_msg.edit_text("❌ خطا در پردازش فایل ویدیو.")
+            finally:
+                for p in [temp_video_path, temp_audio_path]:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+
+        elif sub_action in ["shazam", "artist", "full_music"]:
+            status_msg = await query.message.reply_text("🔍 🎧 در حال استخراج صوت و آنالیز عمیق هوشمند (Shazam)...")
+            try:
+                tg_file = await context.bot.get_file(file_id)
+                await tg_file.download_to_drive(temp_video_path)
+
+                cmd = [
+                    "ffmpeg", "-y", "-i", temp_video_path,
+                    "-vn", "-ac", "1", "-ar", "44100", temp_audio_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+
+                if os.path.exists(temp_audio_path):
+                    shazam_res = await recognize_audio_shazam(temp_audio_path)
+
+                    if shazam_res:
+                        s_title = shazam_res['title']
+                        s_artist = shazam_res['artist']
+                        s_genre = shazam_res.get('genre', 'نامشخص')
+                        all_detected = shazam_res.get('all_tracks', [])
+                        is_mix = shazam_res.get('is_mix', False)
+
+                        if sub_action == "artist":
+                            text = (
+                                f"👤 **مشخصات هنرمند و اثر شناسایی‌شده:**\n\n"
+                                f"🎤 **هنرمند / خواننده:** {s_artist}\n"
+                                f"🎵 **عنوان اثر:** {s_title}\n"
+                                f"🎸 **سبک موسیقی:** {s_genre}\n"
+                                f"🔀 **نوع اثر:** {'میکس / رمیکس چندتایی' if is_mix else 'آهنگ اصلی / رمیکس'}\n"
+                            )
+                            if len(all_detected) > 1:
+                                text += "\n📜 **سایر ترک‌های موجود در این میکس:**\n"
+                                for idx, trk in enumerate(all_detected[1:], 2):
+                                    text += f"{idx}. {trk['artist']} - {trk['title']}\n"
+
+                            sp_info = get_spotify_token()
+                            await status_msg.edit_text(text, parse_mode="Markdown")
+
+                        elif sub_action == "shazam":
+                            if is_mix:
+                                mix_text = "🔥 **این ویدیو شامل یک میکس / رمیکس چندتایی است!**\n\n"
+                                for idx, trk in enumerate(all_detected, 1):
+                                    mix_text += f"🎵 **آهنگ {idx}:** {trk['title']}\n👤 **هنرمند:** {trk['artist']}\n\n"
+                                mix_text += "🟢 در حال دریافت و ارسال فایل کامل ۳۲۰ این آهنگ‌ها..."
+                                await status_msg.edit_text(mix_text, parse_mode="Markdown")
+                            else:
+                                await status_msg.edit_text(
+                                    f"🎯 **آهنگ/رمیکس شناسایی شد!**\n\n"
+                                    f"🎵 **عنوان:** {s_title}\n"
+                                    f"👤 **هنرمند:** {s_artist}\n"
+                                    f"🎸 **سبک:** {s_genre}\n\n"
+                                    f"🟢 در حال دانلود نسخه کامل 320kbps...",
+                                    parse_mode="Markdown"
+                                )
+
+                            for idx, trk in enumerate(all_detected[:3]):
+                                cur_t, cur_a = trk['title'], trk['artist']
+                                full_res = await search_and_download_full_track(cur_t, cur_a, f"{cur_t} {cur_a}", f"vshz_{idx}_{file_prefix}")
+                                if full_res and os.path.exists(full_res['filepath']):
+                                    caption_audio = f"🔥 **موزیک کامل (320kbps):**\n🎵 {cur_t}\n👤 {cur_a}"
+                                    with open(full_res['filepath'], 'rb') as audio_file:
+                                        await query.message.reply_audio(
+                                            audio=audio_file,
+                                            title=cur_t,
+                                            performer=cur_a,
+                                            caption=caption_audio
+                                        )
+                                    if os.path.exists(full_res['filepath']):
+                                        try:
+                                            os.remove(full_res['filepath'])
+                                        except Exception:
+                                            pass
+                            await status_msg.delete()
+
+                        elif sub_action == "full_music":
+                            await status_msg.edit_text(f"🔍 در حال جستجو و دریافت نسخه کامل 320kbps برای **{s_artist} - {s_title}**...")
+                            full_res = await search_and_download_full_track(s_title, s_artist, f"{s_title} {s_artist}", f"vfull_{file_prefix}")
+                            if full_res and os.path.exists(full_res['filepath']):
+                                caption_audio = f"🎧 **موزیک کامل اورجینال:**\n🎵 عنوان: {s_title}\n👤 خواننده: {s_artist}\n✨ کیفیت: 320kbps (HQ)"
+                                with open(full_res['filepath'], 'rb') as audio_file:
+                                    await query.message.reply_audio(
+                                        audio=audio_file,
+                                        title=s_title,
+                                        performer=s_artist,
+                                        caption=caption_audio
+                                    )
+                                await status_msg.delete()
+                            else:
+                                await status_msg.edit_text("❌ متأسفانه نسخه کامل این موزیک یافت نشد.")
+
+                    else:
+                        await status_msg.edit_text("❌ نتوانستیم اثری از این موزیک در دیتابیس شزام پیدا کنیم.")
+                else:
+                    await status_msg.edit_text("❌ خطا در استخراج صوت ویدیو.")
+
+            except Exception as e:
+                logger.error(f"Error processing video options: {e}")
+                await status_msg.edit_text("❌ خطا در آنالیز ویدیو.")
+            finally:
+                for p in [temp_video_path, temp_audio_path]:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+
 
     status_msg = await msg.reply_text("🔍 🎧 در حال دریافت فایل صوتی و آنالیز عمیق میکس با Shazam...")
     temp_path = os.path.join(DOWNLOAD_DIR, f"direct_{uuid.uuid4().hex[:6]}.mp3")
@@ -1113,7 +1373,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_link))
-    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.VIDEO, handle_direct_audio_message))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_direct_audio_message))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO, handle_direct_video_message))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     app.run_polling(drop_pending_updates=True)
