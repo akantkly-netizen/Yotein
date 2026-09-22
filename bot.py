@@ -537,14 +537,15 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends greeting message on /start command."""
+    """Sends custom greeting message on /start command."""
     welcome_text = (
-        "⚡️ **سلام! من ربات دانلود اینستا هستم.**\n\n"
-        "با من می‌تونی ویدیوها و پست‌های اینستاگرام رو **بدون محدودیت** و با **کیفیت‌های مختلف** دانلود کنی.\n\n"
-        "🎵 همچنین سیستم هوشمند متصل به **Spotify & YouTube Music** نسخه کامل موزیک اصلی پست رو برات استخراج می‌کنه!\n\n"
-        "👇 **کافیه فقط لینک پست یا ریلز اینستاگرام رو برام بفرستی:**"
+        "درود به روی ماهت 🧘🏾🌚\n"
+        "من ربات دانلودرم 🧸\n\n"
+        "با من می‌تونی ویدو ها، موزیک ها و پست های هر پلتفرمی رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
+        "و همچنین میتونی موزیک پست دلخواهت را با استفاده از من پیدا و دانلود کنی 🧘🏾🎧\n\n"
+        "کافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text)
 
 
 async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
