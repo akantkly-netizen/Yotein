@@ -176,6 +176,123 @@ def format_size(bytes_val: float) -> str:
     return f"{mb:.1f} MB"
 
 
+def get_video_metadata(filepath: str) -> Dict[str, Any]:
+    """Extracts duration, resolution, and codecs from file using ffprobe."""
+    meta = {"duration": 0, "width": 0, "height": 0, "vcodec": "", "acodec": ""}
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", filepath
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            fmt = data.get("format", {})
+            meta["duration"] = int(float(fmt.get("duration", 0)))
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video" and not meta["vcodec"]:
+                    meta["vcodec"] = stream.get("codec_name", "")
+                    meta["width"] = int(stream.get("width", 0))
+                    meta["height"] = int(stream.get("height", 0))
+                elif stream.get("codec_type") == "audio" and not meta["acodec"]:
+                    meta["acodec"] = stream.get("codec_name", "")
+    except Exception as e:
+        logger.debug(f"Metadata extraction error: {e}")
+    return meta
+
+
+async def prepare_telegram_video(filepath: str) -> Dict[str, Any]:
+    """
+    Ensures 100% Telegram Video Compatibility:
+    - Normalizes video to H.264 (yuv420p) + AAC + faststart.
+    - Auto-compresses video if file exceeds 48MB (Telegram Bot API limit).
+    - Generates video thumbnail and extracts dimensions.
+    """
+    if not filepath or not os.path.exists(filepath):
+        return {"filepath": filepath, "error": "File does not exist"}
+
+    meta = get_video_metadata(filepath)
+    filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
+    vcodec = meta.get("vcodec", "").lower()
+    acodec = meta.get("acodec", "").lower()
+
+    needs_transcode = (
+        vcodec not in ["h264", "avc1"] or
+        acodec not in ["aac", "mp4a"] or
+        filesize_mb > 48.0 or
+        not filepath.lower().endswith(".mp4")
+    )
+
+    processed_path = filepath
+    if needs_transcode:
+        out_prefix = f"tg_prep_{uuid.uuid4().hex[:6]}.mp4"
+        out_path = os.path.join(DOWNLOAD_DIR, out_prefix)
+        duration = meta.get("duration", 0) or 60
+
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", filepath]
+
+        # Auto-compression algorithm if filesize > 48MB
+        if filesize_mb > 48.0 and duration > 0:
+            target_size_bits = 45 * 8 * 1024 * 1024  # Target ~45 MB
+            target_total_bitrate = int(target_size_bits / duration)
+            audio_bitrate = 128000
+            video_bitrate = max(200000, target_total_bitrate - audio_bitrate)
+            ffmpeg_cmd.extend([
+                "-c:v", "libx264", "-b:v", f"{video_bitrate}", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k"
+            ])
+        else:
+            ffmpeg_cmd.extend([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-c:a", "aac", "-b:a", "128k"
+            ])
+
+        ffmpeg_cmd.extend([
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            out_path
+        ])
+
+        loop = asyncio.get_event_loop()
+        def _transcode():
+            subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+
+        await loop.run_in_executor(executor, _transcode)
+
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if filepath != out_path and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+            processed_path = out_path
+            meta = get_video_metadata(processed_path)
+
+    # Extract Video Thumbnail
+    thumb_path = None
+    if meta.get("width") and meta.get("height"):
+        t_path = os.path.join(DOWNLOAD_DIR, f"thumb_{uuid.uuid4().hex[:6]}.jpg")
+        cmd_thumb = [
+            "ffmpeg", "-y", "-ss", "00:00:01", "-i", processed_path,
+            "-vframes", "1", "-vf", "scale=320:-1", t_path
+        ]
+        try:
+            subprocess.run(cmd_thumb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            if os.path.exists(t_path) and os.path.getsize(t_path) > 0:
+                thumb_path = t_path
+        except Exception:
+            thumb_path = None
+
+    return {
+        "filepath": processed_path,
+        "width": meta.get("width", 0),
+        "height": meta.get("height", 0),
+        "duration": meta.get("duration", 0),
+        "thumb_path": thumb_path,
+        "filesize": os.path.getsize(processed_path) if os.path.exists(processed_path) else 0
+    }
+
+
 def estimate_format_filesize(format_dict: Dict[str, Any], duration: float) -> float:
     """Estimates audio/video format size in bytes."""
     filesize = format_dict.get('filesize') or format_dict.get('filesize_approx')
@@ -1303,24 +1420,53 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     file_prefix = f"file_{uuid.uuid4().hex[:6]}"
 
     if action_type == "vid":
-        status_msg = await query.message.reply_text("⏳ در حال دانلود ویدیو... لطفاً صبور باشید.")
-        filepath = await download_media_video(url, param, file_prefix, direct_url=direct_url)
+        status_msg = await query.message.reply_text("⏳ در حال دانلود و بهینه‌سازی حرفه‌ای ویدیو برای تلگرام...")
+        raw_filepath = await download_media_video(url, param, file_prefix, direct_url=direct_url)
 
         try:
-            if filepath and os.path.exists(filepath):
+            if raw_filepath and os.path.exists(raw_filepath):
+                await status_msg.edit_text("⚙️ در حال بهینه‌سازی فرمت ویدیو و استخراج کاور...")
+                prep_res = await prepare_telegram_video(raw_filepath)
+                filepath = prep_res.get("filepath", raw_filepath)
+                thumb_path = prep_res.get("thumb_path")
+                v_width = prep_res.get("width")
+                v_height = prep_res.get("height")
+                v_duration = prep_res.get("duration")
+
                 filesize = os.path.getsize(filepath)
                 if filesize > 50 * 1024 * 1024:
-                    await status_msg.edit_text("❌ حجم ویدیو بیشتر از محدودیّت ۵۰ مگابایت تلگرام است.")
+                    await status_msg.edit_text("❌ امکان ارسال فایل‌های بیشتر از ۵۰ مگابایت در تلگرام وجود ندارد.")
                     return
 
                 await status_msg.edit_text("⬆️ در حال آپلود ویدیو به تلگرام...")
-                with open(filepath, 'rb') as video_file:
-                    await query.message.reply_video(
-                        video=video_file,
-                        caption="✨ دانلود شده توسط ربات دانلودر",
-                        supports_streaming=True
-                    )
-                await status_msg.delete()
+                
+                kwargs = {
+                    "caption": "✨ دانلود شده توسط ربات دانلودر",
+                    "supports_streaming": True,
+                }
+                if v_width and v_height:
+                    kwargs["width"] = v_width
+                    kwargs["height"] = v_height
+                if v_duration:
+                    kwargs["duration"] = v_duration
+                if thumb_path and os.path.exists(thumb_path):
+                    kwargs["thumbnail"] = open(thumb_path, 'rb')
+
+                try:
+                    with open(filepath, 'rb') as video_file:
+                        await query.message.reply_video(
+                            video=video_file,
+                            **kwargs
+                        )
+                    await status_msg.delete()
+                finally:
+                    if "thumbnail" in kwargs and hasattr(kwargs["thumbnail"], "close"):
+                        kwargs["thumbnail"].close()
+                    if thumb_path and os.path.exists(thumb_path):
+                        try:
+                            os.remove(thumb_path)
+                        except Exception:
+                            pass
             else:
                 await status_msg.edit_text("❌ خطا در دانلود ویدیو.")
         except Exception as e:
@@ -1581,7 +1727,16 @@ def main():
 
     setup_cookies_file()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # Enhanced HTTP connection options for large video uploads
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(300)
+        .write_timeout(300)
+        .connect_timeout(60)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_link))
