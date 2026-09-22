@@ -62,7 +62,7 @@ def setup_cookies_file() -> Optional[str]:
         except Exception as e:
             logger.error(f"Error writing cookies env: {e}")
 
-    # If old invalid cookies file exists, remove it to prevent request poisoning
+    # Clean up invalid cookie files
     if os.path.exists(cookie_path):
         try:
             os.remove(cookie_path)
@@ -200,9 +200,12 @@ def estimate_format_filesize(fmt: Dict[str, Any], duration: float) -> Optional[i
 
 
 def format_size(bytes_size: Optional[int]) -> str:
-    """Formats raw bytes size into MB / KB readable strings."""
+    """Formats raw bytes size into GB / MB / KB readable strings."""
     if not bytes_size or bytes_size <= 0:
         return "تخمینی"
+    gb = bytes_size / (1024 * 1024 * 1024)
+    if gb >= 1.0:
+        return f"{gb:.2f} GB"
     mb = bytes_size / (1024 * 1024)
     if mb >= 1.0:
         return f"{mb:.1f} MB"
@@ -231,21 +234,31 @@ def extract_resolution_height(fmt: Dict[str, Any]) -> int:
 
     width = fmt.get('width')
     if width and isinstance(width, int):
-        if width >= 1080:
+        if width >= 3840:
+            return 2160
+        elif width >= 2560:
+            return 1440
+        elif width >= 1920:
             return 1080
-        elif width >= 720:
+        elif width >= 1280:
             return 720
-        elif width >= 480:
+        elif width >= 854:
             return 480
-        elif width >= 360:
+        elif width >= 640:
             return 360
+        elif width >= 426:
+            return 240
 
     return 0
 
 
 def format_quality_label(height: int) -> str:
-    """Generates user-friendly quality labels for heights."""
-    if height >= 1080:
+    """Generates detailed user-friendly quality labels for all heights."""
+    if height >= 2160:
+        return f"📹 {height}p (4K Ultra HD)"
+    elif height >= 1440:
+        return f"📹 {height}p (2K QHD)"
+    elif height >= 1080:
         return f"📹 {height}p (Full HD)"
     elif height >= 720:
         return f"📹 {height}p (HD)"
@@ -254,6 +267,15 @@ def format_quality_label(height: int) -> str:
     elif height > 0:
         return f"📹 {height}p"
     return "📹 کیفیت استاندارد"
+
+
+def sanitize_telegram_text(text: str) -> str:
+    """Strips risky formatting characters to prevent Telegram API Markdown parsing errors."""
+    if not text:
+        return ""
+    for char in ['_', '*', '`', '[', ']', '(', ')', '~']:
+        text = text.replace(char, ' ')
+    return text.strip()
 
 
 def get_spotify_token() -> Optional[str]:
@@ -528,7 +550,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
 
     loop = asyncio.get_event_loop()
 
-    # Layer 1: yt-dlp Extraction without poisoned cookies
+    # Layer 1: yt-dlp Extraction
     strategies = [
         {
             'http_headers': {
@@ -821,7 +843,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming Instagram and YouTube links."""
+    """Processes incoming Instagram and YouTube links safely without crashing."""
     url = update.message.text.strip()
 
     if not is_supported_url(url):
@@ -830,9 +852,13 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleanup_temp_files()
     clean_expired_cache()
 
-    status_msg = await update.message.reply_text("🔎 در حال بررسی لینک و استخراج کیفیت‌ها...")
+    status_msg = await update.message.reply_text("🔎 در حال بررسی لینک و استخراج تمامی کیفیت‌ها...")
 
-    info = await extract_media_info_robust(url)
+    try:
+        info = await extract_media_info_robust(url)
+    except Exception as e:
+        logger.error(f"Error during media extraction: {e}")
+        info = None
 
     if not info:
         await status_msg.edit_text("❌ متأسفانه دریافت اطلاعات پست/ویدیو با خطا مواجه شد. از عمومی (Public) بودن لینک اطمینان حاصل کنید.")
@@ -862,7 +888,8 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if extracted_a and not artist_name:
             artist_name = extracted_a
 
-    short_caption = raw_caption[:500] + "..." if len(raw_caption) > 500 else raw_caption
+    safe_caption = sanitize_telegram_text(raw_caption[:400])
+    short_caption = safe_caption + "..." if len(raw_caption) > 400 else safe_caption
 
     valid_formats = []
     seen_heights = set()
@@ -917,7 +944,7 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extra_row = []
     if thumbnail:
         extra_row.append(InlineKeyboardButton("🖼 کاور اصلی", callback_data=f"img:{cache_id}:{current_slide}"))
-    if len(raw_caption) > 500:
+    if len(raw_caption) > 400:
         extra_row.append(InlineKeyboardButton("📜 کپشن کامل", callback_data=f"cap:{cache_id}:{current_slide}"))
 
     if extra_row:
@@ -937,27 +964,39 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await status_msg.delete()
 
-    caption_text = f"📝 **کپشن:**\n{short_caption}\n\nکیفیت یا گزینه مورد نظر را انتخاب کنید:"
+    caption_text = f"📝 کپشن:\n{short_caption}\n\nکیفیت یا گزینه مورد نظر را انتخاب کنید:"
+
+    sent_successfully = False
 
     if thumbnail:
         try:
             await update.message.reply_photo(
                 photo=thumbnail,
                 caption=caption_text,
-                parse_mode="Markdown",
                 reply_markup=reply_markup
             )
-            return
+            sent_successfully = True
         except Exception as ex:
             logger.warning(f"Could not send photo thumbnail: {ex}")
 
-    await update.message.reply_text(
-        text=caption_text,
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
+    if not sent_successfully:
+        try:
+            await update.message.reply_text(
+                text=caption_text,
+                reply_markup=reply_markup
+            )
+            sent_successfully = True
+        except Exception as ex:
+            logger.error(f"Failed to send menu message: {ex}")
+            await status_msg.edit_text("❌ خطا در نمایش منوی دانلود. لطفاً مجدداً تلاش کنید.")
+            return
+
+    # Delete checking message AFTER menu is safely sent
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1056,8 +1095,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             if res and os.path.exists(res['filepath']):
                 await status_msg.edit_text("⬆️ در حال ارسال موزیک کامل با کیفیت 320kbps...")
-                sp_note = f"\n🌐 **لینک اسپاتیفای:** {res['spotify_url']}" if res.get('spotify_url') else ""
-                caption_audio = f"🎧 **موزیک کامل اورجینال:**\n🎵 **عنوان:** {res['title']}\n👤 **خواننده:** {res['uploader']}\n✨ **کیفیت:** 320kbps (HQ){sp_note}"
+                sp_note = f"\n🌐 لینک اسپاتیفای: {res['spotify_url']}" if res.get('spotify_url') else ""
+                caption_audio = f"🎧 موزیک کامل اورجینال:\n🎵 عنوان: {res['title']}\n👤 خواننده: {res['uploader']}\n✨ کیفیت: 320kbps (HQ){sp_note}"
 
                 with open(res['filepath'], 'rb') as audio_file:
                     await query.message.reply_audio(
@@ -1065,7 +1104,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         title=res['title'],
                         performer=res['uploader'],
                         caption=caption_audio,
-                        parse_mode="Markdown",
                         read_timeout=300,
                         write_timeout=300
                     )
@@ -1086,7 +1124,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action_type == "cap":
         full_cap = cached_item.get("caption", "بدون کپشن")
-        await query.message.reply_text(f"📜 **کپشن کامل:**\n\n{full_cap}")
+        clean_full_cap = sanitize_telegram_text(full_cap)
+        await query.message.reply_text(f"📜 کپشن کامل:\n\n{clean_full_cap}")
 
 
 async def post_init(application: Application):
