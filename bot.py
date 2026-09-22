@@ -52,8 +52,8 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 
 def setup_cookies_file() -> Optional[str]:
-    """Prepares and validates Instagram/YouTube cookie file if supplied."""
-    cookies_env = os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT")
+    """Prepares and validates Instagram/YouTube cookie file if supplied via Environment Variables."""
+    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT")
     cookie_path = "cookies.txt"
 
     if cookies_env:
@@ -326,27 +326,28 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
 
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Fetches Instagram/YouTube media metadata using multi-strategy fallbacks and IG App ID bypass."""
+    """Fetches Instagram/YouTube media metadata using ultra-robust multi-client strategies to bypass Cloud IP Blocks."""
     clean_url = clean_media_url(url)
     cookie_file = setup_cookies_file()
 
     # Advanced Multi-Strategy Configurations to bypass Cloud Server IP Blocking
     strategies = [
-        # Strategy 1: Desktop Chrome with Instagram App ID & YouTube Android client
+        # Strategy 1: Android Client (Primary bypass for YouTube Datacenter IP blocking)
         {
+            'impersonate': 'chrome',
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'X-IG-App-ID': '936619743392459',
-                'Sec-Fetch-Mode': 'navigate',
             },
             'extractor_args': {
-                'youtube': {'player_client': ['android', 'web', 'mweb']},
+                'youtube': {'player_client': ['android', 'ios', 'mweb']},
+                'instagram': {'api': 'graphql'}
             }
         },
-        # Strategy 2: iOS Mobile Safari header set
+        # Strategy 2: iOS Native Mobile Client headers
         {
+            'impersonate': 'safari',
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
                 'Accept': '*/*',
@@ -357,12 +358,25 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 'youtube': {'player_client': ['ios', 'web']},
             }
         },
-        # Strategy 3: Android Instagram App / Mobile browser set
+        # Strategy 3: TV Embedded Client Strategy
         {
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) SmartTV Safari/537.42',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+            'extractor_args': {
+                'youtube': {'player_client': ['tv', 'mweb']},
+            }
+        },
+        # Strategy 4: Fallback Desktop Chrome
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'X-IG-App-ID': '1217981644879628',
+            },
+            'extractor_args': {
+                'youtube': {'player_client': ['web', 'android']},
             }
         }
     ]
@@ -375,8 +389,9 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             'no_warnings': True,
             'extract_flat': False,
             'nocheckcertificate': True,
-            'concurrent_fragment_downloads': 12,
+            'concurrent_fragment_downloads': 16,
             'http_headers': strat.get('http_headers', {}),
+            'impersonate': strat.get('impersonate'),
         }
 
         if 'extractor_args' in strat:
@@ -427,10 +442,14 @@ async def download_media_video(url: str, param: str, output_prefix: str) -> Opti
             'no_warnings': True,
             'merge_output_format': 'mp4',
             'nocheckcertificate': True,
-            'concurrent_fragment_downloads': 12,
-            'buffersize': 2048 * 1024,
+            'concurrent_fragment_downloads': 16,
+            'buffersize': 4096 * 1024,
+            'impersonate': 'chrome',
+            'extractor_args': {
+                'youtube': {'player_client': ['android', 'ios', 'mweb']},
+            },
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
                 'X-IG-App-ID': '936619743392459',
             }
         }
