@@ -80,7 +80,8 @@ def is_supported_url(text: str) -> bool:
         r'https?://(?:www\.)?instagr\.am/',
         r'https?://(?:www\.)?youtube\.com/',
         r'https?://youtu\.be/',
-        r'https?://(?:open\.)?spotify\.com/'
+        r'https?://(?:open\.)?spotify\.com/',
+        r'https?://(?:www\.|vt\.|vm\.)?tiktok\.com/'
     ]
     return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
@@ -97,12 +98,16 @@ def is_spotify_url(url: str) -> bool:
     return bool(re.search(r'https?://(?:open\.)?spotify\.com', url, re.IGNORECASE))
 
 
+def is_tiktok_url(url: str) -> bool:
+    return bool(re.search(r'https?://(?:www\.|vt\.|vm\.)?tiktok\.com', url, re.IGNORECASE))
+
+
 def clean_media_url(url: str) -> str:
     """Removes tracking query params from media URLs."""
     if not url:
         return ""
     parsed = urllib.parse.urlparse(url.strip())
-    # Keep path clean for IG / YT
+    # Keep path clean for IG / YT / TikTok
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
 
@@ -192,7 +197,7 @@ def clean_music_query(text: str) -> str:
     noise_patterns = [
         r'دانلود\s+موزیک', r'دانلود\s+آهنگ', r'اهنگ\s+جدید', r'آهنگ\s+جدید',
         r'پست\s+جدید', r'ریمیکس\s+جدید', r'فول\s+آلبوم', r'لینک\s+بیو',
-        r'اصلی', r'کامل', r'استوری', r'اکسپلور', r'اینستاگرام'
+        r'اصلی', r'کامل', r'استوری', r'اکسپلور', r'اینستاگرام', r'تیک\s*تاک', r'تیکتاک'
     ]
     for p in noise_patterns:
         t = re.sub(p, '', t, flags=re.IGNORECASE)
@@ -391,7 +396,7 @@ def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Direct Scrapers for Instagram Fallbacks
+# Direct Scrapers for Instagram & TikTok Fallbacks
 # ---------------------------------------------------------------------------
 
 def extract_instagram_dd_info(url: str) -> Optional[Dict[str, Any]]:
@@ -445,9 +450,9 @@ def extract_instagram_embed_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
-    """Calls Cobalt API node fallback."""
+    """Calls Cobalt API node fallback for TikTok, Instagram, YouTube."""
     cobalt_instances = ["https://api.cobalt.tools/api/json", "https://cobalt.qaz.im/api/json"]
-    payload = json.dumps({"url": url, "vQuality": "720"}).encode('utf-8')
+    payload = json.dumps({"url": url, "vQuality": "1080"}).encode('utf-8')
 
     loop = asyncio.get_event_loop()
     for instance in cobalt_instances:
@@ -458,7 +463,7 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
                     headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=6) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     if resp.status == 200:
                         return json.loads(resp.read().decode('utf-8'))
             except Exception:
@@ -468,9 +473,9 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
         if data and 'url' in data:
             return {
                 "direct_url": data['url'],
-                "title": "رسانه استخراج شده",
-                "description": "استخراج شده با موتور کمکی",
-                "formats": [{"url": data['url'], "ext": "mp4", "height": 720, "vcodec": "h264"}],
+                "title": "ویدیو تیک‌تاک / رسانه استخراج شده",
+                "description": "استخراج شده با کیفیت اصلی",
+                "formats": [{"url": data['url'], "ext": "mp4", "height": 1080, "vcodec": "h264"}],
                 "duration": 60
             }
     return None
@@ -622,7 +627,7 @@ async def recognize_audio_shazam(filepath: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Multi-tiered Extraction Pipeline ensuring maximum success without errors."""
+    """Multi-tiered Extraction Pipeline ensuring maximum success for Instagram, YouTube, TikTok & Spotify."""
     clean_url = clean_media_url(url)
 
     if is_spotify_url(clean_url):
@@ -701,14 +706,15 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         if embed_res:
             return embed_res
 
+    # Cobalt Fallback Strategy (Works exceptionally for TikTok, IG, YT)
     cobalt_res = await fetch_cobalt_fallback_info(clean_url)
     if cobalt_res:
         return cobalt_res
 
-    if is_instagram_url(clean_url) or is_youtube_url(clean_url):
+    if is_instagram_url(clean_url) or is_youtube_url(clean_url) or is_tiktok_url(clean_url):
         return {
             "direct_url": clean_url,
-            "title": "رسانه استخراج شده",
+            "title": "ویدیو تیک‌تاک / پست استخراج شده",
             "description": "استخراج مستقیم",
             "formats": [{"url": clean_url, "ext": "mp4", "height": 720, "vcodec": "h264"}],
             "duration": 60,
@@ -945,7 +951,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "درود به روی ماهت 🧘🏾🌚\n"
         "من ربات دانلودر و موتور جستجوی هوشمند موسیقی هستم 🧸\n\n"
-        "با من می‌تونی ویدئوها، موزیک‌ها و پست‌های هر پلتفرمی رو بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
+        "با من می‌تونی ویدئوها، موزیک‌ها و پست‌های **اینستاگرام، یوتیوب، تیک‌تاک و اسپاتیفای** رو بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
         "همچنین ربات به **قدرتمندترین موتورهای شناساگر موسیقی (Shazam, Deezer, Apple Music, Spotify)** متصل شده تا تمام رمیکس‌ها، بیت‌ها و موزیک‌های اسلو رو برات پیدا کنه! 🎧🔥\n\n"
         "کافیه فقط لینک پست، آهنگ، یا یک وویس/ویدیو برام بفرستی 🧸"
     )
@@ -953,7 +959,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming Instagram, YouTube, and Spotify links."""
+    """Processes incoming Instagram, YouTube, TikTok, and Spotify links."""
     url = update.message.text.strip()
 
     if not is_supported_url(url):
