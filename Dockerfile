@@ -1,12 +1,19 @@
-#STREAMING_CHUNK: Creating Dockerfile for foolproof deployment on Railway...
 FROM python:3.11-slim
-#نصب ffmpeg و ابزارهای مورد نیاز
-RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
+
+# نصب FFmpeg و ابزارهای مورد نیاز سیستم‌عامل
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+# تنظیم پوشه کاری
 WORKDIR /app
-#کپی و نصب پیش‌نیازها
+
+# نصب پیش‌نیازهای پایتون
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-#کپی بقیه کدها
+
+# کپی کردن تمام فایل‌های پروژه
 COPY . .
-#اجرای ربات
-CMD ["python", "bot.py"]
+
+# اجرای ربات
+CMD ["python", "main.py"]
