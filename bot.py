@@ -103,6 +103,17 @@ def is_instagram_url(url: str) -> bool:
     return bool(re.search(pattern, url))
 
 
+def is_youtube_url(url: str) -> bool:
+    """Validates if input text is a YouTube video/shorts/music link."""
+    pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/(watch\?v=|shorts/|live/|embed/|[A-Za-z0-9_-]+)"
+    return bool(re.search(pattern, url))
+
+
+def is_supported_url(url: str) -> bool:
+    """Checks if the provided text contains an Instagram or YouTube URL."""
+    return is_instagram_url(url) or is_youtube_url(url)
+
+
 def clean_instagram_url(url: str) -> str:
     """Extracts clean Instagram post URL without tracking query parameters."""
     match = re.search(r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|reels|stories)/[A-Za-z0-9_-]+)", url)
@@ -541,7 +552,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "درود به روی ماهت 🧘🏾🌚\n"
         "من ربات دانلودرم 🧸\n\n"
-        "با من می‌تونی ویدو ها، موزیک ها و پست های هر پلتفرمی رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
+        "با من می‌تونی ویدو ها، موزیک ها و پست های هر پلتفرمی (اینستاگرام و یوتیوب) رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
         "و همچنین میتونی موزیک پست دلخواهت را با استفاده از من پیدا و دانلود کنی 🧘🏾🎧\n\n"
         "کافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸"
     )
@@ -549,10 +560,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes incoming links, extracts qualities, thumbnails, and carousel slides."""
+    """Processes incoming Instagram and YouTube links, extracts qualities, thumbnails, and carousel slides."""
     url = update.message.text.strip()
 
-    if not is_instagram_url(url):
+    if not is_supported_url(url):
         return
 
     cleanup_temp_files()
@@ -563,7 +574,7 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
     info = await extract_instagram_info_robust(url)
 
     if not info:
-        await status_msg.edit_text("❌ متأسفانه دریافت اطلاعات پست با خطا مواجه شد. از عمومی (Public) بودن پیج اطمینان حاصل کنید.")
+        await status_msg.edit_text("❌ متأسفانه دریافت اطلاعات پست/ویدیو با خطا مواجه شد. از عمومی (Public) بودن لینک اطمینان حاصل کنید.")
         return
 
     cache_id = str(uuid.uuid4())[:8]
