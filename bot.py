@@ -10,6 +10,7 @@ import time
 import shutil
 import base64
 import subprocess
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse
 import urllib.request
@@ -39,7 +40,7 @@ except ImportError:
     HAS_SHAZAMIO = False
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & LOGGING
+# CONFIGURATION, HARDENING CONSTANTS & LOGGING
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -66,8 +67,16 @@ CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 _spotify_access_token: Optional[str] = None
 _spotify_token_expires_at: float = 0.0
 
+VALID_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4a", ".mp3", ".ogg", ".flac", ".wav"}
+
+# Music Search & Validation Hardening Threshold Constants
+MIN_TITLE_SIMILARITY = 0.40
+MIN_ARTIST_SIMILARITY = 0.30
+MAX_DURATION_DIFF_SECONDS = 90.0
+MIN_TOTAL_MATCH_SCORE = 0.45
+
 # ---------------------------------------------------------------------------
-# UTILITIES & HOST / URL HANDLING (PHASE 1 REFACTOR)
+# UTILITIES & HOST / URL HANDLING
 # ---------------------------------------------------------------------------
 
 def check_ffmpeg_installed() -> bool:
@@ -202,6 +211,8 @@ def setup_cookies_file() -> Optional[str]:
 
 def cleanup_job_files(prefix: str):
     """Deletes temporary files matching the job prefix."""
+    if not prefix:
+        return
     try:
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, f"{prefix}*")):
             if os.path.isfile(filepath):
@@ -222,14 +233,6 @@ def get_cached_slide(cache_id: str, slide_idx: int) -> Optional[Dict[str, Any]]:
         return slides[slide_idx]
     return None
 
-def get_current_slide(cache_id: str) -> Optional[Dict[str, Any]]:
-    """Fetches current active slide from cache."""
-    cached = MEDIA_CACHE.get(cache_id)
-    if not cached:
-        return None
-    curr_idx = cached.get("current_slide", 0)
-    return get_cached_slide(cache_id, curr_idx)
-
 def clean_expired_cache():
     """Removes expired items from MEDIA_CACHE safely."""
     now = time.time()
@@ -247,7 +250,7 @@ def clean_expired_cache():
 def extract_resolution_height(format_dict: Dict[str, Any]) -> int:
     """Extracts format resolution height safely."""
     h = format_dict.get('height')
-    if isinstance(h, int):
+    if isinstance(h, int) and h > 0:
         return h
     res_str = str(format_dict.get('resolution', ''))
     match = re.search(r'(\d{3,4})p?', res_str)
@@ -264,22 +267,36 @@ def format_quality_label(height: int) -> str:
     return f"📱 {height}p"
 
 def format_size(bytes_val: float) -> str:
-    """Formats bytes to MB/GB string."""
+    """Formats bytes to MB/GB string or returns 'حجم نامشخص' if size is unknown."""
     if not bytes_val or bytes_val <= 0:
-        return "~MB"
+        return "حجم نامشخص"
     mb = bytes_val / (1024 * 1024)
     if mb >= 1024:
         return f"{mb / 1024:.1f} GB"
     return f"{mb:.1f} MB"
 
 def estimate_format_filesize(format_dict: Dict[str, Any], duration: float) -> float:
-    """Calculates estimated filesize in bytes."""
-    filesize = format_dict.get('filesize') or format_dict.get('filesize_approx')
-    if filesize:
+    """Calculates estimated filesize in bytes strictly without inventing values."""
+    filesize = format_dict.get('filesize')
+    if filesize and isinstance(filesize, (int, float)) and filesize > 0:
         return float(filesize)
-    tbr = format_dict.get('tbr') or format_dict.get('vbr', 0) + format_dict.get('abr', 0)
-    if tbr and duration > 0:
-        return (tbr * 1024 / 8) * duration
+
+    filesize_approx = format_dict.get('filesize_approx')
+    if filesize_approx and isinstance(filesize_approx, (int, float)) and filesize_approx > 0:
+        return float(filesize_approx)
+
+    tbr = format_dict.get('tbr')
+    if not tbr or not isinstance(tbr, (int, float)) or tbr <= 0:
+        vbr = format_dict.get('vbr') or 0
+        abr = format_dict.get('abr') or 0
+        if isinstance(vbr, (int, float)) and isinstance(abr, (int, float)):
+            tbr = vbr + abr
+        else:
+            tbr = 0
+
+    if tbr and isinstance(tbr, (int, float)) and tbr > 0 and duration and duration > 0:
+        return (float(tbr) * 1024 / 8) * float(duration)
+
     return 0.0
 
 def clean_music_query(text: str) -> str:
@@ -323,12 +340,130 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
     return clean_cap[:60], ""
 
 # ---------------------------------------------------------------------------
-# FFMPEG PROCESSING & TRANSCODING PIPELINE
+# MEDIA FILE FINDING, STALE FILE PROTECTION & HEIGHT VALIDATION
+# ---------------------------------------------------------------------------
+
+def validate_downloaded_video_height(filepath: str, max_height: Optional[int]) -> bool:
+    """
+    Validates that the downloaded video file exists, has a valid video stream,
+    and its height does not exceed max_height.
+    If max_height is None or <= 0, validation passes (unrestricted 'best').
+    """
+    if not filepath or not os.path.exists(filepath):
+        return False
+    try:
+        if os.path.getsize(filepath) <= 0:
+            return False
+    except Exception:
+        return False
+
+    if max_height is None or max_height <= 0:
+        return True
+
+    meta = sync_get_video_metadata(filepath)
+    actual_height = meta.get("height", 0)
+    if actual_height <= 0:
+        logger.warning(f"Failed to probe video height or no video stream found for {filepath}")
+        return False
+
+    if actual_height > max_height:
+        logger.warning(f"Video height validation failed: actual height {actual_height}p exceeds max_height {max_height}p")
+        return False
+
+    return True
+
+def find_downloaded_media(job_prefix: str, min_mtime: float = 0.0) -> Optional[str]:
+    """
+    Locates downloaded video/media file for a given job_prefix.
+    Rejects stale files created prior to min_mtime (with tolerance).
+    """
+    if not job_prefix:
+        return None
+
+    pattern = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.*")
+    candidates = glob.glob(pattern)
+
+    valid_files = []
+    tolerance = 2.0  # seconds filesystem timestamp tolerance
+    effective_min_mtime = min_mtime - tolerance if min_mtime > 0 else 0.0
+
+    for filepath in candidates:
+        if not os.path.isfile(filepath):
+            continue
+
+        filename = os.path.basename(filepath)
+
+        if (filename.startswith("thumb_") or 
+            filename.startswith("prep_") or 
+            filename.startswith("slice_") or 
+            "_slice_" in filename):
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in VALID_MEDIA_EXTENSIONS:
+            try:
+                st_mtime = os.path.getmtime(filepath)
+                if os.path.getsize(filepath) > 0 and st_mtime >= effective_min_mtime:
+                    valid_files.append((filepath, st_mtime))
+            except Exception:
+                pass
+
+    if not valid_files:
+        return None
+
+    valid_files.sort(key=lambda x: x[1], reverse=True)
+    return valid_files[0][0]
+
+def find_downloaded_audio(job_prefix: str, min_mtime: float = 0.0) -> Optional[str]:
+    """
+    Locates extracted audio file for a given job_prefix.
+    Rejects stale files created prior to min_mtime (with tolerance).
+    """
+    if not job_prefix:
+        return None
+
+    pattern = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.*")
+    candidates = glob.glob(pattern)
+
+    audio_extensions = {".mp3", ".m4a", ".opus", ".ogg", ".wav", ".aac", ".flac"}
+    valid_files = []
+    tolerance = 2.0
+    effective_min_mtime = min_mtime - tolerance if min_mtime > 0 else 0.0
+
+    for filepath in candidates:
+        if not os.path.isfile(filepath):
+            continue
+
+        filename = os.path.basename(filepath)
+        if filename.startswith("thumb_") or filename.startswith("prep_") or "_slice_" in filename:
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in audio_extensions:
+            try:
+                st_mtime = os.path.getmtime(filepath)
+                if os.path.getsize(filepath) > 0 and st_mtime >= effective_min_mtime:
+                    is_mp3 = 1 if ext == ".mp3" else 0
+                    valid_files.append((is_mp3, st_mtime, filepath))
+            except Exception:
+                pass
+
+    if not valid_files:
+        return None
+
+    valid_files.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return valid_files[0][2]
+
+# ---------------------------------------------------------------------------
+# FFMPEG PROCESSING & TRANSCODING PIPELINE (HARDENED)
 # ---------------------------------------------------------------------------
 
 def sync_get_video_metadata(filepath: str) -> Dict[str, Any]:
     """Runs ffprobe synchronously to fetch media metadata."""
     meta = {"duration": 0, "width": 0, "height": 0, "vcodec": "", "acodec": ""}
+    if not filepath or not os.path.exists(filepath):
+        return meta
+
     try:
         cmd = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
@@ -355,10 +490,11 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
     Ensures Telegram compatibility:
     - Normalizes video to H.264 + AAC (MP4 container).
     - Compresses video if file exceeds 49MB (Telegram Bot API limit).
-    - Extracts thumbnail & video dimensions safely.
+    - Hardened: If FFmpeg fails, operations strictly fail (no return of broken files).
+    - Validates output using FFprobe.
     """
     if not filepath or not os.path.exists(filepath):
-        return {"filepath": filepath, "error": "File missing"}
+        return {"filepath": None, "error": "File missing"}
 
     loop = asyncio.get_running_loop()
     meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(filepath))
@@ -379,7 +515,7 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
         out_path = os.path.join(DOWNLOAD_DIR, f"prep_{job_prefix}.mp4")
         duration = meta.get("duration", 0) or 60
 
-        def _do_transcode():
+        def _do_transcode() -> bool:
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", filepath]
             if filesize_mb > 48.0 and duration > 0:
                 target_size_bits = 45 * 8 * 1024 * 1024  # ~45MB target
@@ -405,17 +541,30 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
             res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
             if res.returncode != 0:
                 logger.error(f"FFmpeg transcode failed: {res.stderr.decode('utf-8', errors='ignore')}")
+                return False
+            
+            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                logger.error("FFmpeg transcode output file is missing or zero size.")
+                return False
 
-        await loop.run_in_executor(executor, _do_transcode)
+            return True
 
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            if filepath != out_path and os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-            processed_path = out_path
-            meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(processed_path))
+        success = await loop.run_in_executor(executor, _do_transcode)
+
+        if not success:
+            cleanup_job_files(f"prep_{job_prefix}")
+            return {"filepath": None, "error": "FFmpeg transcoding failed"}
+
+        if filepath != out_path and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+        processed_path = out_path
+        meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(processed_path))
+        if meta.get("width", 0) == 0 and meta.get("height", 0) == 0:
+            logger.error("FFprobe validation failed on transcoded file.")
+            return {"filepath": None, "error": "Transcoded file validation failed"}
 
     # Thumbnail Generation
     thumb_path = None
@@ -442,7 +591,7 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
     }
 
 # ---------------------------------------------------------------------------
-# MUSIC SEARCH ENGINES (Spotify, iTunes, Deezer)
+# MUSIC SEARCH ENGINES (Spotify, iTunes, Deezer) WITH HARDENED MULTI-ENGINE SELECTION
 # ---------------------------------------------------------------------------
 
 def get_spotify_token() -> Optional[str]:
@@ -474,103 +623,159 @@ def get_spotify_token() -> Optional[str]:
         logger.debug(f"Spotify token retrieval failed: {e}")
         return None
 
-def search_spotify_track(query: str) -> Optional[Dict[str, Any]]:
-    """Searches Spotify Web API for track metadata."""
+def get_spotify_candidates(query: str) -> List[Dict[str, Any]]:
+    """Fetches candidate tracks from Spotify Web API."""
     token = get_spotify_token()
     if not token or not query:
-        return None
+        return []
     try:
         q_enc = urllib.parse.quote(query)
-        req_url = f"https://api.spotify.com/v1/search?q={q_enc}&type=track&limit=1"
+        req_url = f"https://api.spotify.com/v1/search?q={q_enc}&type=track&limit=5"
         req = urllib.request.Request(req_url, headers={'Authorization': f'Bearer {token}'})
         with urllib.request.urlopen(req, timeout=6) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 items = data.get('tracks', {}).get('items', [])
-                if items:
-                    tr = items[0]
+                candidates = []
+                for tr in items:
                     artists = ", ".join([a.get('name', '') for a in tr.get('artists', [])])
                     album_art = tr.get('album', {}).get('images', [{}])[0].get('url', '')
-                    return {
+                    duration = float(tr.get('duration_ms', 0)) / 1000.0
+                    candidates.append({
                         'title': tr.get('name', ''),
                         'artist': artists,
                         'album': tr.get('album', {}).get('name', ''),
+                        'duration': duration,
                         'cover': album_art,
                         'spotify_url': tr.get('external_urls', {}).get('spotify', ''),
                         'source': 'Spotify Engine'
-                    }
+                    })
+                return candidates
     except Exception as e:
-        logger.debug(f"Spotify search error: {e}")
-    return None
+        logger.debug(f"Spotify candidates fetch error: {e}")
+    return []
 
-def search_itunes_track(query: str) -> Optional[Dict[str, Any]]:
-    """Searches iTunes/Apple Music API for song metadata."""
+def get_itunes_candidates(query: str) -> List[Dict[str, Any]]:
+    """Fetches candidate tracks from iTunes API."""
     if not query:
-        return None
+        return []
     try:
         q_enc = urllib.parse.quote(query)
-        req_url = f"https://itunes.apple.com/search?term={q_enc}&entity=song&limit=1"
+        req_url = f"https://itunes.apple.com/search?term={q_enc}&entity=song&limit=5"
         req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=6) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 results = data.get('results', [])
-                if results:
-                    tr = results[0]
+                candidates = []
+                for tr in results:
                     cover_hq = tr.get('artworkUrl100', '').replace('100x100bb', '1000x1000bb')
-                    return {
+                    duration = float(tr.get('trackTimeMillis', 0)) / 1000.0
+                    candidates.append({
                         'title': tr.get('trackName', ''),
                         'artist': tr.get('artistName', ''),
                         'album': tr.get('collectionName', ''),
                         'genre': tr.get('primaryGenreName', ''),
+                        'duration': duration,
                         'cover': cover_hq,
                         'source': 'Apple Music Engine'
-                    }
+                    })
+                return candidates
     except Exception as e:
-        logger.debug(f"iTunes search error: {e}")
-    return None
+        logger.debug(f"iTunes candidates fetch error: {e}")
+    return []
 
-def search_deezer_track(query: str) -> Optional[Dict[str, Any]]:
-    """Searches Deezer Music API for song metadata."""
+def get_deezer_candidates(query: str) -> List[Dict[str, Any]]:
+    """Fetches candidate tracks from Deezer API."""
     if not query:
-        return None
+        return []
     try:
         q_enc = urllib.parse.quote(query)
-        req_url = f"https://api.deezer.com/search?q={q_enc}&limit=1"
+        req_url = f"https://api.deezer.com/search?q={q_enc}&limit=5"
         req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=6) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 items = data.get('data', [])
-                if items:
-                    tr = items[0]
-                    return {
+                candidates = []
+                for tr in items:
+                    duration = float(tr.get('duration', 0))
+                    candidates.append({
                         'title': tr.get('title', ''),
                         'artist': tr.get('artist', {}).get('name', ''),
                         'album': tr.get('album', {}).get('title', ''),
+                        'duration': duration,
                         'cover': tr.get('album', {}).get('cover_xl') or tr.get('album', {}).get('cover_medium', ''),
                         'source': 'Deezer Engine'
-                    }
+                    })
+                return candidates
     except Exception as e:
-        logger.debug(f"Deezer search error: {e}")
-    return None
+        logger.debug(f"Deezer candidates fetch error: {e}")
+    return []
 
-def search_multi_engine_track(query: str) -> Optional[Dict[str, Any]]:
-    """Runs fallback sequence through Spotify, iTunes, and Deezer."""
-    clean_q = clean_music_query(query)
-    if not clean_q:
+def select_best_metadata_candidate(candidates: List[Dict[str, Any]], query: str) -> Optional[Dict[str, Any]]:
+    """Evaluates candidates against query using similarity scoring and minimum threshold."""
+    if not candidates or not query:
         return None
 
-    res = search_spotify_track(clean_q)
-    if res: return res
+    clean_q = clean_music_query(query)
+    best_candidate = None
+    best_score = 0.0
 
-    res = search_itunes_track(clean_q)
-    if res: return res
+    for cand in candidates:
+        c_title = cand.get('title', '')
+        c_artist = cand.get('artist', '')
+        c_str = f"{c_artist} {c_title}".strip()
 
-    res = search_deezer_track(clean_q)
-    if res: return res
+        title_sim = string_similarity(c_title, clean_q)
+        full_sim = string_similarity(c_str, clean_q)
+        sim_score = max(title_sim, full_sim)
+
+        if sim_score > best_score:
+            best_score = sim_score
+            best_candidate = cand
+
+    if best_candidate and best_score >= MIN_TOTAL_MATCH_SCORE:
+        best_candidate['confidence_score'] = best_score
+        return best_candidate
 
     return None
+
+def search_spotify_track(query: str) -> Optional[Dict[str, Any]]:
+    cands = get_spotify_candidates(query)
+    return select_best_metadata_candidate(cands, query)
+
+def search_itunes_track(query: str) -> Optional[Dict[str, Any]]:
+    cands = get_itunes_candidates(query)
+    return select_best_metadata_candidate(cands, query)
+
+def search_deezer_track(query: str) -> Optional[Dict[str, Any]]:
+    cands = get_deezer_candidates(query)
+    return select_best_metadata_candidate(cands, query)
+
+def search_multi_engine_track(query: str) -> Optional[Dict[str, Any]]:
+    """
+    HARDENED MULTI-ENGINE METADATA SEARCH:
+    Queries Spotify, iTunes, and Deezer APIs simultaneously.
+    DOES NOT stop at first success. Aggregates all valid candidates from all three engines,
+    selects the highest confidence canonical metadata, and returns None if confidence is low.
+    Spotify remains strictly metadata/search only.
+    """
+    clean_q = clean_music_query(query)
+    if not clean_q or len(clean_q) < 2:
+        return None
+
+    all_candidates: List[Dict[str, Any]] = []
+
+    # Query all three engines
+    all_candidates.extend(get_spotify_candidates(clean_q))
+    all_candidates.extend(get_itunes_candidates(clean_q))
+    all_candidates.extend(get_deezer_candidates(clean_q))
+
+    if not all_candidates:
+        return None
+
+    return select_best_metadata_candidate(all_candidates, clean_q)
 
 def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
     """Extracts Spotify track details via oEmbed API."""
@@ -592,6 +797,200 @@ def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"Spotify oEmbed error: {e}")
     return None
+
+# ---------------------------------------------------------------------------
+# MUSIC INTELLIGENCE, HARD VALIDATION & CANDIDATE MATCHING ENGINE
+# ---------------------------------------------------------------------------
+
+def normalize_music_text(text: str) -> str:
+    """Normalizes music title and artist strings for comparison."""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'#\w+', '', text)
+    text = re.sub(r'@\w+', '', text)
+
+    noise_parentheses = [
+        r'[\(\[\{]\s*(official\s+audio|official\s+video|music\s+video|lyric\s+video|lyrics|hd|4k|topic|full\s+song)\s*[\)\]\}]'
+    ]
+    for np in noise_parentheses:
+        text = re.sub(np, ' ', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\b(featuring|feat|ft)\b', ' ', text)
+    text = re.sub(r'\b(official\s+audio|official\s+video|official\s+music\s+video|music\s+video|lyric\s+video|lyrics|hd|4k|topic)\b', ' ', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return " ".join(text.split())
+
+def string_similarity(s1: str, s2: str) -> float:
+    """Calculates composite string similarity score (0.0 to 1.0)."""
+    norm1 = normalize_music_text(s1)
+    norm2 = normalize_music_text(s2)
+    if not norm1 or not norm2:
+        return 0.0
+    if norm1 == norm2:
+        return 1.0
+
+    tokens1 = set(norm1.split())
+    tokens2 = set(norm2.split())
+    if not tokens1 or not tokens2:
+        return 0.0
+
+    intersection = tokens1.intersection(tokens2)
+    union = tokens1.union(tokens2)
+    jaccard = len(intersection) / len(union) if union else 0.0
+
+    containment_bonus = 0.2 if (norm1 in norm2 or norm2 in norm1) else 0.0
+    char_ratio = SequenceMatcher(None, norm1, norm2).ratio()
+
+    return min(1.0, max(jaccard, char_ratio) * 0.7 + containment_bonus + (jaccard * 0.1))
+
+def score_music_candidate(
+    candidate: Dict[str, Any],
+    target_title: str,
+    target_artist: str,
+    target_duration: float
+) -> float:
+    """Evaluates candidate song track against target criteria with penalties."""
+    c_title = candidate.get('title', '')
+    c_uploader = candidate.get('uploader', '') or candidate.get('channel', '')
+    c_duration = float(candidate.get('duration') or 0)
+
+    title_score = string_similarity(c_title, target_title)
+
+    artist_title_sim = string_similarity(c_title, target_artist) if target_artist else 0.0
+    artist_uploader_sim = string_similarity(c_uploader, target_artist) if target_artist else 0.0
+    artist_score = max(artist_title_sim, artist_uploader_sim)
+
+    duration_score = 0.5
+    if target_duration > 0 and c_duration > 0:
+        diff = abs(c_duration - target_duration)
+        if diff <= 5:
+            duration_score = 1.0
+        elif diff <= 15:
+            duration_score = 0.85
+        elif diff <= 30:
+            duration_score = 0.6
+        elif diff <= 60:
+            duration_score = 0.3
+        else:
+            duration_score = 0.0
+    elif c_duration > 0:
+        if 60 <= c_duration <= 600:
+            duration_score = 0.7
+        else:
+            duration_score = 0.1
+
+    base_score = (title_score * 0.45) + (artist_score * 0.35) + (duration_score * 0.20)
+
+    c_title_lower = c_title.lower()
+    t_title_lower = target_title.lower()
+
+    if "remix" in c_title_lower and "remix" not in t_title_lower:
+        base_score -= 0.25
+    if "live" in c_title_lower and "live" not in t_title_lower:
+        base_score -= 0.25
+    if "cover" in c_title_lower and "cover" not in t_title_lower:
+        base_score -= 0.35
+    if "karaoke" in c_title_lower or "instrumental" in c_title_lower:
+        base_score -= 0.40
+    if "sped up" in c_title_lower or "slowed" in c_title_lower or "nightcore" in c_title_lower:
+        base_score -= 0.35
+
+    c_uploader_lower = c_uploader.lower()
+    if "topic" in c_uploader_lower or "vevo" in c_uploader_lower:
+        base_score += 0.15
+    if "official audio" in c_title_lower or "official video" in c_title_lower:
+        base_score += 0.10
+
+    return max(0.0, min(1.0, base_score))
+
+def validate_music_candidate(
+    candidate: Dict[str, Any],
+    target_title: str,
+    target_artist: str,
+    target_duration: float,
+    score: float
+) -> Tuple[bool, str]:
+    """
+    HARD VALIDATION: Strictly checks title similarity, artist similarity, duration difference, and composite score.
+    Score alone CANNOT bypass hard validation criteria.
+    """
+    if score < MIN_TOTAL_MATCH_SCORE:
+        return False, f"Score {score:.2f} below minimum threshold {MIN_TOTAL_MATCH_SCORE}"
+
+    c_title = candidate.get('title', '')
+    c_uploader = candidate.get('uploader', '') or candidate.get('channel', '')
+    c_duration = float(candidate.get('duration') or 0)
+
+    title_sim = string_similarity(c_title, target_title)
+    if title_sim < MIN_TITLE_SIMILARITY:
+        return False, f"Title similarity {title_sim:.2f} below threshold {MIN_TITLE_SIMILARITY}"
+
+    if target_artist:
+        artist_title_sim = string_similarity(c_title, target_artist)
+        artist_uploader_sim = string_similarity(c_uploader, target_artist)
+        artist_sim = max(artist_title_sim, artist_uploader_sim)
+        if artist_sim < MIN_ARTIST_SIMILARITY:
+            return False, f"Artist similarity {artist_sim:.2f} below threshold {MIN_ARTIST_SIMILARITY}"
+
+    if target_duration > 0 and c_duration > 0:
+        dur_diff = abs(c_duration - target_duration)
+        if dur_diff > MAX_DURATION_DIFF_SECONDS:
+            return False, f"Duration difference {dur_diff:.1f}s exceeds max allowed {MAX_DURATION_DIFF_SECONDS}s"
+
+    return True, "Valid Candidate"
+
+def collect_youtube_candidates(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Collects YouTube & YouTube Music candidates without downloading audio files upfront."""
+    candidates = []
+    if not query:
+        return candidates
+
+    cookie_file = setup_cookies_file()
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': 'in_playlist',
+        'nocheckcertificate': True,
+    }
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+
+    targets = [f"ytmsearch{limit}:{query}", f"ytsearch{limit}:{query}"]
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        for tgt in targets:
+            try:
+                info = ydl.extract_info(tgt, download=False)
+                if info and info.get('entries'):
+                    for entry in info.get('entries', []):
+                        if not entry:
+                            continue
+                        url = entry.get('webpage_url') or entry.get('url')
+                        if not url:
+                            vid = entry.get('id')
+                            if vid:
+                                url = f"https://www.youtube.com/watch?v={vid}"
+                        if url:
+                            candidates.append({
+                                'title': entry.get('title') or "Audio Candidate",
+                                'uploader': entry.get('uploader') or entry.get('channel') or "YouTube Artist",
+                                'duration': float(entry.get('duration') or 0),
+                                'webpage_url': url,
+                                'id': entry.get('id', '')
+                            })
+            except Exception as ex:
+                logger.debug(f"Candidate search failed for {tgt}: {ex}")
+
+    seen_urls = set()
+    unique_candidates = []
+    for c in candidates:
+        if c['webpage_url'] not in seen_urls:
+            seen_urls.add(c['webpage_url'])
+            unique_candidates.append(c)
+
+    return unique_candidates
 
 # ---------------------------------------------------------------------------
 # SHAZAM AUDIO RECOGNITION
@@ -708,34 +1107,107 @@ async def recognize_audio_shazam(filepath: str, job_prefix: str) -> Optional[Dic
     return None
 
 # ---------------------------------------------------------------------------
-# EXTRACTION & NORMALIZATION ENGINE (PHASE 1 REFACTOR)
+# EXTRACTION & FORMAT SELECTION ENGINE (HARDENED)
 # ---------------------------------------------------------------------------
 
 def parse_valid_formats_for_item(formats: List[Dict[str, Any]], duration: float) -> List[Dict[str, Any]]:
-    """Calculates valid format resolutions and estimated sizes for a slide."""
-    valid_formats = []
-    seen_heights = set()
+    """Filters and deduplicates format resolutions for a slide."""
+    if not formats:
+        return []
+
+    height_groups: Dict[int, List[Dict[str, Any]]] = {}
 
     for f in formats:
         vcodec = f.get('vcodec', 'none')
-        if vcodec == 'none':
+        if not vcodec or vcodec == 'none':
             continue
 
         height = extract_resolution_height(f)
-        if height > 0 and height not in seen_heights:
-            seen_heights.add(height)
-            size_bytes = estimate_format_filesize(f, duration)
-            valid_formats.append({
-                'height': height,
-                'label': format_quality_label(height),
-                'size_str': format_size(size_bytes)
-            })
+        if height <= 0:
+            continue
+
+        if height not in height_groups:
+            height_groups[height] = []
+        height_groups[height].append(f)
+
+    valid_formats = []
+
+    for height, fmt_list in height_groups.items():
+        def format_rank_key(fmt):
+            ext = str(fmt.get('ext', '')).lower()
+            vcodec = str(fmt.get('vcodec', '')).lower()
+            acodec = str(fmt.get('acodec', '')).lower()
+
+            is_mp4 = 1 if ext == 'mp4' else 0
+            is_h264 = 1 if ('h264' in vcodec or 'avc' in vcodec) else 0
+            has_audio = 1 if (acodec and acodec != 'none') else 0
+
+            size = estimate_format_filesize(fmt, duration)
+            has_size = 1 if size > 0 else 0
+            tbr = float(fmt.get('tbr') or fmt.get('vbr') or 0)
+
+            return (has_audio, is_mp4, is_h264, has_size, tbr, size)
+
+        sorted_fmts = sorted(fmt_list, key=format_rank_key, reverse=True)
+        best_fmt = sorted_fmts[0]
+
+        acodec = best_fmt.get('acodec', 'none')
+        vcodec = best_fmt.get('vcodec', 'none')
+        has_audio = bool(acodec and acodec != 'none')
+        has_video = bool(vcodec and vcodec != 'none')
+
+        size_bytes = estimate_format_filesize(best_fmt, duration)
+
+        fmt_meta = {
+            'height': height,
+            'format_id': str(best_fmt.get('format_id', '')),
+            'ext': str(best_fmt.get('ext', 'mp4')),
+            'vcodec': str(vcodec),
+            'acodec': str(acodec),
+            'filesize': best_fmt.get('filesize', 0),
+            'filesize_approx': best_fmt.get('filesize_approx', 0),
+            'tbr': best_fmt.get('tbr', 0),
+            'has_audio': has_audio,
+            'has_video': has_video,
+            'label': format_quality_label(height),
+            'size_str': format_size(size_bytes),
+            'size_bytes': size_bytes
+        }
+        valid_formats.append(fmt_meta)
 
     valid_formats.sort(key=lambda x: x['height'], reverse=True)
     return valid_formats
 
+def build_format_selectors(slide: Dict[str, Any], param: str) -> List[str]:
+    """
+    QUALITY SAFETY MANDATE:
+    For numeric parameters (e.g. 720), format selectors MUST NOT contain unrestricted fallbacks or unconstrained height syntax.
+    """
+    if not param or param == "best":
+        return [
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]",
+            "bestvideo+bestaudio",
+            "best"
+        ]
+
+    try:
+        requested_h = int(param)
+    except (ValueError, TypeError):
+        return [
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+            "best"
+        ]
+
+    # Strictly restricted to requested_h with NO unconstrained height fallbacks
+    selectors = [
+        f"bestvideo[height<={requested_h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={requested_h}][vcodec^=avc]+bestaudio[acodec^=mp4a]",
+        f"bestvideo[height<={requested_h}]+bestaudio",
+        f"best[height<={requested_h}]"
+    ]
+    return selectors
+
 def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Dict[str, Any]]:
-    """Normalizes yt-dlp single / playlist / album extraction result into independent slide dicts."""
+    """Normalizes yt-dlp single / playlist / carousel extraction result into independent slide dicts."""
     if not info:
         return []
 
@@ -826,7 +1298,7 @@ def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Di
     return slides
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Extracts media metadata conservatively using yt-dlp without fragile forced extractor_args."""
+    """Extracts media metadata using yt-dlp."""
     clean_url = clean_media_url(url)
 
     if is_spotify_url(clean_url):
@@ -889,27 +1361,31 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
 
     return None
 
-async def download_media_video(url: str, param: str, job_prefix: str) -> Optional[str]:
-    """Downloads requested video quality securely."""
+async def download_media_video(url: str, param: str, job_prefix: str, slide: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    Downloads requested video quality with post-download FFprobe height validation & stale file protection.
+    Rejects any video that exceeds requested max_height.
+    """
+    if not url:
+        return None
+
+    max_height = int(param) if (param and param.isdigit()) else None
+
     async with JOB_SEMAPHORE:
+        cleanup_job_files(job_prefix)
+        download_started_at = time.time()
+
         cookie_file = setup_cookies_file()
         output_template = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.%(ext)s")
 
-        format_specs = []
-        if param and param.isdigit():
-            height = param
-            format_specs.append(f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best")
-            format_specs.append(f"b[height<={height}]/best")
-        elif param and param != "best":
-            format_specs.append(f"{param}+bestaudio/best")
-            format_specs.append(param)
-
-        format_specs.append("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
-        format_specs.append("best")
+        slide_dict = slide or {}
+        format_selectors = build_format_selectors(slide_dict, param)
 
         loop = asyncio.get_running_loop()
 
-        for fmt in format_specs:
+        for fmt in format_selectors:
+            cleanup_job_files(job_prefix)
+
             ydl_opts = {
                 'format': fmt,
                 'outtmpl': output_template,
@@ -929,23 +1405,31 @@ async def download_media_video(url: str, param: str, job_prefix: str) -> Optiona
             def _download():
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        return ydl.prepare_filename(info)
+                        ydl.extract_info(url, download=True)
                 except Exception as ex:
                     logger.debug(f"Video download strategy failed ({fmt}): {ex}")
-                    return None
 
             await loop.run_in_executor(executor, _download)
 
-            matching = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_prefix}.*"))
-            if matching:
-                return matching[0]
+            found_file = find_downloaded_media(job_prefix, min_mtime=download_started_at)
+            if found_file:
+                if validate_downloaded_video_height(found_file, max_height):
+                    return found_file
+                else:
+                    logger.warning(f"Rejecting output file {found_file} due to height validation failure (> {max_height}p).")
+                    cleanup_job_files(job_prefix)
 
         return None
 
 async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optional[str]:
-    """Extracts MP3 audio track from source video URL."""
+    """Extracts MP3 audio track from source slide URL with stale file protection and ffprobe validation."""
+    if not url:
+        return None
+
     async with JOB_SEMAPHORE:
+        cleanup_job_files(job_prefix)
+        download_started_at = time.time()
+
         cookie_file = setup_cookies_file()
         output_template = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.%(ext)s")
 
@@ -956,7 +1440,7 @@ async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optio
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': bitrate,
+                'preferredquality': bitrate if bitrate in ["128", "320"] else "128",
             }],
             'quiet': True,
             'no_warnings': True,
@@ -970,93 +1454,151 @@ async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optio
             def _download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.extract_info(url, download=True)
-                    return os.path.join(DOWNLOAD_DIR, f"{job_prefix}.mp3")
 
             await loop.run_in_executor(executor, _download)
-            final_mp3 = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.mp3")
-            return final_mp3 if os.path.exists(final_mp3) else None
+            found_audio = find_downloaded_audio(job_prefix, min_mtime=download_started_at)
+            if found_audio and os.path.exists(found_audio):
+                meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
+                if meta.get("duration", 0) > 0 and os.path.getsize(found_audio) > 0:
+                    return found_audio
+            return None
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             return None
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, job_prefix: str) -> Optional[Dict[str, Any]]:
-    """Searches and downloads full 320kbps MP3 audio file."""
+    """
+    FULL TRACK VALIDATION PIPELINE:
+    1. Multi-Engine Search (Spotify, iTunes, Deezer) -> Canonical Target
+    2. Collect YouTube / YouTube Music Candidates
+    3. Normalize & Score Candidates
+    4. HARD VALIDATION (validate_music_candidate) BEFORE downloading
+    5. Sort valid candidates descending by score
+    6. Download best valid candidate
+    7. FFprobe Verification
+    8. Return result OR explicit failure (None). NO blind/random downloading.
+    """
     async with JOB_SEMAPHORE:
+        cleanup_job_files(job_prefix)
+        download_started_at = time.time()
+
         clean_t = clean_music_query(track_title)
         clean_a = clean_music_query(artist_name)
         extracted_t, extracted_a = extract_music_info_from_caption(caption)
 
         search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_a} {extracted_t}".strip() or clean_music_query(caption[:80])
-        if not search_seed:
+        if not search_seed or len(search_seed) < 2:
             return None
 
         loop = asyncio.get_running_loop()
+
+        # Step 1: Multi-Engine Metadata Search -> Canonical Target
         multi_match = await loop.run_in_executor(executor, lambda: search_multi_engine_track(search_seed))
 
-        queries_to_try = []
         if multi_match:
-            queries_to_try.append(f"{multi_match['artist']} {multi_match['title']} audio")
-            queries_to_try.append(f"{multi_match['artist']} {multi_match['title']}")
+            target_t = multi_match.get('title') or clean_t or extracted_t
+            target_a = multi_match.get('artist') or clean_a or extracted_a
+            target_dur = float(multi_match.get('duration', 0))
+            engine_label = multi_match.get('source', 'Multi-Engine')
+        else:
+            target_t = clean_t or extracted_t
+            target_a = clean_a or extracted_a
+            target_dur = 0.0
+            engine_label = 'Direct Search'
 
-        queries_to_try.append(f"{search_seed} audio")
-        queries_to_try.append(search_seed)
+        if not target_t or len(target_t) < 2:
+            logger.info("Canonical target title invalid or too short. Aborting search.")
+            return None
+
+        # Step 2: Collect Candidates from YouTube / YouTube Music
+        search_queries = [f"{target_a} {target_t}".strip(), f"{target_t} audio".strip(), search_seed]
+
+        candidates = []
+        for q in search_queries:
+            if not q: continue
+            q_candidates = await loop.run_in_executor(executor, lambda: collect_youtube_candidates(q, limit=6))
+            candidates.extend(q_candidates)
+
+        seen_urls = set()
+        unique_candidates = []
+        for c in candidates:
+            if c['webpage_url'] not in seen_urls:
+                seen_urls.add(c['webpage_url'])
+                unique_candidates.append(c)
+
+        if not unique_candidates:
+            logger.info("No YT candidates collected.")
+            return None
+
+        # Step 3 & 4: Score & HARD VALIDATION BEFORE downloading
+        valid_candidates = []
+        for cand in unique_candidates:
+            score = score_music_candidate(cand, target_t, target_a, target_dur)
+            is_valid, val_reason = validate_music_candidate(cand, target_t, target_a, target_dur, score)
+            if is_valid:
+                valid_candidates.append((score, cand))
+            else:
+                logger.debug(f"Candidate rejected ({cand.get('title')}): {val_reason}")
+
+        if not valid_candidates:
+            logger.info("No candidates passed hard validation. Explicit failure returned.")
+            return None
+
+        # Step 5: Sort valid candidates by score descending
+        valid_candidates.sort(key=lambda x: x[0], reverse=True)
 
         output_template = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.%(ext)s")
         cookie_file = setup_cookies_file()
 
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
-            'outtmpl': output_template,
-            'nocheckcertificate': True,
-            'ignoreerrors': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
-            'quiet': True,
-            'no_warnings': True,
-        }
+        # Step 6 & 7: Download and validate best candidate
+        for score, cand in valid_candidates:
+            target_url = cand['webpage_url']
 
-        if cookie_file:
-            ydl_opts['cookiefile'] = cookie_file
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'outtmpl': output_template,
+                'nocheckcertificate': True,
+                'ignoreerrors': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '320',
+                }],
+                'quiet': True,
+                'no_warnings': True,
+            }
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
 
-        for search_q in queries_to_try:
-            try:
-                def _search():
+            def _dl_cand():
+                try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        target = f"ytmsearch3:{search_q}"
-                        info = ydl.extract_info(target, download=False)
-                        if not info or not info.get('entries'):
-                            target = f"ytsearch3:{search_q}"
-                            info = ydl.extract_info(target, download=False)
+                        ydl.download([target_url])
+                except Exception as ex:
+                    logger.debug(f"Candidate download failed ({target_url}): {ex}")
 
-                        if not info:
-                            return None
+            await loop.run_in_executor(executor, _dl_cand)
 
-                        entries = [e for e in info.get('entries', []) if e]
-                        for entry in entries:
-                            duration = entry.get('duration') or 180
-                            if 30 <= duration <= 1200:
-                                video_url = entry.get('webpage_url') or entry.get('url')
-                                if video_url:
-                                    ydl.download([video_url])
-                                    f_title = (multi_match.get('title') if multi_match else None) or entry.get('title') or "Audio Track"
-                                    f_artist = (multi_match.get('artist') if multi_match else None) or entry.get('uploader') or "Artist"
-                                    return {
-                                        'filepath': os.path.join(DOWNLOAD_DIR, f"{job_prefix}.mp3"),
-                                        'title': f_title,
-                                        'uploader': f_artist,
-                                        'duration': duration,
-                                        'engine': multi_match.get('source') if multi_match else 'YouTube Search Engine'
-                                    }
-                        return None
+            found_audio = find_downloaded_audio(job_prefix, min_mtime=download_started_at)
+            if found_audio and os.path.exists(found_audio):
+                try:
+                    meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
+                    audio_dur = meta.get("duration", 0)
+                    if audio_dur > 0 and os.path.getsize(found_audio) > 0:
+                        final_title = target_t or cand['title']
+                        final_artist = target_a or cand['uploader']
+                        return {
+                            'filepath': found_audio,
+                            'title': final_title,
+                            'uploader': final_artist,
+                            'duration': audio_dur,
+                            'score': score,
+                            'engine': f"{engine_label} (Match Score: {int(score * 100)}%)"
+                        }
+                except Exception as ex:
+                    logger.debug(f"Audio ffprobe validation failed: {ex}")
 
-                res = await loop.run_in_executor(executor, _search)
-                if res and os.path.exists(res['filepath']):
-                    return res
-            except Exception as ex:
-                logger.debug(f"Search failed for '{search_q}': {ex}")
+            cleanup_job_files(job_prefix)
 
         return None
 
@@ -1084,7 +1626,7 @@ def build_media_keyboard(cache_id: str, slide_idx: int, total_slides: int, slide
         callback_data = f"vid:{cache_id}:{slide_idx}:{fmt['height']}"
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
 
-    if not valid_formats:
+    if not valid_formats and not slide.get("is_spotify"):
         keyboard.append([
             InlineKeyboardButton("📹 دانلود ویدیو (بهترین کیفیت)", callback_data=f"vid:{cache_id}:{slide_idx}:best")
         ])
@@ -1098,18 +1640,20 @@ def build_media_keyboard(cache_id: str, slide_idx: int, total_slides: int, slide
             nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"slide:{cache_id}:{slide_idx + 1}"))
         keyboard.append(nav_row)
 
-    keyboard.append([
-        InlineKeyboardButton("🎵 ویس 128kbps", callback_data=f"aud:{cache_id}:{slide_idx}:128"),
-        InlineKeyboardButton("🎵 ویس 320kbps", callback_data=f"aud:{cache_id}:{slide_idx}:320"),
-    ])
+    if not slide.get("is_spotify"):
+        keyboard.append([
+            InlineKeyboardButton("🎵 ویس 128kbps", callback_data=f"aud:{cache_id}:{slide_idx}:128"),
+            InlineKeyboardButton("🎵 ویس 320kbps", callback_data=f"aud:{cache_id}:{slide_idx}:320"),
+        ])
 
     keyboard.append([
         InlineKeyboardButton("🎧 دانلود آهنگ اصلی (Multi-Engine)", callback_data=f"fullm:{cache_id}:{slide_idx}:hq")
     ])
 
-    keyboard.append([
-        InlineKeyboardButton("🔍 تشخیص موزیک با شزام (Shazam Pro)", callback_data=f"shazam:{cache_id}:{slide_idx}")
-    ])
+    if not slide.get("is_spotify"):
+        keyboard.append([
+            InlineKeyboardButton("🔍 تشخیص موزیک با شزام (Shazam Pro)", callback_data=f"shazam:{cache_id}:{slide_idx}")
+        ])
 
     extra_row = []
     if slide.get("thumbnail"):
@@ -1209,7 +1753,7 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all inline callback button queries safely."""
+    """Handles inline callbacks with hardened validation & Spotify restrictions."""
     query = update.callback_query
     await query.answer()
 
@@ -1222,7 +1766,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action_type == "noop":
         return
 
-    # Direct Video Options Callback
+    # Direct Video Options Callback (vopt)
     if action_type == "vopt":
         if len(data_parts) < 3:
             return
@@ -1248,37 +1792,44 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if sub_action == "extract_audio":
                 def _ext_audio():
                     cmd = ["ffmpeg", "-y", "-i", temp_v, "-vn", "-acodec", "libmp3lame", "-b:a", "320k", temp_a]
-                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                    return res.returncode == 0 and os.path.exists(temp_a) and os.path.getsize(temp_a) > 0
 
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(executor, _ext_audio)
+                success = await loop.run_in_executor(executor, _ext_audio)
 
-                if os.path.exists(temp_a):
-                    with open(temp_a, 'rb') as f:
+                found_audio = find_downloaded_audio(job_prefix) if success else None
+                if found_audio:
+                    with open(found_audio, 'rb') as f:
                         await query.message.reply_audio(audio=f, caption="🎵 فایل صوتی استخراج شده (320kbps)")
                     await status_msg.delete()
                 else:
-                    await status_msg.edit_text("❌ خطا در استخراج صوت.")
+                    await status_msg.edit_text("❌ خطا در استخراج صوت از ویدیو.")
 
             elif sub_action in ["shazam", "full_music"]:
                 def _prep_wav():
                     cmd = ["ffmpeg", "-y", "-i", temp_v, "-vn", "-ac", "1", "-ar", "44100", temp_a]
-                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                    return res.returncode == 0 and os.path.exists(temp_a) and os.path.getsize(temp_a) > 0
 
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(executor, _prep_wav)
+                success = await loop.run_in_executor(executor, _prep_wav)
+
+                if not success:
+                    await status_msg.edit_text("❌ خطا در آماده‌سازی فایل صوتی از ویدیو.")
+                    return
 
                 shz_res = await recognize_audio_shazam(temp_a, job_prefix)
                 if shz_res:
                     s_t, s_a = shz_res['title'], shz_res['artist']
-                    await status_msg.edit_text(f"🎯 <b>موزیک شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال دانلود نسخه ۳۲۰...", parse_mode=ParseMode.HTML)
+                    await status_msg.edit_text(f"🎯 <b>موزیک شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال جستجو و دانلود نسخه مطمئن...", parse_mode=ParseMode.HTML)
                     full_res = await search_and_download_full_track(s_t, s_a, f"{s_t} {s_a}", f"full_{job_prefix}")
                     if full_res and os.path.exists(full_res['filepath']):
                         with open(full_res['filepath'], 'rb') as f:
-                            await query.message.reply_audio(audio=f, title=s_t, performer=s_a, caption=f"🎧 <b>{html_escape(s_a)} - {html_escape(s_t)}</b>", parse_mode=ParseMode.HTML)
+                            await query.message.reply_audio(audio=f, title=full_res['title'], performer=full_res['uploader'], caption=f"🎧 <b>{html_escape(full_res['uploader'])} - {html_escape(full_res['title'])}</b>\n⚡️ {html_escape(full_res.get('engine','Engine'))}", parse_mode=ParseMode.HTML)
                         await status_msg.delete()
                     else:
-                        await status_msg.edit_text("❌ نسخه کامل آهنگ پیدا نشد.")
+                        await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ پیدا نشد.")
                 else:
                     await status_msg.edit_text("❌ موزیک توسط شزام تشخیص داده نشد.")
         except Exception as e:
@@ -1308,8 +1859,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("❌ اسلاید مورد نظر یافت نشد.")
         return
 
+    # Spotify callback restriction
+    if slide.get("is_spotify"):
+        if action_type in ["vid", "aud", "shazam"]:
+            await query.message.reply_text("❌ امکان دانلود مستقیم فایل ویدیو/صوت برای لینک‌های اسپاتیفای وجود ندارد.\nلطفاً از گزینه «دانلود آهنگ اصلی» استفاده کنید.")
+            return
+
+    # Quality callback validation for "vid"
+    if action_type == "vid":
+        slide_formats = slide.get("formats", [])
+        if param != "best" and param.isdigit():
+            req_h = int(param)
+            valid_hs = [f['height'] for f in slide_formats if isinstance(f.get('height'), int) and f['height'] > 0]
+            if slide_formats and req_h not in valid_hs:
+                await query.message.reply_text("❌ کیفیت انتخاب‌شده معتبر نیست یا در این اسلاید وجود ندارد.")
+                return
+
     cached_entry["current_slide"] = slide_idx
-    url = slide.get("url") or cached_entry.get("source_url")
+    url = slide.get("url") or slide.get("webpage_url") or cached_entry.get("source_url")
     job_prefix = f"job_{uuid.uuid4().hex[:6]}"
 
     if action_type == "slide":
@@ -1322,11 +1889,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif action_type == "vid":
         status_msg = await query.message.reply_text("⏳ در حال دانلود و بهینه‌سازی ویدیو...")
         try:
-            raw_path = await download_media_video(url, param, job_prefix)
+            raw_path = await download_media_video(url, param, job_prefix, slide=slide)
             if raw_path and os.path.exists(raw_path):
                 prep_res = await prepare_telegram_video(raw_path, job_prefix)
-                filepath = prep_res.get("filepath", raw_path)
+                filepath = prep_res.get("filepath")
                 thumb_path = prep_res.get("thumb_path")
+
+                if not filepath or not os.path.exists(filepath):
+                    await status_msg.edit_text("❌ خطا در پردازش یا تبدیل فرمت ویدیو.")
+                    return
 
                 if prep_res.get("filesize", 0) > 49.5 * 1024 * 1024:
                     await status_msg.edit_text("❌ حجم ویدیو بیشتر از حد مجاز تلگرام (۵۰ مگابایت) است.")
@@ -1348,7 +1919,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ دانلود ویدیو با مشکل مواجه شد.")
+                await status_msg.edit_text("❌ کیفیت درخواستی موجود نیست یا امکان دانلود امن آن وجود ندارد.")
         except Exception as e:
             logger.error(f"Error uploading video: {e}")
             await status_msg.edit_text("❌ خطا در دانلود یا ارسال ویدیو.")
@@ -1364,7 +1935,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.message.reply_audio(audio=af, caption=f"🎵 ویس استخراج شده {param}kbps")
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ خطا در استخراج فایل صوتی.")
+                await status_msg.edit_text("❌ خطا در استخراج یا تبدیل فایل صوتی.")
         finally:
             cleanup_job_files(job_prefix)
 
@@ -1376,14 +1947,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 shz_res = await recognize_audio_shazam(filepath, job_prefix)
                 if shz_res:
                     s_t, s_a = shz_res['title'], shz_res['artist']
-                    await status_msg.edit_text(f"🎯 <b>موزیک شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال دانلود آهنگ کامل...", parse_mode=ParseMode.HTML)
+                    await status_msg.edit_text(f"🎯 <b>موزیک شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال آنالیز و دانلود نسخه مطمئن...", parse_mode=ParseMode.HTML)
                     full_res = await search_and_download_full_track(s_t, s_a, f"{s_t} {s_a}", f"full_{job_prefix}")
                     if full_res and os.path.exists(full_res['filepath']):
                         with open(full_res['filepath'], 'rb') as af:
-                            await query.message.reply_audio(audio=af, title=s_t, performer=s_a, caption=f"🎧 <b>{html_escape(s_a)} - {html_escape(s_t)}</b>", parse_mode=ParseMode.HTML)
+                            await query.message.reply_audio(audio=af, title=full_res['title'], performer=full_res['uploader'], caption=f"🎧 <b>{html_escape(full_res['uploader'])} - {html_escape(full_res['title'])}</b>\n⚡️ {html_escape(full_res.get('engine','Engine'))}", parse_mode=ParseMode.HTML)
                         await status_msg.delete()
                     else:
-                        await status_msg.edit_text("❌ موزیک شناسایی شد اما دانلود نسخه کامل ناموفق بود.")
+                        await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ پیدا نشد.")
                 else:
                     await status_msg.edit_text("❌ اثری از این موزیک در دیتابیس شزام پیدا نشد.")
             else:
@@ -1392,7 +1963,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             cleanup_job_files(job_prefix)
 
     elif action_type == "fullm":
-        status_msg = await query.message.reply_text("🟢 🔎 در حال جستجوی موزیک کامل با موتورهای چندگانه...")
+        status_msg = await query.message.reply_text("🟢 🔎 در حال آنالیز و جستجوی چندگانه موزیک اصلی...")
         try:
             track_title = slide.get("track_title", "")
             artist_name = slide.get("artist_name", "")
@@ -1406,7 +1977,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.message.reply_audio(audio=af, title=res['title'], performer=res['uploader'], caption=caption_audio, parse_mode=ParseMode.HTML)
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ نسخه کامل این موزیک یافت نشد.")
+                await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ مطابق مشخصات یافت نشد.")
         finally:
             cleanup_job_files(job_prefix)
 
@@ -1422,7 +1993,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(f"📜 <b>کپشن کامل:</b>\n\n{html_escape(full_cap)}", parse_mode=ParseMode.HTML)
 
 async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles directly sent voice or audio messages for Shazam identification."""
+    """Handles directly sent voice or audio messages for Shazam identification & candidate search."""
     msg = update.message
     file_obj = msg.audio or msg.voice
     if not file_obj:
@@ -1439,14 +2010,14 @@ async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFA
         shz_res = await recognize_audio_shazam(temp_path, job_prefix)
         if shz_res:
             s_t, s_a = shz_res['title'], shz_res['artist']
-            await status_msg.edit_text(f"🎯 <b>شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال دانلود نسخه کامل ۳۲۰...", parse_mode=ParseMode.HTML)
+            await status_msg.edit_text(f"🎯 <b>شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال آنالیز و دانلود نسخه مطمئن...", parse_mode=ParseMode.HTML)
             full_res = await search_and_download_full_track(s_t, s_a, f"{s_t} {s_a}", f"full_{job_prefix}")
             if full_res and os.path.exists(full_res['filepath']):
                 with open(full_res['filepath'], 'rb') as af:
-                    await msg.reply_audio(audio=af, title=s_t, performer=s_a, caption=f"🎧 <b>{html_escape(s_a)} - {html_escape(s_t)}</b>", parse_mode=ParseMode.HTML)
+                    await msg.reply_audio(audio=af, title=full_res['title'], performer=full_res['uploader'], caption=f"🎧 <b>{html_escape(full_res['uploader'])} - {html_escape(full_res['title'])}</b>\n⚡️ {html_escape(full_res.get('engine','Engine'))}", parse_mode=ParseMode.HTML)
                 await status_msg.delete()
             else:
-                await status_msg.edit_text("❌ آهنگ شناسایی شد اما فایل باکیفیت پیدا نشد.")
+                await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ پیدا نشد.")
         else:
             await status_msg.edit_text("❌ متأسفانه این آهنگ در شزام پیدا نشد.")
     except Exception as ex:
@@ -1525,3 +2096,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# FINAL HARDENING COMPLETE
