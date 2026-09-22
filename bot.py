@@ -67,7 +67,7 @@ _spotify_access_token: Optional[str] = None
 _spotify_token_expires_at: float = 0.0
 
 # ---------------------------------------------------------------------------
-# UTILITIES & SYSTEM CHECKS
+# UTILITIES & HOST / URL HANDLING (PHASE 1 REFACTOR)
 # ---------------------------------------------------------------------------
 
 def check_ffmpeg_installed() -> bool:
@@ -85,82 +85,114 @@ def html_escape(text: str) -> str:
         return ""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+def normalize_host(host: str) -> str:
+    """Strips port and www prefix, converting to clean lowercase hostname."""
+    if not host:
+        return ""
+    host = host.lower().strip()
+    if ":" in host:
+        host = host.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+INSTAGRAM_HOSTS = {"instagram.com", "instagr.am"}
+TIKTOK_HOSTS = {"tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
+SPOTIFY_HOSTS = {"spotify.com", "open.spotify.com"}
+
+def is_youtube_url(url: str) -> bool:
+    if not url: return False
+    try:
+        host = normalize_host(urllib.parse.urlparse(url).netloc)
+        return host in YOUTUBE_HOSTS
+    except Exception:
+        return False
+
+def is_instagram_url(url: str) -> bool:
+    if not url: return False
+    try:
+        host = normalize_host(urllib.parse.urlparse(url).netloc)
+        return host in INSTAGRAM_HOSTS
+    except Exception:
+        return False
+
+def is_tiktok_url(url: str) -> bool:
+    if not url: return False
+    try:
+        host = normalize_host(urllib.parse.urlparse(url).netloc)
+        return host in TIKTOK_HOSTS
+    except Exception:
+        return False
+
+def is_spotify_url(url: str) -> bool:
+    if not url: return False
+    try:
+        host = normalize_host(urllib.parse.urlparse(url).netloc)
+        return host in SPOTIFY_HOSTS
+    except Exception:
+        return False
+
+def is_supported_url(url: str) -> bool:
+    if not url: return False
+    try:
+        host = normalize_host(urllib.parse.urlparse(url).netloc)
+        all_supported = YOUTUBE_HOSTS | INSTAGRAM_HOSTS | TIKTOK_HOSTS | SPOTIFY_HOSTS
+        return host in all_supported
+    except Exception:
+        return False
+
 def extract_urls_from_text(text: str) -> List[str]:
-    """Extracts all valid HTTP/HTTPS URLs embedded inside a user message."""
+    """Extracts all valid HTTP/HTTPS URLs embedded inside a user message and strips trailing punctuation."""
     if not text:
         return []
     url_pattern = r'https?://[^\s<>"{}|\\^`]+'
-    return re.findall(url_pattern, text)
+    raw_urls = re.findall(url_pattern, text)
+    cleaned_urls = []
+    punctuation_to_strip = ".,!?:;)]}"
+
+    for u in raw_urls:
+        while u and u[-1] in punctuation_to_strip:
+            u = u[:-1]
+        if u:
+            cleaned_urls.append(u)
+    return cleaned_urls
 
 def clean_media_url(url: str) -> str:
-    """Removes tracking query parameters while strictly preserving essential video IDs & structure."""
+    """Removes tracking query parameters & fragments while strictly preserving essential video IDs & structure."""
     if not url:
         return ""
     url = url.strip()
     try:
         parsed = urllib.parse.urlparse(url)
+        host = normalize_host(parsed.netloc)
+
+        if host in YOUTUBE_HOSTS:
+            if host == "youtu.be":
+                video_id = parsed.path.lstrip("/")
+                query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                allowed_yt = {"list", "index", "t", "start"}
+                cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
+                if video_id:
+                    cleaned_query["v"] = [video_id]
+                new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
+                return urllib.parse.urlunparse(('https', 'www.youtube.com', '/watch', '', new_query_str, ''))
+            else:
+                query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                allowed_yt = {"v", "list", "index", "t", "start"}
+                cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
+                new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
+                return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
+
         query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        
-        # YouTube Preservation
-        if "youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc:
-            allowed_yt = {"v", "list", "index", "t", "start"}
-            cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
-            new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-            return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
-            
-        # Social Media clean tracking params
-        allowed_generic = {"id"}
-        cleaned_query = {k: v for k, v in query_params.items() if k in allowed_generic}
+        tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "si", "feature", "igsh", "share_id", "is_copy_url"}
+        cleaned_query = {k: v for k, v in query_params.items() if k.lower() not in tracking_keys}
         new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
+
+        return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
     except Exception as e:
         logger.debug(f"URL cleaning error: {e}")
         return url
-
-def is_supported_url(url: str) -> bool:
-    """Validates if the host is a supported social media platform."""
-    if not url:
-        return False
-    try:
-        parsed = urllib.parse.urlparse(url.lower())
-        host = parsed.netloc.replace("www.", "")
-        supported_domains = [
-            "instagram.com", "instagr.am",
-            "youtube.com", "youtu.be",
-            "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-            "spotify.com"
-        ]
-        return any(domain in host for domain in supported_domains)
-    except Exception:
-        return False
-
-def is_instagram_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url.lower()).netloc
-        return "instagram.com" in host or "instagr.am" in host
-    except Exception:
-        return False
-
-def is_youtube_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url.lower()).netloc
-        return "youtube.com" in host or "youtu.be" in host
-    except Exception:
-        return False
-
-def is_spotify_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url.lower()).netloc
-        return "spotify.com" in host
-    except Exception:
-        return False
-
-def is_tiktok_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url.lower()).netloc
-        return "tiktok.com" in host
-    except Exception:
-        return False
 
 def setup_cookies_file() -> Optional[str]:
     """Checks and returns active cookies file path if available."""
@@ -180,13 +212,35 @@ def cleanup_job_files(prefix: str):
     except Exception as e:
         logger.debug(f"Error cleaning files for prefix {prefix}: {e}")
 
+def get_cached_slide(cache_id: str, slide_idx: int) -> Optional[Dict[str, Any]]:
+    """Safely fetches a slide from cache by ID and index."""
+    cached = MEDIA_CACHE.get(cache_id)
+    if not cached:
+        return None
+    slides = cached.get("slides", [])
+    if 0 <= slide_idx < len(slides):
+        return slides[slide_idx]
+    return None
+
+def get_current_slide(cache_id: str) -> Optional[Dict[str, Any]]:
+    """Fetches current active slide from cache."""
+    cached = MEDIA_CACHE.get(cache_id)
+    if not cached:
+        return None
+    curr_idx = cached.get("current_slide", 0)
+    return get_cached_slide(cache_id, curr_idx)
+
 def clean_expired_cache():
-    """Removes expired items from MEDIA_CACHE."""
+    """Removes expired items from MEDIA_CACHE safely."""
     now = time.time()
-    expired_keys = [
-        k for k, v in MEDIA_CACHE.items()
-        if now - v.get("timestamp", 0) > CACHE_EXPIRATION_SECONDS
-    ]
+    expired_keys = []
+    for k, v in list(MEDIA_CACHE.items()):
+        try:
+            created_at = v.get("created_at") or v.get("timestamp", 0)
+            if now - created_at > CACHE_EXPIRATION_SECONDS:
+                expired_keys.append(k)
+        except Exception:
+            expired_keys.append(k)
     for k in expired_keys:
         MEDIA_CACHE.pop(k, None)
 
@@ -306,7 +360,7 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
     if not filepath or not os.path.exists(filepath):
         return {"filepath": filepath, "error": "File missing"}
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(filepath))
     filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
     vcodec = meta.get("vcodec", "").lower()
@@ -578,7 +632,7 @@ def generate_audio_chunks(input_path: str, job_prefix: str) -> List[Tuple[str, s
 
 async def recognize_audio_shazam(filepath: str, job_prefix: str) -> Optional[Dict[str, Any]]:
     """Recognizes track metadata using ShazamIO or raw API fallback."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     chunk_items = await loop.run_in_executor(executor, lambda: generate_audio_chunks(filepath, job_prefix))
     if not chunk_items:
         chunk_items = [(filepath, "Full Audio")]
@@ -654,15 +708,129 @@ async def recognize_audio_shazam(filepath: str, job_prefix: str) -> Optional[Dic
     return None
 
 # ---------------------------------------------------------------------------
-# EXTRACTION & DOWNLOAD ENGINE
+# EXTRACTION & NORMALIZATION ENGINE (PHASE 1 REFACTOR)
 # ---------------------------------------------------------------------------
 
+def parse_valid_formats_for_item(formats: List[Dict[str, Any]], duration: float) -> List[Dict[str, Any]]:
+    """Calculates valid format resolutions and estimated sizes for a slide."""
+    valid_formats = []
+    seen_heights = set()
+
+    for f in formats:
+        vcodec = f.get('vcodec', 'none')
+        if vcodec == 'none':
+            continue
+
+        height = extract_resolution_height(f)
+        if height > 0 and height not in seen_heights:
+            seen_heights.add(height)
+            size_bytes = estimate_format_filesize(f, duration)
+            valid_formats.append({
+                'height': height,
+                'label': format_quality_label(height),
+                'size_str': format_size(size_bytes)
+            })
+
+    valid_formats.sort(key=lambda x: x['height'], reverse=True)
+    return valid_formats
+
+def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Dict[str, Any]]:
+    """Normalizes yt-dlp single / playlist / album extraction result into independent slide dicts."""
+    if not info:
+        return []
+
+    root_title = info.get('title') or "ویدیو / پست"
+    root_desc = info.get('description') or root_title
+    root_thumb = info.get('thumbnail') or ""
+    root_duration = float(info.get('duration') or 0)
+    root_webpage_url = info.get('webpage_url') or info.get('original_url') or info.get('url') or root_url
+    root_track = info.get('track') or info.get('alt_title') or ""
+    root_artist = info.get('artist') or info.get('creator') or info.get('uploader') or ""
+
+    raw_entries = info.get('entries')
+
+    entries_list = []
+    if raw_entries:
+        for entry in raw_entries:
+            if not entry:
+                continue
+            if entry.get('entries'):
+                for sub in entry.get('entries', []):
+                    if sub:
+                        entries_list.append(sub)
+            else:
+                entries_list.append(entry)
+
+    if not entries_list:
+        single_url = info.get('webpage_url') or info.get('original_url') or info.get('url') or root_url
+        single_track = root_track
+        single_artist = root_artist
+
+        if not single_track:
+            ex_t, ex_a = extract_music_info_from_caption(root_desc)
+            single_track = ex_t
+            if ex_a and not single_artist:
+                single_artist = ex_a
+
+        slide_formats = parse_valid_formats_for_item(info.get('formats', []), root_duration)
+
+        return [{
+            "index": 0,
+            "url": single_url,
+            "webpage_url": single_url,
+            "title": root_title,
+            "description": root_desc,
+            "duration": root_duration,
+            "thumbnail": root_thumb,
+            "formats": slide_formats,
+            "track_title": single_track,
+            "artist_name": single_artist,
+            "is_spotify": info.get('is_spotify', False),
+            "raw_info": info
+        }]
+
+    slides = []
+    for idx, entry in enumerate(entries_list):
+        e_url = entry.get('webpage_url') or entry.get('original_url') or entry.get('url') or root_webpage_url
+        e_title = entry.get('title') or root_title
+        e_desc = entry.get('description') or entry.get('title') or root_desc
+        e_thumb = entry.get('thumbnail') or root_thumb
+        e_duration = float(entry.get('duration') or root_duration or 0)
+        e_track = entry.get('track') or entry.get('alt_title') or root_track
+        e_artist = entry.get('artist') or entry.get('creator') or entry.get('uploader') or root_artist
+
+        if not e_track:
+            ex_t, ex_a = extract_music_info_from_caption(e_desc)
+            e_track = ex_t
+            if ex_a and not e_artist:
+                e_artist = ex_a
+
+        raw_formats = entry.get('formats') or info.get('formats', [])
+        slide_formats = parse_valid_formats_for_item(raw_formats, e_duration)
+
+        slides.append({
+            "index": idx,
+            "url": e_url,
+            "webpage_url": e_url,
+            "title": e_title,
+            "description": e_desc,
+            "duration": e_duration,
+            "thumbnail": e_thumb,
+            "formats": slide_formats,
+            "track_title": e_track,
+            "artist_name": e_artist,
+            "is_spotify": entry.get('is_spotify', False),
+            "raw_info": entry
+        })
+
+    return slides
+
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Extracts media metadata using yt-dlp with multi-strategy fallback."""
+    """Extracts media metadata conservatively using yt-dlp without fragile forced extractor_args."""
     clean_url = clean_media_url(url)
 
     if is_spotify_url(clean_url):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         sp_info = await loop.run_in_executor(executor, lambda: extract_spotify_info_oembed(clean_url))
         if sp_info:
             return {
@@ -674,20 +842,18 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 "thumbnail": sp_info['thumbnail'],
                 "formats": [],
                 "duration": 210,
-                "is_spotify": True
+                "is_spotify": True,
+                "webpage_url": clean_url
             }
 
     cookie_file = setup_cookies_file()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     strategies = [
         {
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
-            },
-            'extractor_args': {
-                'youtube': {'player_client': ['android', 'ios', 'web']},
             }
         },
         {
@@ -705,9 +871,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             'nocheckcertificate': True,
             'http_headers': strat.get('http_headers', {}),
         }
-
-        if 'extractor_args' in strat:
-            ydl_opts['extractor_args'] = strat['extractor_args']
 
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
@@ -744,7 +907,7 @@ async def download_media_video(url: str, param: str, job_prefix: str) -> Optiona
         format_specs.append("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
         format_specs.append("best")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         for fmt in format_specs:
             ydl_opts = {
@@ -802,7 +965,7 @@ async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optio
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             def _download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -827,7 +990,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         if not search_seed:
             return None
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         multi_match = await loop.run_in_executor(executor, lambda: search_multi_engine_track(search_seed))
 
         queries_to_try = []
@@ -911,47 +1074,48 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
-def build_media_keyboard(cache_id: str, current_slide: int, total_slides: int, valid_formats: List[Dict[str, Any]], has_thumb: bool, has_caption: bool) -> InlineKeyboardMarkup:
-    """Builds interactive inline keyboard menu."""
+def build_media_keyboard(cache_id: str, slide_idx: int, total_slides: int, slide: Dict[str, Any]) -> InlineKeyboardMarkup:
+    """Builds interactive inline keyboard menu based on slide properties."""
     keyboard = []
+    valid_formats = slide.get("formats", [])
 
     for fmt in valid_formats:
         btn_text = f"{fmt['label']} ({fmt['size_str']})"
-        callback_data = f"vid:{cache_id}:{current_slide}:{fmt['height']}"
+        callback_data = f"vid:{cache_id}:{slide_idx}:{fmt['height']}"
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=callback_data)])
 
     if not valid_formats:
         keyboard.append([
-            InlineKeyboardButton("📹 دانلود ویدیو (بهترین کیفیت)", callback_data=f"vid:{cache_id}:{current_slide}:best")
+            InlineKeyboardButton("📹 دانلود ویدیو (بهترین کیفیت)", callback_data=f"vid:{cache_id}:{slide_idx}:best")
         ])
 
     if total_slides > 1:
         nav_row = []
-        if current_slide > 0:
-            nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"slide:{cache_id}:{current_slide - 1}"))
-        nav_row.append(InlineKeyboardButton(f"اسلاید {current_slide + 1} از {total_slides}", callback_data="noop"))
-        if current_slide < total_slides - 1:
-            nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"slide:{cache_id}:{current_slide + 1}"))
+        if slide_idx > 0:
+            nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"slide:{cache_id}:{slide_idx - 1}"))
+        nav_row.append(InlineKeyboardButton(f"اسلاید {slide_idx + 1} از {total_slides}", callback_data="noop"))
+        if slide_idx < total_slides - 1:
+            nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"slide:{cache_id}:{slide_idx + 1}"))
         keyboard.append(nav_row)
 
     keyboard.append([
-        InlineKeyboardButton("🎵 ویس 128kbps", callback_data=f"aud:{cache_id}:{current_slide}:128"),
-        InlineKeyboardButton("🎵 ویس 320kbps", callback_data=f"aud:{cache_id}:{current_slide}:320"),
+        InlineKeyboardButton("🎵 ویس 128kbps", callback_data=f"aud:{cache_id}:{slide_idx}:128"),
+        InlineKeyboardButton("🎵 ویس 320kbps", callback_data=f"aud:{cache_id}:{slide_idx}:320"),
     ])
 
     keyboard.append([
-        InlineKeyboardButton("🎧 دانلود آهنگ اصلی (Multi-Engine)", callback_data=f"fullm:{cache_id}:{current_slide}:hq")
+        InlineKeyboardButton("🎧 دانلود آهنگ اصلی (Multi-Engine)", callback_data=f"fullm:{cache_id}:{slide_idx}:hq")
     ])
 
     keyboard.append([
-        InlineKeyboardButton("🔍 تشخیص موزیک با شزام (Shazam Pro)", callback_data=f"shazam:{cache_id}:{current_slide}")
+        InlineKeyboardButton("🔍 تشخیص موزیک با شزام (Shazam Pro)", callback_data=f"shazam:{cache_id}:{slide_idx}")
     ])
 
     extra_row = []
-    if has_thumb:
-        extra_row.append(InlineKeyboardButton("🖼 کاور اصلی", callback_data=f"img:{cache_id}:{current_slide}"))
-    if has_caption:
-        extra_row.append(InlineKeyboardButton("📜 کپشن کامل", callback_data=f"cap:{cache_id}:{current_slide}"))
+    if slide.get("thumbnail"):
+        extra_row.append(InlineKeyboardButton("🖼 کاور اصلی", callback_data=f"img:{cache_id}:{slide_idx}"))
+    if slide.get("description"):
+        extra_row.append(InlineKeyboardButton("📜 کپشن کامل", callback_data=f"cap:{cache_id}:{slide_idx}"))
 
     if extra_row:
         keyboard.append(extra_row)
@@ -977,8 +1141,10 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("🔎 در حال آنالیز لینک و بررسی کیفیت‌های موجود...")
 
+    clean_url = clean_media_url(valid_url)
+
     try:
-        info = await extract_media_info_robust(valid_url)
+        info = await extract_media_info_robust(clean_url)
     except Exception as e:
         logger.error(f"Error extracting info: {e}")
         info = None
@@ -987,70 +1153,33 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ خطا در استخراج اطلاعات لینک. لطفاً از صحت لینک اطمینان حاصل کنید.")
         return
 
+    slides = normalize_extraction_entries(info, clean_url)
+    if not slides:
+        await status_msg.edit_text("❌ هیچ محتوای قابل دانلودی در این لینک یافت نشد.")
+        return
+
     cache_id = str(uuid.uuid4())[:8]
-    entries = info.get('entries')
-    is_album = bool(entries and len(entries) > 1)
-    total_slides = len(entries) if is_album else 1
+    total_slides = len(slides)
     current_slide = 0
 
-    main_item = entries[current_slide] if is_album else info
-
-    formats = main_item.get('formats', [])
-    duration = float(main_item.get('duration') or info.get('duration') or 0)
-    thumbnail = main_item.get('thumbnail') or info.get('thumbnail', '')
-    raw_caption = info.get('description') or info.get('title') or "ویدیو / پست"
-
-    track_title = main_item.get('track') or main_item.get('alt_title') or ""
-    artist_name = main_item.get('artist') or main_item.get('creator') or main_item.get('uploader') or ""
-
-    if not track_title:
-        extracted_t, extracted_a = extract_music_info_from_caption(raw_caption)
-        track_title = extracted_t
-        if extracted_a and not artist_name:
-            artist_name = extracted_a
-
-    valid_formats = []
-    seen_heights = set()
-
-    for f in formats:
-        vcodec = f.get('vcodec', 'none')
-        if vcodec == 'none':
-            continue
-
-        height = extract_resolution_height(f)
-        if height > 0 and height not in seen_heights:
-            seen_heights.add(height)
-            size_bytes = estimate_format_filesize(f, duration)
-            valid_formats.append({
-                'height': height,
-                'label': format_quality_label(height),
-                'size_str': format_size(size_bytes)
-            })
-
-    valid_formats.sort(key=lambda x: x['height'], reverse=True)
-
     MEDIA_CACHE[cache_id] = {
-        "url": valid_url,
-        "info": info,
-        "caption": raw_caption,
-        "thumbnail": thumbnail,
-        "track_title": track_title,
-        "artist_name": artist_name,
-        "is_album": is_album,
+        "created_at": time.time(),
+        "source_url": clean_url,
+        "current_slide": current_slide,
         "total_slides": total_slides,
-        "valid_formats": valid_formats,
-        "timestamp": time.time()
+        "slides": slides,
+        "root_info": info
     }
 
-    reply_markup = build_media_keyboard(
-        cache_id, current_slide, total_slides, valid_formats,
-        has_thumb=bool(thumbnail), has_caption=len(raw_caption) > 0
-    )
+    slide_0 = slides[0]
+    reply_markup = build_media_keyboard(cache_id, current_slide, total_slides, slide_0)
 
+    raw_caption = slide_0.get("description") or slide_0.get("title") or "ویدیو / پست"
     safe_cap = html_escape(raw_caption[:300])
     short_cap = safe_cap + "..." if len(raw_caption) > 300 else safe_cap
     caption_text = f"<b>📝 کپشن:</b>\n{short_cap}\n\n<b>گزینه مورد نظر را انتخاب کنید:</b>"
 
+    thumbnail = slide_0.get("thumbnail")
     sent = False
     if thumbnail:
         try:
@@ -1080,9 +1209,12 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all inline callback button queries."""
+    """Handles all inline callback button queries safely."""
     query = update.callback_query
     await query.answer()
+
+    if not query.data:
+        return
 
     data_parts = query.data.split(":")
     action_type = data_parts[0]
@@ -1090,7 +1222,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action_type == "noop":
         return
 
-    # Handle Video Option Actions from direct video files
+    # Direct Video Options Callback
     if action_type == "vopt":
         if len(data_parts) < 3:
             return
@@ -1118,7 +1250,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     cmd = ["ffmpeg", "-y", "-i", temp_v, "-vn", "-acodec", "libmp3lame", "-b:a", "320k", temp_a]
                     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(executor, _ext_audio)
 
                 if os.path.exists(temp_a):
@@ -1133,7 +1265,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     cmd = ["ffmpeg", "-y", "-i", temp_v, "-vn", "-ac", "1", "-ar", "44100", temp_a]
                     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(executor, _prep_wav)
 
                 shz_res = await recognize_audio_shazam(temp_a, job_prefix)
@@ -1156,29 +1288,32 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             cleanup_job_files(job_prefix)
         return
 
-    # Standard Media Callbacks
+    # Standard Media Callbacks validation
     if len(data_parts) < 3:
         return
 
     cache_id = data_parts[1]
-    slide_idx = int(data_parts[2]) if data_parts[2].isdigit() else 0
+    if not data_parts[2].isdigit():
+        return
+    slide_idx = int(data_parts[2])
     param = data_parts[3] if len(data_parts) > 3 else ""
 
-    cached_item = MEDIA_CACHE.get(cache_id)
-    if not cached_item:
+    cached_entry = MEDIA_CACHE.get(cache_id)
+    if not cached_entry:
         await query.message.reply_text("❌ این درخواست منقضی شده است؛ لطفاً لینک را دوباره ارسال کنید.")
         return
 
-    url = cached_item["url"]
+    slide = get_cached_slide(cache_id, slide_idx)
+    if not slide:
+        await query.message.reply_text("❌ اسلاید مورد نظر یافت نشد.")
+        return
+
+    cached_entry["current_slide"] = slide_idx
+    url = slide.get("url") or cached_entry.get("source_url")
     job_prefix = f"job_{uuid.uuid4().hex[:6]}"
 
     if action_type == "slide":
-        cached_item["current_slide"] = slide_idx
-        reply_markup = build_media_keyboard(
-            cache_id, slide_idx, cached_item["total_slides"],
-            cached_item["valid_formats"], bool(cached_item["thumbnail"]),
-            bool(cached_item["caption"])
-        )
+        reply_markup = build_media_keyboard(cache_id, slide_idx, cached_entry.get("total_slides", 1), slide)
         try:
             await query.edit_message_reply_markup(reply_markup=reply_markup)
         except Exception:
@@ -1259,9 +1394,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif action_type == "fullm":
         status_msg = await query.message.reply_text("🟢 🔎 در حال جستجوی موزیک کامل با موتورهای چندگانه...")
         try:
-            track_title = cached_item.get("track_title", "")
-            artist_name = cached_item.get("artist_name", "")
-            caption = cached_item.get("caption", "")
+            track_title = slide.get("track_title", "")
+            artist_name = slide.get("artist_name", "")
+            caption = slide.get("description", "")
 
             res = await search_and_download_full_track(track_title, artist_name, caption, job_prefix)
             if res and os.path.exists(res['filepath']):
@@ -1276,12 +1411,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             cleanup_job_files(job_prefix)
 
     elif action_type == "img":
-        thumb = cached_item.get("thumbnail")
+        thumb = slide.get("thumbnail")
         if thumb:
             await query.message.reply_photo(photo=thumb, caption="🖼 کاور اصلی")
+        else:
+            await query.message.reply_text("❌ کاور برای این اسلاید موجود نیست.")
 
     elif action_type == "cap":
-        full_cap = cached_item.get("caption", "بدون کپشن")
+        full_cap = slide.get("description") or slide.get("title") or "بدون کپشن"
         await query.message.reply_text(f"📜 <b>کپشن کامل:</b>\n\n{html_escape(full_cap)}", parse_mode=ParseMode.HTML)
 
 async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
