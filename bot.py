@@ -56,6 +56,219 @@ CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
+_spotify_access_token: Optional[str] = None
+_spotify_token_expires_at: float = 0.0
+
+
+def get_spotify_token() -> Optional[str]:
+    """Retrieves or refreshes Spotify API access token."""
+    global _spotify_access_token, _spotify_token_expires_at
+    if _spotify_access_token and time.time() < _spotify_token_expires_at:
+        return _spotify_access_token
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    try:
+        auth_bytes = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')
+        auth_header = base64.b64encode(auth_bytes).decode('utf-8')
+        req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8'),
+            headers={
+                'Authorization': f'Basic {auth_header}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode())
+            _spotify_access_token = data.get('access_token')
+            expires_in = data.get('expires_in', 3600)
+            _spotify_token_expires_at = time.time() + expires_in - 60
+            return _spotify_access_token
+    except Exception as e:
+        logger.debug(f"Spotify token retrieval failed: {e}")
+        return None
+
+
+def sanitize_telegram_text(text: str) -> str:
+    """Sanitizes text to avoid HTML/Markdown parsing breakage in Telegram."""
+    if not text:
+        return ""
+    return text.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+
+
+def extract_resolution_height(format_dict: Dict[str, Any]) -> int:
+    """Safely extracts resolution height from format dictionary."""
+    h = format_dict.get('height')
+    if isinstance(h, int):
+        return h
+    res_str = str(format_dict.get('resolution', ''))
+    match = re.search(r'(\d{3,4})p?', res_str)
+    return int(match.group(1)) if match else 0
+
+
+def format_quality_label(height: int) -> str:
+    """Generates user-friendly resolution label."""
+    if height >= 2160: return "🎬 4K (2160p)"
+    if height >= 1440: return "🎬 2K (1440p)"
+    if height >= 1080: return "📹 Full HD (1080p)"
+    if height >= 720:  return "📹 HD (720p)"
+    if height >= 480:  return "📱 SD (480p)"
+    if height >= 360:  return "📱 Low (360p)"
+    return f"📱 {height}p"
+
+
+def format_size(bytes_val: float) -> str:
+    """Formats raw byte sizes into human-readable strings."""
+    if not bytes_val or bytes_val <= 0:
+        return "~MB"
+    mb = bytes_val / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.1f} MB"
+
+
+def estimate_format_filesize(format_dict: Dict[str, Any], duration: float) -> float:
+    """Estimates audio/video format size in bytes."""
+    filesize = format_dict.get('filesize') or format_dict.get('filesize_approx')
+    if filesize:
+        return float(filesize)
+    tbr = format_dict.get('tbr') or format_dict.get('vbr', 0) + format_dict.get('abr', 0)
+    if tbr and duration > 0:
+        return (tbr * 1024 / 8) * duration
+    return 0.0
+
+
+def clean_music_query(text: str) -> str:
+    """Cleans captions and query strings by stripping noise, tags, and emojis."""
+    if not text:
+        return ""
+    t = re.sub(r'https?://\S+', '', text)
+    t = re.sub(r'#\w+', '', t)
+    t = re.sub(r'@\w+', '', t)
+    noise_patterns = [
+        r'دانلود\s+موزیک', r'دانلود\s+آهنگ', r'اهنگ\s+جدید', r'آهنگ\s+جدید',
+        r'پست\s+جدید', r'ریمیکس\s+جدید', r'فول\s+آلبوم', r'لینک\s+بیو',
+        r'اصلی', r'کامل', r'استوری', r'اکسپلور', r'اینستاگرام'
+    ]
+    for p in noise_patterns:
+        t = re.sub(p, '', t, flags=re.IGNORECASE)
+    t = re.sub(r'[^\w\s\-\.]', ' ', t)
+    return " ".join(t.split())
+
+
+def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
+    """Uses regex patterns to extract song title and artist from captions."""
+    if not caption:
+        return "", ""
+    patterns = [
+        r"(?:song|music|track|آهنگ|موزیک)\s*:\s*([^-\n]+)\s*-\s*([^\n]+)",
+        r"([A-Za-z0-9\s]{2,30})\s*[-–—]\s*([A-Za-z0-9\s]{2,30})",
+        r"♬\s*([^-\n]+)\s*-\s*([^\n]+)",
+        r"♫\s*([^-\n]+)\s*-\s*([^\n]+)"
+    ]
+    for p in patterns:
+        match = re.search(p, caption, re.IGNORECASE)
+        if match:
+            g1, g2 = match.group(1).strip(), match.group(2).strip()
+            return clean_music_query(g1), clean_music_query(g2)
+    clean_cap = clean_music_query(caption)
+    return clean_cap[:60], ""
+
+
+def preprocess_audio_for_recognition(input_path: str) -> str:
+    """Uses FFmpeg to crop middle audio section (10s-30s drop) & normalize to WAV 44.1kHz mono."""
+    if not os.path.exists(input_path):
+        return input_path
+
+    processed_path = os.path.join(DOWNLOAD_DIR, f"prep_{uuid.uuid4().hex[:6]}.wav")
+    try:
+        cmd_duration = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", input_path
+        ]
+        res = subprocess.run(cmd_duration, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        duration = float(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else 30.0
+
+        start_time = 10.0 if duration > 25.0 else 0.0
+        crop_duration = 20.0 if duration > 20.0 else duration
+
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start_time), "-t", str(crop_duration),
+            "-i", input_path, "-vn", "-ac", "1", "-ar", "44100", "-f", "wav", processed_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+
+        if os.path.exists(processed_path) and os.path.getsize(processed_path) > 1000:
+            return processed_path
+    except Exception as e:
+        logger.debug(f"FFmpeg audio preprocessing fallback used: {e}")
+
+    return input_path
+
+
+async def recognize_audio_shazam(filepath: str) -> Optional[Dict[str, Any]]:
+    """Multi-tiered Shazam recognition with preprocessed audio chunking."""
+    prep_file = preprocess_audio_for_recognition(filepath)
+    target_path = prep_file if os.path.exists(prep_file) else filepath
+
+    try:
+        if HAS_SHAZAMIO:
+            try:
+                shazam = Shazam()
+                out = await shazam.recognize(target_path)
+                track = out.get('track', {})
+                if track:
+                    title = track.get('title', '')
+                    artist = track.get('subtitle', '')
+                    genre = track.get('genres', {}).get('primary', 'نامشخص')
+
+                    return {
+                        'title': title,
+                        'artist': artist,
+                        'genre': genre,
+                        'raw': track
+                    }
+            except Exception as e:
+                logger.warning(f"ShazamIO primary engine error: {e}")
+
+        # Secondary Shazam REST API Fallback
+        loop = asyncio.get_event_loop()
+        def _raw_shazam_request():
+            try:
+                with open(target_path, 'rb') as f:
+                    audio_data = f.read()
+                encoded_b64 = base64.b64encode(audio_data[:500000]).decode('utf-8')
+                req_url = "https://amp.shazam.com/discovery/v5/en/US/mweb/-/tag"
+                payload = json.dumps({"sample": encoded_b64}).encode('utf-8')
+                req = urllib.request.Request(req_url, data=payload, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}, method="POST")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode('utf-8'))
+                        track = data.get('track') or data.get('matches', [{}])[0]
+                        if track and 'title' in track:
+                            return {
+                                'title': track.get('title'),
+                                'artist': track.get('subtitle', 'Unknown'),
+                                'genre': 'General'
+                            }
+            except Exception as ex:
+                logger.debug(f"Direct Shazam REST API fallback failed: {ex}")
+            return None
+
+        sec_res = await loop.run_in_executor(executor, _raw_shazam_request)
+        if sec_res:
+            return sec_res
+
+    finally:
+        if prep_file != filepath and os.path.exists(prep_file):
+            try:
+                os.remove(prep_file)
+            except Exception:
+                pass
+
+    return None
+
 
 def setup_cookies_file() -> Optional[str]:
     """Prepares cookie file ONLY if valid cookies are explicitly provided in environment variables."""
@@ -170,7 +383,6 @@ def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
             artist = data.get('author_name', '')
             thumbnail = data.get('thumbnail_url', '')
 
-            # Title often comes as "Song Title" or "Song Title by Artist"
             clean_title = title.split(" - ")[0].split(" by ")[0].strip() if title else "Spotify Song"
 
             return {
@@ -784,7 +996,6 @@ async def handle_media_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = None
 
     if not info:
-        # Final ultra-resilient direct download mode fallback
         info = {
             "direct_url": clean_media_url(url),
             "title": "پست / ویدیو",
@@ -1044,7 +1255,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await status_msg.edit_text(f"✨ موزیک شناسایی شد:\n🎵 {s_title} - {s_artist}\n\nاما فایل کامل آن برای دانلود یافت نشد.")
             else:
                 await status_msg.edit_text("❌ نتوانستیم بیت دقیق را با شزام تشخیص دهیم. در حال تلاش از طریق موتور جستجوی ثانویه...")
-                # Fallback to standard full track search
                 res = await search_and_download_full_track(cached_item.get("track_title", ""), cached_item.get("artist_name", ""), cached_item.get("caption", ""), file_prefix)
                 if res and os.path.exists(res['filepath']):
                     with open(res['filepath'], 'rb') as audio_file:
