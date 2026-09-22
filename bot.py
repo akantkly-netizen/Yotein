@@ -8,6 +8,7 @@ import uuid
 import glob
 import time
 import shutil
+import base64
 import concurrent.futures
 import urllib.parse
 import urllib.request
@@ -30,7 +31,6 @@ from telegram.ext import (
     filters,
 )
 
-# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -261,7 +261,6 @@ def get_spotify_token() -> Optional[str]:
             url = "https://accounts.spotify.com/api/token"
             data = urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8')
             req = urllib.request.Request(url, data=data, method='POST')
-            import base64
             auth_header = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')).decode('utf-8')
             req.add_header("Authorization", f"Basic {auth_header}")
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -322,6 +321,77 @@ def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def extract_instagram_embed_info(url: str) -> Optional[Dict[str, Any]]:
+    """Bypasses Cloud IP blocks on Instagram by scraping the public /embed/captioned/ page."""
+    try:
+        match = re.search(r"instagram\.com/(?:p|reel|reels|tv|stories|share)/([A-Za-z0-9_\-]+)", url)
+        if not match:
+            return None
+        shortcode = match.group(1)
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        
+        req = urllib.request.Request(embed_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            
+        video_urls = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
+        if not video_urls:
+            video_urls = re.findall(r'<meta\s+property="og:video"\s+content="([^"]+)"', html)
+            
+        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html)
+        if not display_urls:
+            display_urls = re.findall(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
+            
+        caption_match = re.search(r'<div\s+class="Caption"[^>]*>(.*?)</div>', html, re.DOTALL)
+        caption = ""
+        if caption_match:
+            caption = re.sub(r'<[^>]+>', '', caption_match.group(1)).strip()
+        else:
+            cap_match = re.search(r'"caption"\s*:\s*"([^"]+)"', html)
+            if cap_match:
+                try:
+                    caption = cap_match.group(1).encode().decode('unicode_escape', errors='ignore')
+                except Exception:
+                    caption = cap_match.group(1)
+
+        clean_video_urls = [v.replace('\\/', '/').replace('\\u0026', '&') for v in video_urls]
+        clean_display_urls = [d.replace('\\/', '/').replace('\\u0026', '&') for d in display_urls]
+        
+        if clean_video_urls:
+            direct_v_url = clean_video_urls[0]
+            thumb = clean_display_urls[0] if clean_display_urls else None
+            return {
+                "direct_url": direct_v_url,
+                "title": caption[:100] if caption else "ویدیوی اینستاگرام",
+                "description": caption or "ویدیو استخراج شده از اینستاگرام",
+                "formats": [
+                    {"url": direct_v_url, "ext": "mp4", "height": 1080, "vcodec": "h264"},
+                    {"url": direct_v_url, "ext": "mp4", "height": 720, "vcodec": "h264"},
+                    {"url": direct_v_url, "ext": "mp4", "height": 480, "vcodec": "h264"}
+                ],
+                "duration": 60,
+                "thumbnail": thumb
+            }
+        elif clean_display_urls:
+            direct_img_url = clean_display_urls[0]
+            return {
+                "direct_url": direct_img_url,
+                "title": caption[:100] if caption else "تصویر اینستاگرام",
+                "description": caption or "پست تصویری اینستاگرام",
+                "formats": [
+                    {"url": direct_img_url, "ext": "jpg", "height": 1080, "vcodec": "none"}
+                ],
+                "duration": 0,
+                "thumbnail": direct_img_url
+            }
+    except Exception as e:
+        logger.debug(f"Instagram embed extraction error: {e}")
+    return None
+
+
 async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
     """Fallback extractor using multi-instance Cobalt nodes when Cloud IPs are blocked."""
     instances = [
@@ -342,19 +412,25 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
 
     def _call_instance(api_url: str):
         try:
-            req = urllib.request.Request(f"{api_url}/api/json", data=payload, headers=headers, method="POST")
+            req = urllib.request.Request(f"{api_url}/", data=payload, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode('utf-8'))
-        except Exception as e:
-            logger.debug(f"Cobalt node '{api_url}' request error: {e}")
+        except Exception:
+            try:
+                req = urllib.request.Request(f"{api_url}/api/json", data=payload, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        return json.loads(resp.read().decode('utf-8'))
+            except Exception as e:
+                logger.debug(f"Cobalt node '{api_url}' request error: {e}")
         return None
 
     for inst in instances:
         res = await loop.run_in_executor(executor, lambda: _call_instance(inst))
         if res:
             status = res.get("status")
-            if status in ["stream", "redirect"]:
+            if status in ["stream", "redirect", "tunnel"]:
                 media_url = res.get("url")
                 if media_url:
                     return {
@@ -386,12 +462,22 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Fetches Instagram/YouTube media metadata using multi-strategy clients + Cobalt fallback."""
+    """Fetches Instagram/YouTube media metadata using multi-strategy clients + Embed Scraper + Cobalt fallback."""
     clean_url = clean_media_url(url)
     cookie_file = setup_cookies_file()
 
+    loop = asyncio.get_event_loop()
+
+    # Strategy 1: Instagram Embed Scraper for Instagram Links
+    if is_instagram_url(clean_url):
+        logger.info("Attempting Instagram Embed Scraper...")
+        embed_res = await loop.run_in_executor(executor, lambda: extract_instagram_embed_info(clean_url))
+        if embed_res:
+            return embed_res
+
+    # Strategy 2: Multi-client yt-dlp extraction
     strategies = [
-        # Strategy 1: Android Client
+        # Strategy A: Android Client
         {
             'impersonate': 'chrome',
             'http_headers': {
@@ -404,7 +490,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 'instagram': {'api': 'graphql'}
             }
         },
-        # Strategy 2: iOS Native Mobile Client
+        # Strategy B: iOS Mobile Client
         {
             'impersonate': 'safari',
             'http_headers': {
@@ -417,7 +503,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
                 'youtube': {'player_client': ['ios', 'web']},
             }
         },
-        # Strategy 3: Smart TV Client Strategy
+        # Strategy C: Smart TV Client
         {
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) SmartTV Safari/537.42',
@@ -428,8 +514,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             }
         }
     ]
-
-    loop = asyncio.get_event_loop()
 
     for strat in strategies:
         ydl_opts = {
@@ -460,7 +544,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         if result:
             return result
 
-    # Fallback to Cobalt API Node Extractor if yt-dlp was Cloud IP Blocked
+    # Strategy 3: Cobalt Node Extractor Fallback
     logger.info("Attempting Cobalt API Node fallback...")
     cobalt_res = await fetch_cobalt_fallback_info(clean_url)
     if cobalt_res:
@@ -474,14 +558,14 @@ async def download_media_video(url: str, param: str, output_prefix: str, direct_
     cookie_file = setup_cookies_file()
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
-    # If direct CDN stream URL was provided by Cobalt fallback
+    # Direct CDN Stream handling
     if direct_url:
         target_path = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp4")
         try:
             req = urllib.request.Request(direct_url, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
-            with urllib.request.urlopen(req, timeout=120) as resp, open(target_path, 'wb') as out_file:
+            with urllib.request.urlopen(req, timeout=180) as resp, open(target_path, 'wb') as out_file:
                 shutil.copyfileobj(resp, out_file)
             if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
                 return target_path
