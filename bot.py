@@ -50,10 +50,43 @@ CACHE_EXPIRATION_SECONDS = 3600  # 1 hour TTL cache
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
+# Default Built-in Session Cookies for Instagram & YouTube Bypass
+DEFAULT_COOKIES = """# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com	TRUE	/	TRUE	1821521893	__Secure-1PSIDTS	sidts-CjQBXMw41axWxy1_iwaoyoJTcoSESyvpPilfGnTvw9zihET_7fvUmYCkptO6LNtgo8Bj9Jg6EAA
+.youtube.com	TRUE	/	TRUE	1821521893	__Secure-3PSIDTS	sidts-CjQBXMw41axWxy1_iwaoyoJTcoSESyvpPilfGnTvw9zihET_7fvUmYCkptO6LNtgo8Bj9Jg6EAA
+.youtube.com	TRUE	/	FALSE	1824545893	HSID	A6i8JY6Jj7VqYYpHY
+.youtube.com	TRUE	/	TRUE	1824545893	SSID	Ab8dJjKwgP6a8t2A5
+.youtube.com	TRUE	/	FALSE	1824545893	APISID	VaxbSzjfsbEFfe_j/AmWeubSebAnIXDnOR
+.youtube.com	TRUE	/	TRUE	1824545893	SAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
+.youtube.com	TRUE	/	TRUE	1824545893	__Secure-1PAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
+.youtube.com	TRUE	/	TRUE	1824545893	__Secure-3PAPISID	1FuFT7z9cM5ofzzg/AAv_9yCVSqmZ9l04U
+.youtube.com	TRUE	/	FALSE	1824545893	SID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSDQVKeiawTJt047FoKigF1QACgYKASsSARYSFQHGX2MitNKcH5JAVQkjBmScuuyI4BoVAUF8yKrZrOVY8hbG-S9wjR6hxWA_0076
+.youtube.com	TRUE	/	TRUE	1824545893	__Secure-1PSID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSss3iql16fPzyiYHRuQCfRQACgYKAbYSARYSFQHGX2MiaG-N3FIVCrgCeCBb-N-VCRoVAUF8yKpfXctJ3NEvTemCz87jnD570076
+.youtube.com	TRUE	/	TRUE	1824545893	__Secure-3PSID	g.a000CwmKD_sID0MrWIwNy9PzWM5O-UFiTuCvtRG65xKYP3FjU0KSKbb6ztFTWj1APC5pAFGn3AACgYKAQUSARYSFQHGX2MiaQ8dSzA7UsbGZK3AxSlC-RoVAUF8yKoNbx-nYP-IMz1zq7m0hRbC0076
+.youtube.com	TRUE	/	TRUE	1824547852	PREF	f6=40000000&tz=Asia.Tehran
+.youtube.com	TRUE	/	TRUE	1824546073	LOGIN_INFO	AFmmF2swRQIhAMii8v8LP04PGUE_rZk-qgUsV9BVJe-YCr4UJqzN69vFAiBtNOTPzqxpXLOCmF4eq1I4zE7OGJRQueLUzqajrL1H0Q:QUQ3MjNmeFVOZ0gtYmk5Q2h2cHVhenpxa0hSbFBJOEEyR013SDNPd3BxZjZIaDNnb3R2U3NySUt0ZlF0OTB1NXU4Y3FrZW1XVl9iQ25rMWpiOHRJODhodlpkSEZLcjJOV0wxOUpGLTdkM0hlUzltNlB3YTduTjgwa0k0U2tMc0g2OHBsdGZFN3R0VkRMTkRhcTdSUWJvazBNUEtnS1dkUkZn
+.youtube.com	TRUE	/	FALSE	1821523851	SIDCC	AKEyXzVTi5VqKbEJQpuTn6RFK3KSkUvw5-OgKsCJAa5fSXYLrHwaHiYtah6yUmCRZbXC0gpNxQ
+.youtube.com	TRUE	/	TRUE	1821523851	__Secure-1PSIDCC	AKEyXzVaDHqc8VxeSpdhkNRxRTDIE2H0QLYrpjmBwkOh09MmTQeHXYWWqu_MZkcc54XTOaewog
+.youtube.com	TRUE	/	TRUE	1821523851	__Secure-3PSIDCC	AKEyXzX1_Um3DIPAndnt_GMMPWTP6ihATHQ49QMJke36Z6O-CT3MdWyxj0L3PVn1UeVUoJlIIg
+.youtube.com	TRUE	/	TRUE	1789988493	CONSISTENCY	AJDB8J9j4Akp-HPNtMgmseuKKA_UZ-0JznT47U8w15VE1eH15Ufkyb6p2YiTu5spzXn6khR2AFFwrPqGY7IxvkWmAIrFJqhvrRmTXJStcFUJqRK310kpfd4GXGk
+.instagram.com	TRUE	/	TRUE	1824546188	datr	iwWxahgifpSI8W3ZcDJN7B71
+.instagram.com	TRUE	/	TRUE	1821522188	ig_did	27C9E16A-C367-4A1C-865C-FE721F819333
+.instagram.com	TRUE	/	TRUE	1790591148	dpr	2.75
+.instagram.com	TRUE	/	TRUE	1824546192	mid	arEFiwABAAHu3QQds6ZiCPSOgEsv
+.instagram.com	TRUE	/	TRUE	1790591148	wd	393x736
+.instagram.com	TRUE	/	TRUE	1824546363	csrftoken	ubJNUlzYcdmPRrGnXVIRmY4u3DcGmBAZ
+.instagram.com	TRUE	/	TRUE	1797762363	ds_user_id	27024601837
+.instagram.com	TRUE	/	TRUE	1821522344	sessionid	27024601837%3AAtkh4ITUO7wEyu%3A25%3AAYkJ6dvp9GgTGsiuZmGArYVg9EMsqWT3zbW43rBwqw
+.instagram.com	TRUE	/	TRUE	0	rur	VCN%2C17841426935128075%2C1791195965%3A01ff6acb7c96532219f15453ea6ced48fc08cba53b98d1c8c754b3b0d9d0b291edef0e9a
+"""
+
 
 def setup_cookies_file() -> Optional[str]:
-    """Prepares and validates Instagram/YouTube cookie file if supplied via Environment Variables."""
-    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT")
+    """Prepares and validates Instagram/YouTube cookie file directly using built-in or environment cookies."""
+    cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("INSTAGRAM_COOKIES") or os.getenv("COOKIES_TEXT") or DEFAULT_COOKIES
     cookie_path = "cookies.txt"
 
     if cookies_env:
@@ -468,16 +501,9 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
 
     loop = asyncio.get_event_loop()
 
-    # Strategy 1: Instagram Embed Scraper for Instagram Links
-    if is_instagram_url(clean_url):
-        logger.info("Attempting Instagram Embed Scraper...")
-        embed_res = await loop.run_in_executor(executor, lambda: extract_instagram_embed_info(clean_url))
-        if embed_res:
-            return embed_res
-
-    # Strategy 2: Multi-client yt-dlp extraction
+    # Strategy 1: yt-dlp Extraction with Cookies
     strategies = [
-        # Strategy A: Android Client
+        # Strategy A: Android Client with Session Cookies
         {
             'impersonate': 'chrome',
             'http_headers': {
@@ -543,6 +569,13 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         result = await loop.run_in_executor(executor, _fetch)
         if result:
             return result
+
+    # Strategy 2: Instagram Embed Scraper for Instagram Links
+    if is_instagram_url(clean_url):
+        logger.info("Attempting Instagram Embed Scraper...")
+        embed_res = await loop.run_in_executor(executor, lambda: extract_instagram_embed_info(clean_url))
+        if embed_res:
+            return embed_res
 
     # Strategy 3: Cobalt Node Extractor Fallback
     logger.info("Attempting Cobalt API Node fallback...")
@@ -706,6 +739,8 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
     output_template = os.path.join(DOWNLOAD_DIR, f"{output_prefix}.%(ext)s")
 
+    cookie_file = setup_cookies_file()
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
@@ -720,6 +755,9 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         'no_warnings': True,
         'default_search': 'ytsearch5:',
     }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
 
     loop = asyncio.get_event_loop()
 
@@ -1059,6 +1097,9 @@ def main():
         sys.exit(1)
 
     logger.info("Starting Telegram Media Downloader Bot...")
+
+    # Ensure cookie file is written on main thread boot
+    setup_cookies_file()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
