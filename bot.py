@@ -117,9 +117,15 @@ def is_youtube_url(url: str) -> bool:
     return bool(re.search(pattern, url))
 
 
+def is_spotify_url(url: str) -> bool:
+    """Validates if input text is a Spotify track, album, or playlist link."""
+    pattern = r"(https?://)?(open|play)\.spotify\.com/(track|album|playlist|episode)/[A-Za-z0-9]+"
+    return bool(re.search(pattern, url))
+
+
 def is_supported_url(url: str) -> bool:
-    """Checks if the provided text contains an Instagram or YouTube URL."""
-    return is_instagram_url(url) or is_youtube_url(url)
+    """Checks if the provided text contains an Instagram, YouTube, or Spotify URL."""
+    return is_instagram_url(url) or is_youtube_url(url) or is_spotify_url(url)
 
 
 def clean_media_url(url: str) -> str:
@@ -130,7 +136,10 @@ def clean_media_url(url: str) -> str:
             return match.group(1) + "/"
     elif is_youtube_url(url):
         url = url.strip()
-        if "youtube.com/shorts/" in url:
+        if "music.youtube.com/watch?v=" in url:
+            yt_id = url.split("watch?v=")[1].split("&")[0].split("?")[0]
+            return f"https://music.youtube.com/watch?v={yt_id}"
+        elif "youtube.com/shorts/" in url:
             shorts_id = url.split("shorts/")[1].split("?")[0].split("/")[0]
             return f"https://www.youtube.com/shorts/{shorts_id}"
         elif "youtu.be/" in url:
@@ -139,237 +148,41 @@ def clean_media_url(url: str) -> str:
         elif "watch?v=" in url:
             yt_id = url.split("watch?v=")[1].split("&")[0]
             return f"https://www.youtube.com/watch?v={yt_id}"
+    elif is_spotify_url(url):
+        match = re.search(r"(https?://open\.spotify\.com/(?:track|album|playlist)/[A-Za-z0-9]+)", url)
+        if match:
+            return match.group(1)
     return url.strip()
 
 
-def clean_music_query(raw_text: str) -> str:
-    """Cleans hashtags, mentions, URLs, and control characters while preserving global Unicode characters."""
-    if not raw_text:
-        return ""
-    text = re.sub(r'https?://\S+|www\.\S+', '', raw_text)
-    text = re.sub(r'[@#]\w+', '', text)
-    text = re.sub(r'[^\w\s\d]', ' ', text, flags=re.UNICODE)
-    return ' '.join(text.split()).strip()
-
-
-def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
-    """Extracts song title and artist using global multi-language keyword patterns."""
-    if not caption:
-        return "", ""
-
-    patterns = [
-        r'(?:موزیک|آهنگ|ترانه|خواننده|موسیقی|Song|Music|Track|Singer|Artist|By|Musik|Phonk|Remix)[\s:-]+([^\n#@]+)',
-        r'[🎵🎧🎼🎶🔊💿📻]\s*([^\n#@]+)',
-    ]
-
-    for pat in patterns:
-        match = re.search(pat, caption, re.IGNORECASE)
-        if match:
-            found = match.group(1).strip()
-            if len(found) > 2:
-                for sep in ["-", "–", "—", "|", "~"]:
-                    if sep in found:
-                        parts = found.split(sep, 1)
-                        return parts[0].strip(), parts[1].strip()
-                return found, ""
-
-    delimiters = [r'\s+[-–—|~]\s+']
-    for line in caption.split('\n'):
-        line_clean = re.sub(r'https?://\S+|[@#]\w+', '', line).strip()
-        if 5 <= len(line_clean) <= 100:
-            for sep in delimiters:
-                parts = re.split(sep, line_clean, maxsplit=1)
-                if len(parts) == 2 and len(parts[0]) > 2 and len(parts[1]) > 2:
-                    return parts[0].strip(), parts[1].strip()
-
-    lines = [line.strip() for line in caption.split('\n') if line.strip() and not line.startswith('#') and not line.startswith('@')]
-    if lines:
-        first_line = lines[0]
-        first_line = re.sub(r'https?://\S+', '', first_line).strip()
-        if 3 <= len(first_line) <= 90:
-            return first_line, ""
-
-    return "", ""
-
-
-def estimate_format_filesize(fmt: Dict[str, Any], duration: float) -> Optional[int]:
-    """Calculates filesize from direct byte fields or estimates it from bitrate and duration."""
-    filesize = fmt.get('filesize') or fmt.get('filesize_approx')
-    if filesize and filesize > 0:
-        return filesize
-
-    tbr = fmt.get('tbr') or ((fmt.get('vbr') or 0) + (fmt.get('abr') or 0))
-    if tbr and tbr > 0 and duration and duration > 0:
-        estimated_bytes = int((tbr * 1000 / 8) * duration)
-        return estimated_bytes
-
-    return None
-
-
-def format_size(bytes_size: Optional[int]) -> str:
-    """Formats raw bytes size into GB / MB / KB readable strings."""
-    if not bytes_size or bytes_size <= 0:
-        return "تخمینی"
-    gb = bytes_size / (1024 * 1024 * 1024)
-    if gb >= 1.0:
-        return f"{gb:.2f} GB"
-    mb = bytes_size / (1024 * 1024)
-    if mb >= 1.0:
-        return f"{mb:.1f} MB"
-    kb = bytes_size / 1024
-    return f"{int(kb)} KB"
-
-
-def extract_resolution_height(fmt: Dict[str, Any]) -> int:
-    """Extracts resolution height integer from height, width, resolution string, or format_note."""
-    height = fmt.get('height')
-    if height and isinstance(height, int) and height > 0:
-        return height
-
-    resolution = fmt.get('resolution') or ""
-    if "x" in resolution:
-        try:
-            parts = resolution.lower().split("x")
-            return min(int(parts[0]), int(parts[1]))
-        except Exception:
-            pass
-
-    format_note = fmt.get('format_note') or ""
-    match = re.search(r'(\d{3,4})p?', format_note)
-    if match:
-        return int(match.group(1))
-
-    width = fmt.get('width')
-    if width and isinstance(width, int):
-        if width >= 3840:
-            return 2160
-        elif width >= 2560:
-            return 1440
-        elif width >= 1920:
-            return 1080
-        elif width >= 1280:
-            return 720
-        elif width >= 854:
-            return 480
-        elif width >= 640:
-            return 360
-        elif width >= 426:
-            return 240
-
-    return 0
-
-
-def format_quality_label(height: int) -> str:
-    """Generates detailed user-friendly quality labels for all heights."""
-    if height >= 2160:
-        return f"📹 {height}p (4K Ultra HD)"
-    elif height >= 1440:
-        return f"📹 {height}p (2K QHD)"
-    elif height >= 1080:
-        return f"📹 {height}p (Full HD)"
-    elif height >= 720:
-        return f"📹 {height}p (HD)"
-    elif height >= 480:
-        return f"📹 {height}p (SD)"
-    elif height > 0:
-        return f"📹 {height}p"
-    return "📹 کیفیت استاندارد"
-
-
-def sanitize_telegram_text(text: str) -> str:
-    """Strips risky formatting characters to prevent Telegram API Markdown parsing errors."""
-    if not text:
-        return ""
-    for char in ['_', '*', '`', '[', ']', '(', ')', '~']:
-        text = text.replace(char, ' ')
-    return text.strip()
-
-
-def slice_audio_sample_ffmpeg(input_filepath: str, duration_sec: int = 15) -> Optional[str]:
-    """Cuts a 15-second snippet from the middle/drop of the audio file for accurate Shazam beat recognition."""
-    output_sample = os.path.join(DOWNLOAD_DIR, f"sample_{uuid.uuid4().hex[:6]}.mp3")
+def extract_spotify_info_oembed(url: str) -> Optional[Dict[str, Any]]:
+    """Extracts Spotify track metadata using Spotify's reliable zero-auth oEmbed API."""
     try:
-        cmd = [
-            "ffmpeg", "-y", "-ss", "00:00:10", "-i", input_filepath,
-            "-t", str(duration_sec), "-acodec", "libmp3lame", "-ac", "1", "-ar", "44100",
-            output_sample
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        if os.path.exists(output_sample) and os.path.getsize(output_sample) > 1000:
-            return output_sample
+        clean_u = clean_media_url(url)
+        encoded_url = urllib.parse.quote(clean_u, safe='')
+        oembed_url = f"https://open.spotify.com/oembed?url={encoded_url}"
+        req = urllib.request.Request(oembed_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            title = data.get('title', '')
+            artist = data.get('author_name', '')
+            thumbnail = data.get('thumbnail_url', '')
+
+            # Title often comes as "Song Title" or "Song Title by Artist"
+            clean_title = title.split(" - ")[0].split(" by ")[0].strip() if title else "Spotify Song"
+
+            return {
+                'title': clean_title or title,
+                'artist': artist,
+                'thumbnail': thumbnail,
+                'spotify_url': clean_u,
+                'raw_title': title
+            }
     except Exception as e:
-        logger.debug(f"FFmpeg slicing fallback: {e}")
-
-    # Fallback to direct input if slicing fails
-    return input_filepath if os.path.exists(input_filepath) else None
-
-
-async def recognize_audio_shazam(audio_path: str) -> Optional[Dict[str, Any]]:
-    """Uses Shazam API fingerprinting to recognize exact tracks, Phonk, Slowed+Reverb, or specific remixes."""
-    if not os.path.exists(audio_path):
-        return None
-
-    sample_path = slice_audio_sample_ffmpeg(audio_path, duration_sec=18)
-    file_to_check = sample_path or audio_path
-
-    if HAS_SHAZAMIO:
-        try:
-            shazam = Shazam()
-            out = await shazam.recognize(file_to_check)
-            track = out.get('track', {})
-            if track:
-                title = track.get('title', '')
-                subtitle = track.get('subtitle', '')
-                genre = track.get('genres', {}).get('primary', '')
-                images = track.get('images', {})
-                cover = images.get('coverarthq') or images.get('coverart', '')
-                spotify_id = track.get('hub', {}).get('providers', [{}])[0].get('actions', [{}])[0].get('uri', '')
-
-                return {
-                    "title": title,
-                    "artist": subtitle,
-                    "genre": genre,
-                    "cover": cover,
-                    "spotify_id": spotify_id,
-                    "shazam_url": track.get('url', '')
-                }
-        except Exception as ex:
-            logger.debug(f"ShazamIO recognition error: {ex}")
-
-    # Cleanup sample file
-    if sample_path and sample_path != audio_path and os.path.exists(sample_path):
-        try:
-            os.remove(sample_path)
-        except Exception:
-            pass
-
+        logger.debug(f"Spotify oEmbed fetch error: {e}")
     return None
-
-
-def get_spotify_token() -> Optional[str]:
-    """Retrieves access token for Spotify API."""
-    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-        try:
-            url = "https://accounts.spotify.com/api/token"
-            data = urllib.parse.urlencode({'grant_type': 'client_credentials'}).encode('utf-8')
-            req = urllib.request.Request(url, data=data, method='POST')
-            auth_header = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')).decode('utf-8')
-            req.add_header("Authorization", f"Basic {auth_header}")
-            req.add_header("Content-Type", "application/x-www-form-urlencoded")
-            with urllib.request.urlopen(req, timeout=5) as response:
-                res_data = json.loads(response.read().decode())
-                return res_data.get('access_token')
-        except Exception as ex:
-            logger.debug(f"Failed Spotify credentials auth: {ex}")
-
-    try:
-        req = urllib.request.Request("https://open.spotify.com/get_access_token", headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res_data = json.loads(response.read().decode())
-            return res_data.get('accessToken')
-    except Exception as ex:
-        logger.debug(f"Failed open Spotify token fetch: {ex}")
-        return None
 
 
 def search_spotify_track(query: str) -> Optional[Dict[str, str]]:
@@ -612,8 +425,25 @@ async def fetch_cobalt_fallback_info(url: str) -> Optional[Dict[str, Any]]:
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
     """Multi-tiered Extraction Pipeline ensuring maximum success without errors."""
     clean_url = clean_media_url(url)
-    cookie_file = setup_cookies_file()
 
+    # Tier 0: Direct Spotify Track URL Handler
+    if is_spotify_url(clean_url):
+        logger.info("Extracting Spotify metadata via oEmbed...")
+        sp_info = extract_spotify_info_oembed(clean_url)
+        if sp_info:
+            return {
+                "direct_url": clean_url,
+                "title": f"🎵 {sp_info['title']} - {sp_info['artist']}",
+                "description": f"موزیک اسپاتیفای: {sp_info['title']} اثر {sp_info['artist']}",
+                "track": sp_info['title'],
+                "artist": sp_info['artist'],
+                "thumbnail": sp_info['thumbnail'],
+                "formats": [],
+                "duration": 210,
+                "is_spotify": True
+            }
+
+    cookie_file = setup_cookies_file()
     loop = asyncio.get_event_loop()
 
     # Tier 1: yt-dlp Extraction with Rotating Player Clients & Mobile User-Agents
@@ -808,8 +638,13 @@ async def download_media_audio(url: str, bitrate: str, output_prefix: str) -> Op
 
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, output_prefix: str) -> Optional[Dict[str, Any]]:
-    """Performs deep multi-stage Spotify + YouTube Music search pipeline."""
+    """Ultra-resilient YouTube Music & YouTube search & download pipeline."""
     queries_to_try = []
+
+    # Direct YouTube / YouTube Music link check
+    if is_youtube_url(caption or track_title):
+        direct_yt_url = clean_media_url(caption or track_title)
+        queries_to_try.append(direct_yt_url)
 
     clean_t = clean_music_query(track_title)
     clean_a = clean_music_query(artist_name)
@@ -818,19 +653,19 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     spotify_match = None
     search_seed = f"{clean_a} {clean_t}".strip() or f"{extracted_artist} {extracted_title}".strip() or clean_music_query(caption[:100])
 
-    if search_seed:
+    if search_seed and len(search_seed) >= 3:
         spotify_match = search_spotify_track(search_seed)
 
     if spotify_match:
         sp_title = spotify_match['title']
         sp_artist = spotify_match['artist']
-        queries_to_try.append(f"{sp_artist} {sp_title} official audio")
-        queries_to_try.append(f"{sp_artist} {sp_title}")
+        queries_to_try.append(f"{sp_artist} {sp_title} audio")
+        queries_to_try.append(f"{sp_artist} {sp_title} official music video")
 
     if clean_a and clean_t:
-        queries_to_try.append(f"{clean_a} {clean_t} full song audio")
-        queries_to_try.append(f"{clean_a} {clean_t} remix phonk")
+        queries_to_try.append(f"{clean_a} {clean_t} audio")
         queries_to_try.append(f"{clean_a} {clean_t}")
+        queries_to_try.append(f"{clean_a} {clean_t} remix phonk")
     if clean_t:
         queries_to_try.append(f"{clean_t} official song")
         queries_to_try.append(f"{clean_t}")
@@ -838,7 +673,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     if extracted_title:
         q_ext = clean_music_query(f"{extracted_artist} {extracted_title}")
         if q_ext and q_ext not in queries_to_try:
-            queries_to_try.append(f"{q_ext} official")
+            queries_to_try.append(f"{q_ext} audio")
 
     if not queries_to_try and caption:
         clean_cap = clean_music_query(caption[:120])
@@ -849,10 +684,11 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
     cookie_file = setup_cookies_file()
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'outtmpl': output_template,
-        'concurrent_fragment_downloads': 12,
+        'concurrent_fragment_downloads': 16,
         'nocheckcertificate': True,
+        'ignoreerrors': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -860,7 +696,12 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         }],
         'quiet': True,
         'no_warnings': True,
-        'default_search': 'ytsearch5:',
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'ios', 'mweb']},
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36',
+        }
     }
 
     if cookie_file:
@@ -872,21 +713,26 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         try:
             def _search():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
-                    if not info or 'entries' not in info or not info['entries']:
+                    target = search_q if search_q.startswith("http") else f"ytsearch5:{search_q}"
+                    info = ydl.extract_info(target, download=False)
+                    if not info:
                         return None
 
-                    for entry in info['entries']:
-                        if not entry:
-                            continue
-                        duration = entry.get('duration', 0)
-                        if 30 <= duration <= 900:
-                            video_url = entry.get('webpage_url') or entry.get('url')
+                    entries = info.get('entries', [info]) if 'entries' in info else [info]
+                    entries = [e for e in entries if e]
+
+                    if not entries:
+                        return None
+
+                    for entry in entries:
+                        duration = entry.get('duration') or 180
+                        if 20 <= duration <= 1200:
+                            video_url = entry.get('webpage_url') or entry.get('url') or search_q
                             if video_url:
                                 ydl.download([video_url])
 
-                                final_title = (spotify_match.get('title') if spotify_match else None) or entry.get('title', track_title or "Original Song")
-                                final_artist = (spotify_match.get('artist') if spotify_match else None) or entry.get('uploader') or entry.get('artist') or "Unknown Artist"
+                                final_title = (spotify_match.get('title') if spotify_match else None) or entry.get('title') or track_title or "Original Song"
+                                final_artist = (spotify_match.get('artist') if spotify_match else None) or entry.get('uploader') or entry.get('artist') or artist_name or "Unknown Artist"
 
                                 return {
                                     'filepath': os.path.join(DOWNLOAD_DIR, f"{output_prefix}.mp3"),
@@ -901,7 +747,7 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
             if res and os.path.exists(res['filepath']):
                 return res
         except Exception as ex:
-            logger.debug(f"Search query failed '{search_q}': {ex}")
+            logger.debug(f"Search query failed for '{search_q}': {ex}")
             continue
 
     return None
