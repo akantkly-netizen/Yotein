@@ -99,18 +99,33 @@ async def get_or_create_job_state(job_prefix: str) -> Dict[str, Any]:
             JOB_STATES[job_prefix] = {
                 "state": "idle",  # idle, running, timed_out, finished, cancelled
                 "active_task": None,
+                "future": None,   # underlying concurrent.futures.Future for thread tracking
+                "cleanup_scheduled": False,
                 "created_at": time.time()
             }
         return JOB_STATES[job_prefix]
 
-async def update_job_state(job_prefix: str, state: str, task: Optional[asyncio.Task] = None):
+async def update_job_state(
+    job_prefix: str,
+    state: str,
+    task: Optional[asyncio.Task] = None,
+    future: Optional[Any] = None
+):
     async with JOB_STATES_LOCK:
         if job_prefix not in JOB_STATES:
-            JOB_STATES[job_prefix] = {"state": state, "active_task": task, "created_at": time.time()}
+            JOB_STATES[job_prefix] = {
+                "state": state,
+                "active_task": task,
+                "future": future,
+                "cleanup_scheduled": False,
+                "created_at": time.time()
+            }
         else:
             JOB_STATES[job_prefix]["state"] = state
             if task is not None:
                 JOB_STATES[job_prefix]["active_task"] = task
+            if future is not None:
+                JOB_STATES[job_prefix]["future"] = future
 
 # ---------------------------------------------------------------------------
 # ERROR CLASSIFICATION & RETRY UTILITIES
@@ -140,20 +155,23 @@ def is_transient_error(exc: Exception) -> bool:
 
 async def safe_execute_ytdlp(
     job_prefix: str,
-    coro_func,
-    timeout_seconds: float,
+    target_func=None,
+    coro_func=None,
+    timeout_seconds: float = DOWNLOAD_TIMEOUT_SECONDS,
     max_attempts: int = MAX_RETRY_ATTEMPTS,
     initial_delay: float = 1.0
 ):
     """
     Executes yt-dlp operation with strict timeout safety, per-job running state locking,
-    deferred cleanup, and exponential backoff retry for transient errors.
+    underlying worker thread future tracking, deferred cleanup, and exponential backoff retry for transient errors.
     """
     state_obj = await get_or_create_job_state(job_prefix)
-    
+
     async with JOB_STATES_LOCK:
         if state_obj["state"] == "running":
-            raise DownloadError(f"Job {job_prefix} is already running an active worker.", is_transient=False)
+            fut = state_obj.get("future")
+            if fut is not None and not fut.done():
+                raise DownloadError(f"Job {job_prefix} is already running an active worker.", is_transient=False)
         state_obj["state"] = "running"
 
     attempt = 1
@@ -162,19 +180,36 @@ async def safe_execute_ytdlp(
 
     try:
         while attempt <= max_attempts:
-            # Check if previous worker is still flagged or active
-            async with JOB_STATES_LOCK:
-                if state_obj["state"] == "timed_out":
-                    # Wait briefly for lingering background worker before next attempt
-                    await asyncio.sleep(0.5)
+            # Wait for any lingering worker thread from previous attempt before launching retry
+            prev_fut = state_obj.get("future")
+            if prev_fut is not None and not prev_fut.done():
+                logger.info(f"Waiting for lingering worker thread to finish for job {job_prefix} (attempt {attempt-1})...")
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(prev_fut), timeout=30.0)
+                except Exception as wait_ex:
+                    logger.debug(f"Wait for lingering worker on {job_prefix} ended: {wait_ex}")
 
             current_task = asyncio.current_task()
-            await update_job_state(job_prefix, "running", current_task)
+            await update_job_state(job_prefix, "running", task=current_task)
 
             try:
-                result = await asyncio.wait_for(coro_func(), timeout=timeout_seconds)
+                if target_func is not None:
+                    fut = executor.submit(target_func)
+                    async with JOB_STATES_LOCK:
+                        state_obj["future"] = fut
+                    result = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout_seconds)
+                elif coro_func is not None:
+                    res_or_coro = coro_func()
+                    if asyncio.iscoroutine(res_or_coro):
+                        result = await asyncio.wait_for(res_or_coro, timeout=timeout_seconds)
+                    else:
+                        result = res_or_coro
+                else:
+                    raise ValueError("Neither target_func nor coro_func provided to safe_execute_ytdlp")
+
                 await update_job_state(job_prefix, "finished", None)
                 return result
+
             except asyncio.CancelledError:
                 await update_job_state(job_prefix, "cancelled", None)
                 raise
@@ -182,13 +217,13 @@ async def safe_execute_ytdlp(
                 last_exception = te
                 await update_job_state(job_prefix, "timed_out", None)
                 logger.warning(f"Operation timed out for job {job_prefix} on attempt {attempt}/{max_attempts}")
-                
+
                 if attempt >= max_attempts:
                     raise DownloadError(f"Operation timed out after {timeout_seconds}s", is_transient=True)
             except Exception as e:
                 last_exception = e
                 await update_job_state(job_prefix, "finished", None)
-                
+
                 if attempt >= max_attempts or not is_transient_error(e):
                     raise
                 logger.warning(f"Transient error on attempt {attempt}/{max_attempts} for job {job_prefix}: {e}. Retrying in {delay:.1f}s...")
@@ -203,8 +238,10 @@ async def safe_execute_ytdlp(
         return None
     finally:
         async with JOB_STATES_LOCK:
-            if JOB_STATES.get(job_prefix, {}).get("state") not in ["running", "timed_out"]:
-                JOB_STATES[job_prefix]["state"] = "finished"
+            fut = state_obj.get("future")
+            if fut is None or fut.done():
+                if state_obj.get("state") not in ["running", "timed_out"]:
+                    state_obj["state"] = "finished"
 
 # ---------------------------------------------------------------------------
 # UTILITIES & HOST / URL HANDLING
@@ -340,16 +377,11 @@ def setup_cookies_file() -> Optional[str]:
         return COOKIES_FILE_ENV
     return None
 
-def cleanup_job_files(prefix: str):
-    """Deletes temporary files matching the job prefix cleanly, deferring if worker is active."""
+def _do_file_deletion(prefix: str):
+    """Deletes temporary files matching the job prefix cleanly."""
     if not prefix:
         return
     try:
-        job_state = JOB_STATES.get(prefix, {}).get("state")
-        if job_state == "running":
-            # Deferred cleanup: do not delete files while worker is actively running / writing
-            return
-
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, f"{prefix}*")):
             if os.path.isfile(filepath):
                 try:
@@ -358,6 +390,35 @@ def cleanup_job_files(prefix: str):
                     logger.debug(f"Failed to remove file {filepath}: {ex}")
     except Exception as e:
         logger.debug(f"Error cleaning files for prefix {prefix}: {e}")
+
+def cleanup_job_files(prefix: str):
+    """Deletes temporary files matching the job prefix cleanly, deferring if worker is still writing."""
+    if not prefix:
+        return
+    try:
+        state_obj = JOB_STATES.get(prefix)
+        if state_obj:
+            fut = state_obj.get("future")
+            if fut is not None and not fut.done():
+                # Worker thread is active; schedule deferred cleanup once thread finishes
+                def _deferred_cleanup(f):
+                    try:
+                        state_obj["state"] = "finished"
+                        _do_file_deletion(prefix)
+                    except Exception as ex:
+                        logger.debug(f"Deferred cleanup error for {prefix}: {ex}")
+
+                if not state_obj.get("cleanup_scheduled"):
+                    state_obj["cleanup_scheduled"] = True
+                    fut.add_done_callback(_deferred_cleanup)
+                return
+
+            if state_obj.get("state") == "running":
+                return
+
+        _do_file_deletion(prefix)
+    except Exception as e:
+        logger.debug(f"Error in cleanup_job_files for prefix {prefix}: {e}")
 
 def get_cached_slide(cache_id: str, slide_idx: int) -> Optional[Dict[str, Any]]:
     """Safely fetches a slide from cache by ID and index while enforcing expiration checks."""
@@ -500,7 +561,7 @@ def validate_downloaded_video_height(filepath: str, max_height: Optional[int]) -
     duration = meta.get("duration", 0)
     vcodec = meta.get("vcodec", "")
 
-    if actual_height <= 0 or duration <= 0 or not vcodec:
+    if actual_height <= 0 or not vcodec:
         logger.warning(f"Validation failed for {filepath}: duration={duration}, height={actual_height}, vcodec={vcodec}")
         return False
 
@@ -512,7 +573,7 @@ def validate_downloaded_video_height(filepath: str, max_height: Optional[int]) -
     return True
 
 def find_downloaded_media(job_prefix: str, min_mtime: float = 0.0) -> Optional[str]:
-    """Locates downloaded video/media file for a given job_prefix, rejecting stale files."""
+    """Locates downloaded video/media file for a given job_prefix, rejecting stale or intermediate files."""
     if not job_prefix:
         return None
 
@@ -529,10 +590,14 @@ def find_downloaded_media(job_prefix: str, min_mtime: float = 0.0) -> Optional[s
 
         filename = os.path.basename(filepath)
 
+        # Ignore thumbnails, preps, audio slices, and temporary fragment downloads (.f137., .f140., .part, .ytdl)
         if (filename.startswith("thumb_") or 
             filename.startswith("prep_") or 
             filename.startswith("slice_") or 
-            "_slice_" in filename):
+            "_slice_" in filename or
+            re.search(r'\.f\d+\.', filename) or
+            filename.endswith('.part') or
+            filename.endswith('.ytdl')):
             continue
 
         ext = os.path.splitext(filename)[1].lower()
@@ -606,14 +671,35 @@ def sync_get_video_metadata(filepath: str) -> Dict[str, Any]:
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
             fmt = data.get("format", {})
-            meta["duration"] = int(float(fmt.get("duration", 0)))
+            dur_raw = fmt.get("duration")
+            if dur_raw and str(dur_raw).strip().lower() != "n/a":
+                try:
+                    meta["duration"] = int(float(dur_raw))
+                except (ValueError, TypeError):
+                    meta["duration"] = 0
+
             for stream in data.get("streams", []):
-                if stream.get("codec_type") == "video" and not meta["vcodec"]:
+                codec_type = stream.get("codec_type")
+                if codec_type == "video" and not meta["vcodec"]:
                     meta["vcodec"] = stream.get("codec_name", "")
-                    meta["width"] = int(stream.get("width", 0))
-                    meta["height"] = int(stream.get("height", 0))
-                elif stream.get("codec_type") == "audio" and not meta["acodec"]:
+                    meta["width"] = int(stream.get("width", 0) or 0)
+                    meta["height"] = int(stream.get("height", 0) or 0)
+                    if meta["duration"] <= 0:
+                        s_dur = stream.get("duration")
+                        if s_dur and str(s_dur).strip().lower() != "n/a":
+                            try:
+                                meta["duration"] = int(float(s_dur))
+                            except (ValueError, TypeError):
+                                pass
+                elif codec_type == "audio" and not meta["acodec"]:
                     meta["acodec"] = stream.get("codec_name", "")
+                    if meta["duration"] <= 0:
+                        s_dur = stream.get("duration")
+                        if s_dur and str(s_dur).strip().lower() != "n/a":
+                            try:
+                                meta["duration"] = int(float(s_dur))
+                            except (ValueError, TypeError):
+                                pass
     except subprocess.TimeoutExpired:
         logger.warning(f"ffprobe metadata extraction timed out after {FFPROBE_TIMEOUT_SECONDS}s for {filepath}")
     except Exception as e:
@@ -628,7 +714,7 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
     loop = asyncio.get_running_loop()
     try:
         meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(filepath))
-        if meta.get("height", 0) == 0 or meta.get("duration", 0) == 0:
+        if meta.get("height", 0) == 0:
             logger.error(f"Input file {filepath} is not a valid video file (height={meta.get('height')}, duration={meta.get('duration')})")
             return {"filepath": None, "error": "Invalid video input"}
 
@@ -1474,7 +1560,6 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             }
 
     cookie_file = setup_cookies_file()
-    loop = asyncio.get_running_loop()
 
     strategies = [
         {
@@ -1511,7 +1596,7 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
         try:
             result = await safe_execute_ytdlp(
                 job_prefix=job_prefix,
-                coro_func=lambda: loop.run_in_executor(executor, _fetch),
+                target_func=_fetch,
                 timeout_seconds=EXTRACTION_TIMEOUT_SECONDS,
                 max_attempts=2
             )
@@ -1534,81 +1619,57 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
     async with JOB_SEMAPHORE:
         try:
             download_started_at = time.time()
-
             cookie_file = setup_cookies_file()
             slide_dict = slide or {}
             format_selectors = build_format_selectors(slide_dict, param)
-            loop = asyncio.get_running_loop()
 
-            for fmt in format_selectors:
-                attempt = 0
+            for fmt_idx, fmt in enumerate(format_selectors):
+                fmt_prefix = f"{job_prefix}_f{fmt_idx}"
+                fmt_template = os.path.join(DOWNLOAD_DIR, f"{fmt_prefix}.%(ext)s")
 
-                async def _do_attempt():
-                    nonlocal attempt
-                    attempt += 1
-                    att_prefix = f"{job_prefix}_a{attempt}"
-                    att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
-
-                    ydl_opts = {
-                        'format': fmt,
-                        'outtmpl': att_template,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'merge_output_format': 'mp4',
-                        'nocheckcertificate': True,
-                        'concurrent_fragment_downloads': 8,
-                        'http_headers': {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        }
+                ydl_opts = {
+                    'format': fmt,
+                    'outtmpl': fmt_template,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'merge_output_format': 'mp4',
+                    'nocheckcertificate': True,
+                    'concurrent_fragment_downloads': 8,
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     }
+                }
 
-                    if cookie_file:
-                        ydl_opts['cookiefile'] = cookie_file
+                if cookie_file:
+                    ydl_opts['cookiefile'] = cookie_file
 
-                    def _download():
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.extract_info(url, download=True)
+                def _download():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.extract_info(url, download=True)
 
-                    try:
-                        await safe_execute_ytdlp(
-                            job_prefix=att_prefix,
-                            coro_func=lambda: loop.run_in_executor(executor, _download),
-                            timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                            max_attempts=1
-                        )
-                    except asyncio.CancelledError:
-                        cleanup_job_files(att_prefix)
-                        raise
-                    except Exception as ex:
-                        logger.warning(f"yt-dlp download attempt failed for format {fmt}: {ex}")
-                        cleanup_job_files(att_prefix)
-                        raise ex
+                try:
+                    await safe_execute_ytdlp(
+                        job_prefix=fmt_prefix,
+                        target_func=_download,
+                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                        max_attempts=2
+                    )
 
-                    found_file = find_downloaded_media(att_prefix, min_mtime=download_started_at)
+                    found_file = find_downloaded_media(fmt_prefix, min_mtime=download_started_at)
                     if found_file:
                         if validate_downloaded_video_height(found_file, max_height):
                             return found_file
                         else:
                             logger.warning(f"Rejecting output file {found_file} due to height/validation failure.")
-                            cleanup_job_files(att_prefix)
-                            raise DownloadError(f"Height validation failed for quality {param}", is_transient=False)
-
-                    cleanup_job_files(att_prefix)
-                    raise DownloadError("Download finished but no valid file found", is_transient=True)
-
-                try:
-                    res_file = await safe_execute_ytdlp(
-                        job_prefix=f"{job_prefix}_fmt",
-                        coro_func=_do_attempt,
-                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                        max_attempts=2
-                    )
-                    if res_file and os.path.exists(res_file):
-                        return res_file
+                            cleanup_job_files(fmt_prefix)
+                    else:
+                        cleanup_job_files(fmt_prefix)
                 except asyncio.CancelledError:
+                    cleanup_job_files(fmt_prefix)
                     raise
                 except Exception as ex:
-                    logger.debug(f"Video download attempt failed for format {fmt}: {ex}")
+                    logger.warning(f"Video download attempt failed for format selector {fmt}: {ex}")
+                    cleanup_job_files(fmt_prefix)
 
             return None
         except asyncio.CancelledError:
@@ -1628,80 +1689,62 @@ async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optio
         try:
             cleanup_job_files(job_prefix)
             download_started_at = time.time()
-
             cookie_file = setup_cookies_file()
-            loop = asyncio.get_running_loop()
-            attempt = 0
 
-            async def _do_attempt():
-                nonlocal attempt
-                attempt += 1
-                att_prefix = f"{job_prefix}_a{attempt}"
-                att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
+            att_prefix = f"{job_prefix}_aud"
+            att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
 
-                ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': att_template,
-                    'nocheckcertificate': True,
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': bitrate if bitrate in ["128", "320"] else "128",
-                    }],
-                    'quiet': True,
-                    'no_warnings': True,
-                }
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': att_template,
+                'nocheckcertificate': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': bitrate if bitrate in ["128", "320"] else "128",
+                }],
+                'quiet': True,
+                'no_warnings': True,
+            }
 
-                if cookie_file:
-                    ydl_opts['cookiefile'] = cookie_file
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
 
-                def _download():
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.extract_info(url, download=True)
-
-                try:
-                    await safe_execute_ytdlp(
-                        job_prefix=att_prefix,
-                        coro_func=lambda: loop.run_in_executor(executor, _download),
-                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                        max_attempts=1
-                    )
-                except asyncio.CancelledError:
-                    cleanup_job_files(att_prefix)
-                    raise
-                except Exception as ex:
-                    cleanup_job_files(att_prefix)
-                    raise ex
-
-                found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
-                if found_audio and os.path.exists(found_audio):
-                    meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
-                    if meta.get("duration", 0) > 0 and os.path.getsize(found_audio) > 0:
-                        return found_audio
-
-                cleanup_job_files(att_prefix)
-                raise DownloadError("Audio extraction produced invalid output", is_transient=True)
+            def _download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url, download=True)
 
             try:
-                return await safe_execute_ytdlp(
-                    job_prefix=f"{job_prefix}_aud",
-                    coro_func=_do_attempt,
+                await safe_execute_ytdlp(
+                    job_prefix=att_prefix,
+                    target_func=_download,
                     timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
                     max_attempts=2
                 )
             except asyncio.CancelledError:
+                cleanup_job_files(att_prefix)
                 raise
             except Exception as ex:
                 logger.debug(f"Audio download attempt failed: {ex}")
+                cleanup_job_files(att_prefix)
                 return None
+
+            found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
+            if found_audio and os.path.exists(found_audio):
+                loop = asyncio.get_running_loop()
+                meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
+                if meta.get("duration", 0) > 0 and os.path.getsize(found_audio) > 0:
+                    return found_audio
+
+            cleanup_job_files(att_prefix)
+            return None
         except asyncio.CancelledError:
             cleanup_job_files(job_prefix)
             raise
         except Exception as e:
             logger.exception(f"Error downloading audio for job {job_prefix}: {e}")
-            return None
-        finally:
             cleanup_job_files(job_prefix)
+            return None
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, job_prefix: str) -> Optional[Dict[str, Any]]:
     """Full track search & download pipeline with strict validation, safe yt-dlp execution & concurrency protection."""
@@ -1774,47 +1817,36 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
             for cand_idx, (score, cand) in enumerate(valid_candidates):
                 target_url = cand['webpage_url']
-                attempt = 0
+                att_prefix = f"{job_prefix}_c{cand_idx}"
+                att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
 
-                async def _dl_cand_attempt():
-                    nonlocal attempt
-                    attempt += 1
-                    att_prefix = f"{job_prefix}_c{cand_idx}_a{attempt}"
-                    att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
+                ydl_opts = {
+                    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                    'outtmpl': att_template,
+                    'nocheckcertificate': True,
+                    'ignoreerrors': True,
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '320',
+                    }],
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                if cookie_file:
+                    ydl_opts['cookiefile'] = cookie_file
 
-                    ydl_opts = {
-                        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-                        'outtmpl': att_template,
-                        'nocheckcertificate': True,
-                        'ignoreerrors': True,
-                        'postprocessors': [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '320',
-                        }],
-                        'quiet': True,
-                        'no_warnings': True,
-                    }
-                    if cookie_file:
-                        ydl_opts['cookiefile'] = cookie_file
+                def _dl():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([target_url])
 
-                    def _dl():
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([target_url])
-
-                    try:
-                        await safe_execute_ytdlp(
-                            job_prefix=att_prefix,
-                            coro_func=lambda: loop.run_in_executor(executor, _dl),
-                            timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                            max_attempts=1
-                        )
-                    except asyncio.CancelledError:
-                        cleanup_job_files(att_prefix)
-                        raise
-                    except Exception as ex:
-                        cleanup_job_files(att_prefix)
-                        raise ex
+                try:
+                    await safe_execute_ytdlp(
+                        job_prefix=att_prefix,
+                        target_func=_dl,
+                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                        max_attempts=2
+                    )
 
                     found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
                     if found_audio and os.path.exists(found_audio):
@@ -1833,21 +1865,12 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                             }
 
                     cleanup_job_files(att_prefix)
-                    raise DownloadError("Candidate download produced invalid file", is_transient=True)
-
-                try:
-                    res = await safe_execute_ytdlp(
-                        job_prefix=f"{job_prefix}_cand_{cand_idx}",
-                        coro_func=_dl_cand_attempt,
-                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                        max_attempts=2
-                    )
-                    if res:
-                        return res
                 except asyncio.CancelledError:
+                    cleanup_job_files(att_prefix)
                     raise
                 except Exception as ex:
                     logger.debug(f"Candidate download failed for {target_url}: {ex}")
+                    cleanup_job_files(att_prefix)
 
             return None
         except asyncio.CancelledError:
@@ -1856,8 +1879,6 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         except Exception as e:
             logger.exception(f"Unexpected error in search_and_download_full_track for job {job_prefix}: {e}")
             return None
-        finally:
-            cleanup_job_files(job_prefix)
 
 # ---------------------------------------------------------------------------
 # TELEGRAM BOT HANDLERS & CALLBACKS
@@ -2208,7 +2229,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     filepath = prep_res.get("filepath")
                     thumb_path = prep_res.get("thumb_path")
 
-                    if not filepath or not os.path.exists(filepath):
+                    if not filepath or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
                         await status_msg.edit_text("❌ خطا در پردازش یا تبدیل فرمت ویدیو.")
                         return
 
