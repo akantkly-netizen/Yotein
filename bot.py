@@ -97,9 +97,10 @@ SUPPORTED_URL_RE = re.compile(
 # ------------------------------------------------------------------
 BTN_HELP = "📖 راهنما"
 BTN_ABOUT = "ℹ️ درباره ربات"
+BTN_MUSIC = "🎵 جستجوی موزیک"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_HELP, BTN_ABOUT]],
+    [[BTN_MUSIC], [BTN_HELP, BTN_ABOUT]],
     resize_keyboard=True,   # دکمه‌ها رو کوچیک و جمع‌وجور نشون می‌ده
     is_persistent=True,     # همیشه روی صفحه بمونه
 )
@@ -108,6 +109,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 # نگهداری موقت اطلاعات هر لینک تا زمانی که کاربر کیفیت رو انتخاب کنه
 # key: کد کوتاه (chat_id_msgid) -> {"url":..., "formats": [...]}
 PENDING = {}
+
+# مجموعه‌ی chat_id هایی که منتظر فرستادن اسم آهنگ هستن (بعد از زدن دکمه‌ی جستجو)
+WAITING_MUSIC_QUERY = set()
 
 
 # ------------------------------------------------------------------
@@ -130,6 +134,37 @@ def extract_info(url: str) -> dict:
     with yt_dlp.YoutubeDL(build_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     return info
+
+
+def search_music(query: str, limit: int = 5):
+    """
+    توی یوتیوب دنبال آهنگ می‌گرده (چون yt-dlp مستقیم به یوتیوب/گوگل
+    دسترسی داره) و ترجیحاً نسخه‌ی "Official Audio/Video" رو انتخاب
+    می‌کنه. یه dict اطلاعات (بدون فرمت‌های کامل) برمی‌گردونه یا None.
+    """
+    search_query = f"ytsearch{limit}:{query} official audio"
+    with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
+        result = ydl.extract_info(search_query, download=False)
+
+    entries = [e for e in (result.get("entries") or []) if e]
+    if not entries:
+        return None
+
+    def score(entry):
+        title = (entry.get("title") or "").lower()
+        s = 0
+        if "official audio" in title:
+            s += 3
+        elif "official video" in title or "official music video" in title:
+            s += 2
+        elif "official" in title:
+            s += 1
+        if "lyric" in title:
+            s += 1
+        return s
+
+    best = max(entries, key=score)
+    return best
 
 
 def format_size(num_bytes) -> str:
@@ -360,6 +395,8 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "۳. از بین دکمه‌های کیفیت (هرکدوم با حجم دقیق) یکی رو انتخاب کن\n"
         "۴. اگه فقط صدا می‌خوای، دکمه‌ی «🎵 فقط صدا» رو بزن\n"
         "۵. یه نوار پیشرفت زنده می‌بینی تا دانلود و ارسال تموم بشه\n\n"
+        f"🎵 با دکمه‌ی «{BTN_MUSIC}» هم می‌تونی فقط اسم یه آهنگ رو بفرستی؛"
+        " نسخه‌ی رسمیش رو پیدا می‌کنم و برات می‌فرستم.\n\n"
         "نکته: پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل"
         " دانلود نیستن.",
         reply_markup=MAIN_KEYBOARD,
@@ -377,32 +414,66 @@ async def about_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    match = SUPPORTED_URL_RE.search(text)
-    if not match:
-        await update.message.reply_text(
-            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام،"
-            " ویدیو/شورتز یوتیوب یا ویدیوی تیک‌تاک رو بفرست."
+async def music_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    WAITING_MUSIC_QUERY.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "🎵 اسم آهنگ و خواننده رو بفرست (مثلاً: «Shadmehr Aghili - Bahar»).\n"
+        "نسخه‌ی رسمیش رو پیدا می‌کنم و برات می‌فرستم.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
+    if not query_text:
+        await update.message.reply_text("یه اسم آهنگ بفرست تا جستجو کنم.")
+        return
+
+    status_msg = await update.message.reply_text(f"🔎 دارم دنبال «{query_text}» می‌گردم...")
+
+    try:
+        best = await asyncio.to_thread(search_music, query_text)
+    except Exception as e:
+        logger.exception("search_music failed")
+        await status_msg.edit_text("❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        return
+
+    if not best:
+        await status_msg.edit_text(
+            "چیزی برای این آهنگ پیدا نکردم. اسم دقیق‌تر یا اسم خواننده رو هم اضافه کن."
         )
         return
 
-    url = match.group(0)
-    status_msg = await update.message.reply_text("⏳ دارم اطلاعات لینک رو می‌گیرم...")
+    video_url = best.get("url") or best.get("webpage_url") or best.get("id")
+    if best.get("id") and not str(video_url).startswith("http"):
+        video_url = f"https://www.youtube.com/watch?v={best['id']}"
 
+    chat_id = update.effective_chat.id
+    await show_quality_picker(update.message, chat_id, video_url, status_msg)
+
+
+async def show_quality_picker(message, chat_id: int, url: str, status_msg=None):
+    """
+    اطلاعات لینک رو می‌گیره، تامبنیل+توضیحات رو نشون می‌ده و دکمه‌های
+    کیفیت رو می‌سازه. هم برای لینک مستقیم استفاده می‌شه هم برای نتیجه‌ی
+    جستجوی موزیک. اگه status_msg داده بشه (پیام "در حال جستجو/گرفتن
+    اطلاعات")، در پایان حذف می‌شه.
+    """
     try:
         info = extract_info(url)
     except Exception as e:
         logger.exception("extract_info failed")
-        await status_msg.edit_text(
+        err_text = (
             "❌ نتونستم اطلاعات این لینک رو بگیرم. ممکنه پست خصوصی باشه یا"
             " لینک اشتباه باشه.\nجزئیات خطا: " + str(e)[:300]
         )
+        if status_msg:
+            await status_msg.edit_text(err_text)
+        else:
+            await message.reply_text(err_text)
         return
 
     options = pick_quality_options(info)
 
-    buttons_template = []  # بعد از ساخت key تکمیل میشه
     thumbnail_url = info.get("thumbnail")
     uploader = info.get("uploader") or info.get("uploader_id") or ""
     description = info.get("description") or info.get("title") or ""
@@ -420,18 +491,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(caption) > 1024:  # سقف کپشن عکس در تلگرام
         caption = caption[:1000] + "…\n\nکیفیت مورد نظرت رو انتخاب کن:"
 
-    await status_msg.delete()
+    if status_msg:
+        await status_msg.delete()
 
     if thumbnail_url:
         try:
-            sent_msg = await update.message.reply_photo(photo=thumbnail_url, caption=caption)
+            sent_msg = await message.reply_photo(photo=thumbnail_url, caption=caption)
         except Exception:
             logger.exception("sending thumbnail failed, falling back to text")
-            sent_msg = await update.message.reply_text(caption)
+            sent_msg = await message.reply_text(caption)
     else:
-        sent_msg = await update.message.reply_text(caption)
+        sent_msg = await message.reply_text(caption)
 
-    key = f"{update.effective_chat.id}_{sent_msg.message_id}"
+    key = f"{chat_id}_{sent_msg.message_id}"
     PENDING[key] = {"url": url, "options": {o["format_id"] + "_" + o["kind"]: o for o in options}}
 
     buttons = []
@@ -440,6 +512,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton(o["label"], callback_data=cb_data)])
 
     await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
+
+    if chat_id in WAITING_MUSIC_QUERY:
+        WAITING_MUSIC_QUERY.discard(chat_id)
+        await handle_music_query(update, context, text)
+        return
+
+    match = SUPPORTED_URL_RE.search(text)
+    if not match:
+        await update.message.reply_text(
+            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام،"
+            " ویدیو/شورتز یوتیوب یا ویدیوی تیک‌تاک رو بفرست، یا از دکمه‌ی"
+            f" «{BTN_MUSIC}» برای جستجوی آهنگ استفاده کن."
+        )
+        return
+
+    url = match.group(0)
+    status_msg = await update.message.reply_text("⏳ دارم اطلاعات لینک رو می‌گیرم...")
+    await show_quality_picker(update.message, chat_id, url, status_msg)
 
 
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -514,6 +609,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ABOUT)}$"), about_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_MUSIC)}$"), music_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
 
@@ -523,4 +619,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
