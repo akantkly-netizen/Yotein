@@ -1,3 +1,0 @@
-python-telegram-bot>=20.0
-yt-dlp>=2024.03.10
-shazamio>=0.5.0
