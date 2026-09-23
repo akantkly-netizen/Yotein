@@ -100,10 +100,32 @@ def extract_info(url: str) -> dict:
     return info
 
 
+def format_size(num_bytes) -> str:
+    """بایت رو به MB/KB خوانا تبدیل می‌کنه."""
+    if not num_bytes:
+        return ""
+    mb = num_bytes / 1024 / 1024
+    if mb >= 1:
+        return f"{mb:.1f}MB"
+    kb = num_bytes / 1024
+    return f"{kb:.0f}KB"
+
+
+def best_audio_format(formats):
+    """بهترین فرمت فقط-صدا رو برای تخمین حجم mp3 خروجی برمی‌گردونه."""
+    audio_only = [
+        f for f in formats
+        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+    ]
+    if not audio_only:
+        return None
+    return max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+
+
 def pick_quality_options(info: dict):
     """
     از بین فرمت‌های موجود، چند گزینه‌ی معنادار برای کاربر می‌سازه:
-    بهترین کیفیت، کیفیت متوسط، کیفیت پایین (اگر موجود باشه) + فقط صدا.
+    هر رزولوشن موجود با حجم دقیق (یا تقریبی اگه سرور اعلام نکرده باشه) + فقط صدا.
     """
     formats = info.get("formats") or []
     video_formats = [
@@ -117,12 +139,23 @@ def pick_quality_options(info: dict):
         if h not in by_height or (f.get("tbr") or 0) > (by_height[h].get("tbr") or 0):
             by_height[h] = f
 
+    # بهترین فرمت صدا که موقع مرج به ویدیو اضافه می‌شه، برای تخمین حجم نهایی
+    audio_f = best_audio_format(formats)
+    audio_size = 0
+    if audio_f:
+        audio_size = audio_f.get("filesize") or audio_f.get("filesize_approx") or 0
+
     sorted_heights = sorted(by_height.keys(), reverse=True)
     options = []
     for h in sorted_heights:
         f = by_height[h]
-        size = f.get("filesize") or f.get("filesize_approx")
-        size_txt = f" (~{size / 1024 / 1024:.1f}MB)" if size else ""
+        video_size = f.get("filesize") or f.get("filesize_approx") or 0
+        exact = f.get("filesize") is not None
+        total = video_size + audio_size if video_size else 0
+        if total:
+            size_txt = f" - {format_size(total)}" + ("" if exact else " (تقریبی)")
+        else:
+            size_txt = ""
         options.append(
             {
                 "label": f"🎬 {h}p{size_txt}",
@@ -133,10 +166,16 @@ def pick_quality_options(info: dict):
 
     # اگر هیچ فرمت مجزایی پیدا نشد (مثلا فقط یه فایل ترکیبی هست)
     if not options and formats:
-        options.append({"label": "🎬 کیفیت پیش‌فرض", "format_id": "best", "kind": "video"})
+        best = max(formats, key=lambda f: f.get("height") or 0)
+        size = best.get("filesize") or best.get("filesize_approx")
+        size_txt = f" - {format_size(size)}" if size else ""
+        options.append({"label": f"🎬 کیفیت پیش‌فرض{size_txt}", "format_id": "best", "kind": "video"})
 
     # گزینه‌ی فقط صدا همیشه اضافه میشه
-    options.append({"label": "🎵 فقط صدا (MP3)", "format_id": "bestaudio", "kind": "audio"})
+    audio_label = "🎵 فقط صدا (MP3)"
+    if audio_size:
+        audio_label += f" - {format_size(audio_size)}"
+    options.append({"label": audio_label, "format_id": "bestaudio", "kind": "audio"})
     return options
 
 
@@ -212,7 +251,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     options = pick_quality_options(info)
-    key = f"{update.effective_chat.id}_{status_msg.message_id}"
+
+    buttons_template = []  # بعد از ساخت key تکمیل میشه
+    thumbnail_url = info.get("thumbnail")
+    uploader = info.get("uploader") or info.get("uploader_id") or ""
+    description = info.get("description") or info.get("title") or ""
+    description = description.strip()
+    if len(description) > 600:
+        description = description[:600] + "…"
+
+    caption_lines = []
+    if uploader:
+        caption_lines.append(f"👤 {uploader}")
+    if description:
+        caption_lines.append(description)
+    caption_lines.append("\nکیفیت مورد نظرت رو انتخاب کن:")
+    caption = "\n\n".join(caption_lines) if caption_lines else "کیفیت مورد نظرت رو انتخاب کن:"
+    if len(caption) > 1024:  # سقف کپشن عکس در تلگرام
+        caption = caption[:1000] + "…\n\nکیفیت مورد نظرت رو انتخاب کن:"
+
+    await status_msg.delete()
+
+    if thumbnail_url:
+        try:
+            sent_msg = await update.message.reply_photo(photo=thumbnail_url, caption=caption)
+        except Exception:
+            logger.exception("sending thumbnail failed, falling back to text")
+            sent_msg = await update.message.reply_text(caption)
+    else:
+        sent_msg = await update.message.reply_text(caption)
+
+    key = f"{update.effective_chat.id}_{sent_msg.message_id}"
     PENDING[key] = {"url": url, "options": {o["format_id"] + "_" + o["kind"]: o for o in options}}
 
     buttons = []
@@ -220,13 +289,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cb_data = f"dl|{key}|{o['format_id']}|{o['kind']}"
         buttons.append([InlineKeyboardButton(o["label"], callback_data=cb_data)])
 
-    title = info.get("title") or info.get("description") or "محتوای اینستاگرام"
-    title = (title[:150] + "…") if len(title) > 150 else title
+    await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
-    await status_msg.edit_text(
-        f"✅ پیدا شد: {title}\n\nکیفیت مورد نظرت رو انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+
+async def set_status(query, text: str):
+    """چه پیام اصلی عکس باشه چه متن، وضعیت رو به‌روز می‌کنه."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=text)
+        else:
+            await query.edit_message_text(text)
+    except Exception:
+        # اگه ادیت ممکن نبود (مثلا پیام خیلی قدیمی شده)، یه پیام جدید بفرست
+        await query.message.reply_text(text)
 
 
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,16 +311,16 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         _, key, format_id, kind = query.data.split("|", 3)
     except ValueError:
-        await query.edit_message_text("❌ خطای داخلی، دوباره لینک رو بفرست.")
+        await set_status(query, "❌ خطای داخلی، دوباره لینک رو بفرست.")
         return
 
     entry = PENDING.get(key)
     if not entry:
-        await query.edit_message_text("⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.")
+        await set_status(query, "⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.")
         return
 
     url = entry["url"]
-    await query.edit_message_text("⬇️ در حال دانلود... (بسته به حجم فایل ممکنه کمی طول بکشه)")
+    await set_status(query, "⬇️ در حال دانلود... (بسته به حجم فایل ممکنه کمی طول بکشه)")
 
     tmp_dir = tempfile.mkdtemp(prefix="insta_dl_")
     try:
@@ -253,10 +328,11 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         size_mb = os.path.getsize(file_path) / 1024 / 1024
 
         if size_mb > MAX_TELEGRAM_UPLOAD_MB:
-            await query.edit_message_text(
+            await set_status(
+                query,
                 f"❌ حجم فایل {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB"
                 " ربات‌های تلگرام رسمی بیشتره. برای فایل‌های بزرگ‌تر باید از"
-                " Local Bot API Server استفاده کنی (توضیح در README)."
+                " Local Bot API Server استفاده کنی (توضیح در README).",
             )
             return
 
@@ -267,10 +343,10 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
 
-        await query.edit_message_text("✅ ارسال شد!")
+        await set_status(query, "✅ ارسال شد!")
     except Exception as e:
         logger.exception("download/send failed")
-        await query.edit_message_text("❌ دانلود یا ارسال فایل با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, "❌ دانلود یا ارسال فایل با خطا مواجه شد:\n" + str(e)[:300])
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         PENDING.pop(key, None)
