@@ -378,13 +378,47 @@ def clean_media_url(url: str) -> str:
 
 
 def apply_youtube_extractor_options(ydl_opts: Dict[str, Any]) -> Dict[str, Any]:
-    """Applies optional YouTube extractor options without changing default behavior."""
+    """Adds current YouTube compatibility options while preserving all existing options.
+
+    YouTube now uses PO Tokens and JavaScript challenges for parts of playback.
+    Prefer a configured PO-token provider; otherwise use clients that currently
+    have a no-PO-token path where possible.
+    """
+    extractor_args = dict(ydl_opts.get("extractor_args") or {})
+    youtube_args = dict(extractor_args.get("youtube") or {})
+
+    # A manually supplied token is supported for backwards compatibility.
+    # Current yt-dlp guidance recommends a PO-token provider for production
+    # because tokens can be bound to the video/session.
     if YOUTUBE_PO_TOKEN:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "po_token": [f"mweb.gvs+{YOUTUBE_PO_TOKEN}"]
-            }
+        youtube_args["po_token"] = [f"mweb.gvs+{YOUTUBE_PO_TOKEN}"]
+        youtube_args["player_client"] = ["mweb"]
+    elif os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip():
+        # bgutil-ytdlp-pot-provider HTTP provider.
+        extractor_args["youtubepot-bgutilhttp"] = {
+            "base_url": os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
         }
+        youtube_args["player_client"] = ["mweb"]
+    else:
+        # These clients currently have paths that do not require a GVS PO token
+        # for all requests. web_safari can expose HLS formats without the GVS
+        # token requirement; web_embedded is a useful fallback for embeddable
+        # videos. yt-dlp will fall back to the normal format selection logic.
+        youtube_args["player_client"] = ["web_safari", "web_embedded"]
+
+    extractor_args["youtube"] = youtube_args
+    ydl_opts["extractor_args"] = extractor_args
+
+    # Full current YouTube support needs an external JS runtime. Only enable
+    # one when it is actually installed on the host, so the bot does not break
+    # on systems that do not have Deno/Node yet.
+    deno_path = shutil.which("deno")
+    node_path = shutil.which("node")
+    if deno_path:
+        ydl_opts["js_runtimes"] = {"deno": deno_path}
+    elif node_path:
+        ydl_opts["js_runtimes"] = {"node": node_path}
+
     return ydl_opts
 
 def setup_cookies_file() -> Optional[str]:
