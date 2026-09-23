@@ -377,41 +377,31 @@ def clean_media_url(url: str) -> str:
         return url
 
 
-def apply_youtube_extractor_options(ydl_opts: Dict[str, Any]) -> Dict[str, Any]:
-    """Adds current YouTube compatibility options while preserving all existing options.
+def apply_youtube_extractor_options(ydl_opts: Dict[str, Any], player_clients: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Apply current YouTube compatibility options without affecting other extractors.
 
-    YouTube now uses PO Tokens and JavaScript challenges for parts of playback.
-    Prefer a configured PO-token provider; otherwise use clients that currently
-    have a no-PO-token path where possible.
+    The caller can provide an ordered client list.  We keep each layer isolated so a
+    failed YouTube client does not prevent the next one from being tried.
     """
     extractor_args = dict(ydl_opts.get("extractor_args") or {})
     youtube_args = dict(extractor_args.get("youtube") or {})
 
-    # A manually supplied token is supported for backwards compatibility.
-    # Current yt-dlp guidance recommends a PO-token provider for production
-    # because tokens can be bound to the video/session.
     if YOUTUBE_PO_TOKEN:
         youtube_args["po_token"] = [f"mweb.gvs+{YOUTUBE_PO_TOKEN}"]
         youtube_args["player_client"] = ["mweb"]
-    elif os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip():
-        # bgutil-ytdlp-pot-provider HTTP provider.
+    elif player_clients:
+        youtube_args["player_client"] = list(player_clients)
+
+    provider_url = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
+    if provider_url:
         extractor_args["youtubepot-bgutilhttp"] = {
-            "base_url": os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
+            "base_url": provider_url
         }
-        youtube_args["player_client"] = ["mweb"]
-    else:
-        # These clients currently have paths that do not require a GVS PO token
-        # for all requests. web_safari can expose HLS formats without the GVS
-        # token requirement; web_embedded is a useful fallback for embeddable
-        # videos. yt-dlp will fall back to the normal format selection logic.
-        youtube_args["player_client"] = ["web_safari", "web_embedded"]
 
     extractor_args["youtube"] = youtube_args
     ydl_opts["extractor_args"] = extractor_args
 
-    # Full current YouTube support needs an external JS runtime. Only enable
-    # one when it is actually installed on the host, so the bot does not break
-    # on systems that do not have Deno/Node yet.
+    # Current yt-dlp YouTube extraction may require an external JS runtime.
     deno_path = shutil.which("deno")
     node_path = shutil.which("node")
     if deno_path:
@@ -420,6 +410,56 @@ def apply_youtube_extractor_options(ydl_opts: Dict[str, Any]) -> Dict[str, Any]:
         ydl_opts["js_runtimes"] = {"node": node_path}
 
     return ydl_opts
+
+
+def youtube_client_layers() -> List[Dict[str, Any]]:
+    """Ordered YouTube fallback layers. No non-YouTube code uses these options."""
+    if YOUTUBE_PO_TOKEN:
+        return [{"name": "mweb_static_pot", "clients": ["mweb"]}]
+
+    layers = [
+        # HLS-capable path which currently has a no-PO-token GVS route.
+        {"name": "web_safari", "clients": ["web_safari"]},
+        # No GVS PO token currently required; useful independent fallback.
+        {"name": "android_vr", "clients": ["android_vr"]},
+        # No PO token, but only videos that are embeddable are available.
+        {"name": "web_embedded", "clients": ["web_embedded"]},
+    ]
+
+    # If a provider is configured, put the recommended mweb+POT path last.
+    # If it is not configured, this layer is simply omitted rather than causing
+    # every YouTube request to wait for a nonexistent provider.
+    if YOUTUBE_PO_TOKEN or os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip():
+        layers.append({"name": "mweb_pot", "clients": ["mweb"]})
+
+    return layers
+
+
+class _YouTubeLogger:
+    """Forward yt-dlp diagnostics to the bot logger without printing cookies/tokens."""
+    def debug(self, msg):
+        if msg and not str(msg).startswith("[debug] "):
+            logger.debug(f"[yt-dlp] {msg}")
+
+    def warning(self, msg):
+        logger.warning(f"[yt-dlp] {msg}")
+
+    def error(self, msg):
+        logger.error(f"[yt-dlp] {msg}")
+
+
+def youtube_base_opts() -> Dict[str, Any]:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YouTubeLogger(),
+        "extract_flat": False,
+        "nocheckcertificate": True,
+        "retries": 2,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "socket_timeout": 20,
+    }
 
 def setup_cookies_file() -> Optional[str]:
     """Checks and returns active cookies file path if available."""
@@ -1593,7 +1633,7 @@ def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Di
     return slides
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Extracts media metadata using yt-dlp with explicit safe executor handling and timeout/retry safety."""
+    """Extract YouTube through independent fallback layers; preserve existing behavior for other sites."""
     clean_url = clean_media_url(url)
 
     if is_spotify_url(clean_url):
@@ -1614,59 +1654,45 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             }
 
     cookie_file = setup_cookies_file()
-
-    strategies = [
-        {
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-            }
-        },
-        {
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
-            }
-        }
-    ]
-
+    layers = youtube_client_layers() if is_youtube_url(clean_url) else [{"name": "default", "clients": None}]
     job_prefix = f"ext_{uuid.uuid4().hex[:6]}"
 
-    for strat in strategies:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'nocheckcertificate': True,
-            'http_headers': strat.get('http_headers', {}),
+    for layer in layers:
+        ydl_opts = youtube_base_opts()
+        ydl_opts["http_headers"] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
         }
-
-        ydl_opts = apply_youtube_extractor_options(ydl_opts)
-
+        if layer["clients"]:
+            ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
+        elif not is_youtube_url(clean_url):
+            ydl_opts = apply_youtube_extractor_options(ydl_opts)
         if cookie_file:
-            ydl_opts['cookiefile'] = cookie_file
+            ydl_opts["cookiefile"] = cookie_file
 
-        def _fetch():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        def _fetch(opts=ydl_opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(clean_url, download=False)
 
         try:
+            logger.info(f"[YouTube] extraction layer={layer['name']} url={clean_url}")
             result = await safe_execute_ytdlp(
-                job_prefix=job_prefix,
+                job_prefix=f"{job_prefix}_{layer['name']}",
                 target_func=_fetch,
                 timeout_seconds=EXTRACTION_TIMEOUT_SECONDS,
-                max_attempts=2
+                max_attempts=1,
             )
-            if result:
+            if result and (result.get("formats") or result.get("url") or result.get("entries")):
                 return result
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            logger.debug(f"Extraction strategy attempt failed: {ex}")
+            logger.warning(f"[YouTube] extraction layer failed: {layer['name']}: {type(ex).__name__}: {ex}")
 
     return None
 
 async def download_media_video(url: str, param: str, job_prefix: str, slide: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Downloads requested video quality with strict timeout safety, per-job running locks, height validation & concurrency safety."""
+    """Download YouTube video through independent client/format fallback layers."""
     if not url:
         return None
 
@@ -1676,58 +1702,62 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
         try:
             download_started_at = time.time()
             cookie_file = setup_cookies_file()
-            slide_dict = slide or {}
-            format_selectors = build_format_selectors(slide_dict, param)
+            format_selectors = build_format_selectors(slide or {}, param)
 
-            for fmt_idx, fmt in enumerate(format_selectors):
-                fmt_prefix = f"{job_prefix}_f{fmt_idx}"
-                fmt_template = os.path.join(DOWNLOAD_DIR, f"{fmt_prefix}.%(ext)s")
+            is_yt = is_youtube_url(url)
+            layers = youtube_client_layers() if is_yt else [{"name": "default", "clients": None}]
 
-                ydl_opts = {
-                    'format': fmt,
-                    'outtmpl': fmt_template,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'merge_output_format': 'mp4',
-                    'nocheckcertificate': True,
-                    'concurrent_fragment_downloads': 8,
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    }
-                }
+            for layer_idx, layer in enumerate(layers):
+                for fmt_idx, fmt in enumerate(format_selectors):
+                    fmt_prefix = f"{job_prefix}_yt{layer_idx}_f{fmt_idx}"
+                    fmt_template = os.path.join(DOWNLOAD_DIR, f"{fmt_prefix}.%(ext)s")
+                    ydl_opts = youtube_base_opts()
+                    ydl_opts.update({
+                        "format": fmt,
+                        "outtmpl": fmt_template,
+                        "merge_output_format": "mp4",
+                        "concurrent_fragment_downloads": 4,
+                        "http_headers": {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                            "Accept-Language": "en-US,en;q=0.9",
+                        },
+                    })
+                    if layer["clients"]:
+                        ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
+                    elif not is_yt:
+                        ydl_opts = apply_youtube_extractor_options(ydl_opts)
+                    if cookie_file:
+                        ydl_opts["cookiefile"] = cookie_file
 
-                ydl_opts = apply_youtube_extractor_options(ydl_opts)
+                    def _download(opts=ydl_opts):
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.extract_info(url, download=True)
 
-                if cookie_file:
-                    ydl_opts['cookiefile'] = cookie_file
+                    try:
+                        logger.info(f"[YouTube] download layer={layer['name']} format={fmt}")
+                        await safe_execute_ytdlp(
+                            job_prefix=fmt_prefix,
+                            target_func=_download,
+                            timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                            max_attempts=1,
+                        )
 
-                def _download():
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.extract_info(url, download=True)
+                        found_file = find_downloaded_media(fmt_prefix, min_mtime=download_started_at)
+                        if found_file:
+                            if validate_downloaded_video_height(found_file, max_height):
+                                return found_file
+                            logger.warning(f"[YouTube] rejecting output due to height/validation: {found_file}")
 
-                try:
-                    await safe_execute_ytdlp(
-                        job_prefix=fmt_prefix,
-                        target_func=_download,
-                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                        max_attempts=2
-                    )
-
-                    found_file = find_downloaded_media(fmt_prefix, min_mtime=download_started_at)
-                    if found_file:
-                        if validate_downloaded_video_height(found_file, max_height):
-                            return found_file
-                        else:
-                            logger.warning(f"Rejecting output file {found_file} due to height/validation failure.")
-                            cleanup_job_files(fmt_prefix)
-                    else:
                         cleanup_job_files(fmt_prefix)
-                except asyncio.CancelledError:
-                    cleanup_job_files(fmt_prefix)
-                    raise
-                except Exception as ex:
-                    logger.warning(f"Video download attempt failed for format selector {fmt}: {ex}")
-                    cleanup_job_files(fmt_prefix)
+                    except asyncio.CancelledError:
+                        cleanup_job_files(fmt_prefix)
+                        raise
+                    except Exception as ex:
+                        logger.warning(
+                            f"[YouTube] download layer={layer['name']} format={fmt} failed: "
+                            f"{type(ex).__name__}: {ex}"
+                        )
+                        cleanup_job_files(fmt_prefix)
 
             return None
         except asyncio.CancelledError:
