@@ -1,6 +1,0 @@
-pycache/
-*.pyc
-temp_downloads/
-.env
-.venv/
-env/
