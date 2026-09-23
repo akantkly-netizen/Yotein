@@ -1,7 +1,8 @@
 """
 ربات تلگرام دانلود اینستاگرام + یوتیوب
 ----------------------------------------
-کاربر لینک پست/ریلز/استوری اینستاگرام یا ویدیو/شورتز یوتیوب رو می‌فرسته،
+کاربر لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب، یا ویدیوی
+تیک‌تاک رو می‌فرسته،
 ربات کیفیت‌های موجود رو به صورت دکمه (با حجم دقیق) نشون می‌ده. کاربر یا
 یه کیفیت ویدیو انتخاب می‌کنه یا گزینه‌ی "فقط صدا" رو می‌زنه که صدا جدا
 استخراج و ارسال میشه. حین دانلود، یه نوار پیشرفت زنده (درصد + حجم
@@ -43,6 +44,7 @@ import yt_dlp
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.error import BadRequest
@@ -81,9 +83,27 @@ YOUTUBE_URL_RE = re.compile(
     r"(https?://)?(www\.|m\.)?youtube\.com/(watch\?v=|shorts/|embed/|live/)[\w\-]+[\w\-?&=%.]*"
     r"|(https?://)?youtu\.be/[\w\-]+[\w\-?&=%.]*"
 )
-SUPPORTED_URL_RE = re.compile(
-    f"({INSTAGRAM_URL_RE.pattern})|({YOUTUBE_URL_RE.pattern})"
+TIKTOK_URL_RE = re.compile(
+    r"(https?://)?(www\.|m\.)?tiktok\.com/@[\w.\-]+/video/\d+[\w\-?&=%.]*"
+    r"|(https?://)?(vm|vt)\.tiktok\.com/[\w\-]+/?[\w\-?&=%.]*"
+    r"|(https?://)?(www\.)?tiktok\.com/t/[\w\-]+/?[\w\-?&=%.]*"
 )
+SUPPORTED_URL_RE = re.compile(
+    f"({INSTAGRAM_URL_RE.pattern})|({YOUTUBE_URL_RE.pattern})|({TIKTOK_URL_RE.pattern})"
+)
+
+# ------------------------------------------------------------------
+# کیبورد پایین صفحه (Reply Keyboard)
+# ------------------------------------------------------------------
+BTN_HELP = "📖 راهنما"
+BTN_ABOUT = "ℹ️ درباره ربات"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_HELP, BTN_ABOUT]],
+    resize_keyboard=True,   # دکمه‌ها رو کوچیک و جمع‌وجور نشون می‌ده
+    is_persistent=True,     # همیشه روی صفحه بمونه
+)
+
 
 # نگهداری موقت اطلاعات هر لینک تا زمانی که کاربر کیفیت رو انتخاب کنه
 # key: کد کوتاه (chat_id_msgid) -> {"url":..., "formats": [...]}
@@ -321,10 +341,39 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_s
 # ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! لینک پست/ریلز/استوری اینستاگرام یا ویدیو/شورتز یوتیوب رو"
+        "سلام! لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب یا"
+        " ویدیوی تیک‌تاک رو"
         " برام بفرست 🙂\nبعدش کیفیت مورد نظرت رو از بین دکمه‌ها انتخاب کن"
         " (با حجم دقیق هر کدوم)، یا اگه فقط آهنگش رو می‌خوای، گزینه‌ی"
-        " «فقط صدا» رو بزن."
+        " «فقط صدا» رو بزن.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 راهنمای استفاده:\n\n"
+        "۱. لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب یا"
+        " ویدیوی تیک‌تاک"
+        " رو بفرست\n"
+        "۲. تامبنیل و توضیحات محتوا نشون داده می‌شه\n"
+        "۳. از بین دکمه‌های کیفیت (هرکدوم با حجم دقیق) یکی رو انتخاب کن\n"
+        "۴. اگه فقط صدا می‌خوای، دکمه‌ی «🎵 فقط صدا» رو بزن\n"
+        "۵. یه نوار پیشرفت زنده می‌بینی تا دانلود و ارسال تموم بشه\n\n"
+        "نکته: پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل"
+        " دانلود نیستن.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def about_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ درباره ربات:\n\n"
+        "این ربات با کمک yt-dlp از اینستاگرام، یوتیوب و تیک‌تاک دانلود می‌کنه.\n"
+        "لطفاً فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده"
+        " دارید ازش استفاده کنید؛ رعایت کپی‌رایت و قوانین پلتفرم‌ها به"
+        " عهده‌ی خودتونه.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -333,8 +382,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = SUPPORTED_URL_RE.search(text)
     if not match:
         await update.message.reply_text(
-            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام یا"
-            " ویدیو/شورتز یوتیوب رو بفرست."
+            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام،"
+            " ویدیو/شورتز یوتیوب یا ویدیوی تیک‌تاک رو بفرست."
         )
         return
 
@@ -463,6 +512,8 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ABOUT)}$"), about_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
 
