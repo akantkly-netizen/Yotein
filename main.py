@@ -359,12 +359,27 @@ def clean_media_url(url: str) -> str:
                 return urllib.parse.urlunparse((
                     'https', 'www.youtube.com', '/watch', '', new_query_str, ''
                 ))
-            else:
+
+            # Shorts are normal YouTube video IDs. Canonicalizing /shorts/<id>
+            # to /watch?v=<id> avoids passing a Shorts page path through the
+            # generic URL cleaner while leaving every other YouTube URL intact.
+            shorts_match = re.match(r"^/shorts/([^/?#]+)", parsed.path or "", re.IGNORECASE)
+            if shorts_match:
+                video_id = shorts_match.group(1)
                 query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                allowed_yt = {"v", "list", "index", "t", "start"}
+                allowed_yt = {"list", "index", "t", "start"}
                 cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
+                cleaned_query["v"] = [video_id]
                 new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-                return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
+                return urllib.parse.urlunparse((
+                    'https', 'www.youtube.com', '/watch', '', new_query_str, ''
+                ))
+
+            query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            allowed_yt = {"v", "list", "index", "t", "start"}
+            cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
+            new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
+            return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
 
         query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "si", "feature", "igsh", "share_id", "is_copy_url"}
@@ -413,22 +428,21 @@ def apply_youtube_extractor_options(ydl_opts: Dict[str, Any], player_clients: Op
 
 
 def youtube_client_layers() -> List[Dict[str, Any]]:
-    """Ordered YouTube fallback layers. No non-YouTube code uses these options."""
-    if YOUTUBE_PO_TOKEN:
-        return [{"name": "mweb_static_pot", "clients": ["mweb"]}]
-
+    """Ordered YouTube fallback layers. Non-YouTube extractors never use these."""
+    # Start with yt-dlp's normal YouTube client selection. This is important:
+    # forcing a single client can remove formats that are available through the
+    # current default client set.
     layers = [
-        # HLS-capable path which currently has a no-PO-token GVS route.
-        {"name": "web_safari", "clients": ["web_safari"]},
-        # No GVS PO token currently required; useful independent fallback.
-        {"name": "android_vr", "clients": ["android_vr"]},
-        # No PO token, but only videos that are embeddable are available.
+        {"name": "default", "clients": None},
+        # This client does not currently need a GVS PO token and can expose
+        # embeddable video formats.
         {"name": "web_embedded", "clients": ["web_embedded"]},
+        # web_safari can expose HLS formats that avoid the GVS PO-token path.
+        {"name": "web_safari", "clients": ["web_safari"]},
     ]
 
-    # If a provider is configured, put the recommended mweb+POT path last.
-    # If it is not configured, this layer is simply omitted rather than causing
-    # every YouTube request to wait for a nonexistent provider.
+    # If a real PO-token provider or explicit token is configured, try the
+    # recommended mweb path after the no-token fallbacks.
     if YOUTUBE_PO_TOKEN or os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip():
         layers.append({"name": "mweb_pot", "clients": ["mweb"]})
 
@@ -1663,9 +1677,12 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        if layer["clients"]:
-            ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
-        elif not is_youtube_url(clean_url):
+        if is_youtube_url(clean_url):
+            if layer["clients"]:
+                ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
+            else:
+                ydl_opts = apply_youtube_extractor_options(ydl_opts)
+        else:
             ydl_opts = apply_youtube_extractor_options(ydl_opts)
         if cookie_file:
             ydl_opts["cookiefile"] = cookie_file
@@ -1722,9 +1739,12 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
                             "Accept-Language": "en-US,en;q=0.9",
                         },
                     })
-                    if layer["clients"]:
-                        ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
-                    elif not is_yt:
+                    if is_yt:
+                        if layer["clients"]:
+                            ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
+                        else:
+                            ydl_opts = apply_youtube_extractor_options(ydl_opts)
+                    else:
                         ydl_opts = apply_youtube_extractor_options(ydl_opts)
                     if cookie_file:
                         ydl_opts["cookiefile"] = cookie_file
