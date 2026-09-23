@@ -58,6 +58,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 COOKIES_FILE_ENV = os.getenv("COOKIES_FILE", "cookies.txt")
+YOUTUBE_PO_TOKEN = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
 
 MAX_CONCURRENT_JOBS = 3
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
@@ -346,14 +347,18 @@ def clean_media_url(url: str) -> str:
 
         if host in YOUTUBE_HOSTS:
             if host == "youtu.be":
-                video_id = parsed.path.lstrip("/")
+                # youtu.be links can contain a video id followed by a slash or
+                # query parameters. Keep only the actual first path segment.
+                video_id = parsed.path.strip("/").split("/")[0]
                 query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 allowed_yt = {"list", "index", "t", "start"}
                 cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
                 if video_id:
                     cleaned_query["v"] = [video_id]
                 new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-                return urllib.parse.urlunparse(('https', 'www.youtube.com', '/watch', '', new_query_str, ''))
+                return urllib.parse.urlunparse((
+                    'https', 'www.youtube.com', '/watch', '', new_query_str, ''
+                ))
             else:
                 query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 allowed_yt = {"v", "list", "index", "t", "start"}
@@ -370,6 +375,17 @@ def clean_media_url(url: str) -> str:
     except Exception as e:
         logger.debug(f"URL cleaning error: {e}")
         return url
+
+
+def apply_youtube_extractor_options(ydl_opts: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies optional YouTube extractor options without changing default behavior."""
+    if YOUTUBE_PO_TOKEN:
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "po_token": [f"mweb.gvs+{YOUTUBE_PO_TOKEN}"]
+            }
+        }
+    return ydl_opts
 
 def setup_cookies_file() -> Optional[str]:
     """Checks and returns active cookies file path if available."""
@@ -1424,11 +1440,16 @@ def parse_valid_formats_for_item(formats: List[Dict[str, Any]], duration: float)
     return valid_formats
 
 def build_format_selectors(slide: Dict[str, Any], param: str) -> List[str]:
-    """For numeric quality parameter, format selectors MUST NOT contain unrestricted fallbacks."""
+    """Builds yt-dlp selectors while preserving the requested maximum height.
+
+    The selectors intentionally follow yt-dlp's documented video+audio merge
+    pattern instead of requiring a particular container/codec combination.
+    YouTube does not guarantee MP4/M4A or H264/AAC for every resolution.
+    """
     if not param or param == "best":
         return [
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]",
-            "bestvideo+bestaudio",
+            "bestvideo*+bestaudio/best",
+            "bestvideo+bestaudio/best",
             "best"
         ]
 
@@ -1436,16 +1457,15 @@ def build_format_selectors(slide: Dict[str, Any], param: str) -> List[str]:
         requested_h = int(param)
     except (ValueError, TypeError):
         return [
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+            "bestvideo*+bestaudio/best",
             "best"
         ]
 
-    selectors = [
-        f"bestvideo[height<={requested_h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={requested_h}][vcodec^=avc]+bestaudio[acodec^=mp4a]",
-        f"bestvideo[height<={requested_h}]+bestaudio",
-        f"best[height<={requested_h}]"
+    return [
+        f"bestvideo[height<=?{requested_h}]+bestaudio/best[height<=?{requested_h}]",
+        f"bestvideo*[height<=?{requested_h}]+bestaudio/best[height<=?{requested_h}]",
+        f"best[height<=?{requested_h}]"
     ]
-    return selectors
 
 def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Dict[str, Any]]:
     """Normalizes yt-dlp single / playlist / carousel extraction result into independent slide dicts."""
@@ -1586,6 +1606,8 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             'http_headers': strat.get('http_headers', {}),
         }
 
+        ydl_opts = apply_youtube_extractor_options(ydl_opts)
+
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
 
@@ -1639,6 +1661,8 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     }
                 }
+
+                ydl_opts = apply_youtube_extractor_options(ydl_opts)
 
                 if cookie_file:
                     ydl_opts['cookiefile'] = cookie_file
