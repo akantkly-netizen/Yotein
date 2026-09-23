@@ -58,7 +58,6 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 COOKIES_FILE_ENV = os.getenv("COOKIES_FILE", "cookies.txt")
-YOUTUBE_PO_TOKEN = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
 
 MAX_CONCURRENT_JOBS = 3
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
@@ -100,33 +99,18 @@ async def get_or_create_job_state(job_prefix: str) -> Dict[str, Any]:
             JOB_STATES[job_prefix] = {
                 "state": "idle",  # idle, running, timed_out, finished, cancelled
                 "active_task": None,
-                "future": None,   # underlying concurrent.futures.Future for thread tracking
-                "cleanup_scheduled": False,
                 "created_at": time.time()
             }
         return JOB_STATES[job_prefix]
 
-async def update_job_state(
-    job_prefix: str,
-    state: str,
-    task: Optional[asyncio.Task] = None,
-    future: Optional[Any] = None
-):
+async def update_job_state(job_prefix: str, state: str, task: Optional[asyncio.Task] = None):
     async with JOB_STATES_LOCK:
         if job_prefix not in JOB_STATES:
-            JOB_STATES[job_prefix] = {
-                "state": state,
-                "active_task": task,
-                "future": future,
-                "cleanup_scheduled": False,
-                "created_at": time.time()
-            }
+            JOB_STATES[job_prefix] = {"state": state, "active_task": task, "created_at": time.time()}
         else:
             JOB_STATES[job_prefix]["state"] = state
             if task is not None:
                 JOB_STATES[job_prefix]["active_task"] = task
-            if future is not None:
-                JOB_STATES[job_prefix]["future"] = future
 
 # ---------------------------------------------------------------------------
 # ERROR CLASSIFICATION & RETRY UTILITIES
@@ -156,23 +140,20 @@ def is_transient_error(exc: Exception) -> bool:
 
 async def safe_execute_ytdlp(
     job_prefix: str,
-    target_func=None,
-    coro_func=None,
-    timeout_seconds: float = DOWNLOAD_TIMEOUT_SECONDS,
+    coro_func,
+    timeout_seconds: float,
     max_attempts: int = MAX_RETRY_ATTEMPTS,
     initial_delay: float = 1.0
 ):
     """
     Executes yt-dlp operation with strict timeout safety, per-job running state locking,
-    underlying worker thread future tracking, deferred cleanup, and exponential backoff retry for transient errors.
+    deferred cleanup, and exponential backoff retry for transient errors.
     """
     state_obj = await get_or_create_job_state(job_prefix)
-
+    
     async with JOB_STATES_LOCK:
         if state_obj["state"] == "running":
-            fut = state_obj.get("future")
-            if fut is not None and not fut.done():
-                raise DownloadError(f"Job {job_prefix} is already running an active worker.", is_transient=False)
+            raise DownloadError(f"Job {job_prefix} is already running an active worker.", is_transient=False)
         state_obj["state"] = "running"
 
     attempt = 1
@@ -181,36 +162,19 @@ async def safe_execute_ytdlp(
 
     try:
         while attempt <= max_attempts:
-            # Wait for any lingering worker thread from previous attempt before launching retry
-            prev_fut = state_obj.get("future")
-            if prev_fut is not None and not prev_fut.done():
-                logger.info(f"Waiting for lingering worker thread to finish for job {job_prefix} (attempt {attempt-1})...")
-                try:
-                    await asyncio.wait_for(asyncio.wrap_future(prev_fut), timeout=30.0)
-                except Exception as wait_ex:
-                    logger.debug(f"Wait for lingering worker on {job_prefix} ended: {wait_ex}")
+            # Check if previous worker is still flagged or active
+            async with JOB_STATES_LOCK:
+                if state_obj["state"] == "timed_out":
+                    # Wait briefly for lingering background worker before next attempt
+                    await asyncio.sleep(0.5)
 
             current_task = asyncio.current_task()
-            await update_job_state(job_prefix, "running", task=current_task)
+            await update_job_state(job_prefix, "running", current_task)
 
             try:
-                if target_func is not None:
-                    fut = executor.submit(target_func)
-                    async with JOB_STATES_LOCK:
-                        state_obj["future"] = fut
-                    result = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout_seconds)
-                elif coro_func is not None:
-                    res_or_coro = coro_func()
-                    if asyncio.iscoroutine(res_or_coro):
-                        result = await asyncio.wait_for(res_or_coro, timeout=timeout_seconds)
-                    else:
-                        result = res_or_coro
-                else:
-                    raise ValueError("Neither target_func nor coro_func provided to safe_execute_ytdlp")
-
+                result = await asyncio.wait_for(coro_func(), timeout=timeout_seconds)
                 await update_job_state(job_prefix, "finished", None)
                 return result
-
             except asyncio.CancelledError:
                 await update_job_state(job_prefix, "cancelled", None)
                 raise
@@ -218,13 +182,13 @@ async def safe_execute_ytdlp(
                 last_exception = te
                 await update_job_state(job_prefix, "timed_out", None)
                 logger.warning(f"Operation timed out for job {job_prefix} on attempt {attempt}/{max_attempts}")
-
+                
                 if attempt >= max_attempts:
                     raise DownloadError(f"Operation timed out after {timeout_seconds}s", is_transient=True)
             except Exception as e:
                 last_exception = e
                 await update_job_state(job_prefix, "finished", None)
-
+                
                 if attempt >= max_attempts or not is_transient_error(e):
                     raise
                 logger.warning(f"Transient error on attempt {attempt}/{max_attempts} for job {job_prefix}: {e}. Retrying in {delay:.1f}s...")
@@ -239,10 +203,8 @@ async def safe_execute_ytdlp(
         return None
     finally:
         async with JOB_STATES_LOCK:
-            fut = state_obj.get("future")
-            if fut is None or fut.done():
-                if state_obj.get("state") not in ["running", "timed_out"]:
-                    state_obj["state"] = "finished"
+            if JOB_STATES.get(job_prefix, {}).get("state") not in ["running", "timed_out"]:
+                JOB_STATES[job_prefix]["state"] = "finished"
 
 # ---------------------------------------------------------------------------
 # UTILITIES & HOST / URL HANDLING
@@ -347,39 +309,20 @@ def clean_media_url(url: str) -> str:
 
         if host in YOUTUBE_HOSTS:
             if host == "youtu.be":
-                # youtu.be links can contain a video id followed by a slash or
-                # query parameters. Keep only the actual first path segment.
-                video_id = parsed.path.strip("/").split("/")[0]
+                video_id = parsed.path.lstrip("/")
                 query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 allowed_yt = {"list", "index", "t", "start"}
                 cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
                 if video_id:
                     cleaned_query["v"] = [video_id]
                 new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-                return urllib.parse.urlunparse((
-                    'https', 'www.youtube.com', '/watch', '', new_query_str, ''
-                ))
-
-            # Shorts are normal YouTube video IDs. Canonicalizing /shorts/<id>
-            # to /watch?v=<id> avoids passing a Shorts page path through the
-            # generic URL cleaner while leaving every other YouTube URL intact.
-            shorts_match = re.match(r"^/shorts/([^/?#]+)", parsed.path or "", re.IGNORECASE)
-            if shorts_match:
-                video_id = shorts_match.group(1)
+                return urllib.parse.urlunparse(('https', 'www.youtube.com', '/watch', '', new_query_str, ''))
+            else:
                 query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                allowed_yt = {"list", "index", "t", "start"}
+                allowed_yt = {"v", "list", "index", "t", "start"}
                 cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
-                cleaned_query["v"] = [video_id]
                 new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-                return urllib.parse.urlunparse((
-                    'https', 'www.youtube.com', '/watch', '', new_query_str, ''
-                ))
-
-            query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-            allowed_yt = {"v", "list", "index", "t", "start"}
-            cleaned_query = {k: v for k, v in query_params.items() if k in allowed_yt}
-            new_query_str = urllib.parse.urlencode(cleaned_query, doseq=True)
-            return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
+                return urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, parsed.path, parsed.params, new_query_str, ''))
 
         query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         tracking_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "si", "feature", "igsh", "share_id", "is_copy_url"}
@@ -391,101 +334,22 @@ def clean_media_url(url: str) -> str:
         logger.debug(f"URL cleaning error: {e}")
         return url
 
-
-def apply_youtube_extractor_options(ydl_opts: Dict[str, Any], player_clients: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Apply current YouTube compatibility options without affecting other extractors.
-
-    The caller can provide an ordered client list.  We keep each layer isolated so a
-    failed YouTube client does not prevent the next one from being tried.
-    """
-    extractor_args = dict(ydl_opts.get("extractor_args") or {})
-    youtube_args = dict(extractor_args.get("youtube") or {})
-
-    if YOUTUBE_PO_TOKEN:
-        youtube_args["po_token"] = [f"mweb.gvs+{YOUTUBE_PO_TOKEN}"]
-        youtube_args["player_client"] = ["mweb"]
-    elif player_clients:
-        youtube_args["player_client"] = list(player_clients)
-
-    provider_url = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
-    if provider_url:
-        extractor_args["youtubepot-bgutilhttp"] = {
-            "base_url": provider_url
-        }
-
-    extractor_args["youtube"] = youtube_args
-    ydl_opts["extractor_args"] = extractor_args
-
-    # Current yt-dlp YouTube extraction may require an external JS runtime.
-    deno_path = shutil.which("deno")
-    node_path = shutil.which("node")
-    if deno_path:
-        ydl_opts["js_runtimes"] = {"deno": deno_path}
-    elif node_path:
-        ydl_opts["js_runtimes"] = {"node": node_path}
-
-    return ydl_opts
-
-
-def youtube_client_layers() -> List[Dict[str, Any]]:
-    """Ordered YouTube fallback layers. Non-YouTube extractors never use these."""
-    # Start with yt-dlp's normal YouTube client selection. This is important:
-    # forcing a single client can remove formats that are available through the
-    # current default client set.
-    layers = [
-        {"name": "default", "clients": None},
-        # This client does not currently need a GVS PO token and can expose
-        # embeddable video formats.
-        {"name": "web_embedded", "clients": ["web_embedded"]},
-        # web_safari can expose HLS formats that avoid the GVS PO-token path.
-        {"name": "web_safari", "clients": ["web_safari"]},
-    ]
-
-    # If a real PO-token provider or explicit token is configured, try the
-    # recommended mweb path after the no-token fallbacks.
-    if YOUTUBE_PO_TOKEN or os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip():
-        layers.append({"name": "mweb_pot", "clients": ["mweb"]})
-
-    return layers
-
-
-class _YouTubeLogger:
-    """Forward yt-dlp diagnostics to the bot logger without printing cookies/tokens."""
-    def debug(self, msg):
-        if msg and not str(msg).startswith("[debug] "):
-            logger.debug(f"[yt-dlp] {msg}")
-
-    def warning(self, msg):
-        logger.warning(f"[yt-dlp] {msg}")
-
-    def error(self, msg):
-        logger.error(f"[yt-dlp] {msg}")
-
-
-def youtube_base_opts() -> Dict[str, Any]:
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        "logger": _YouTubeLogger(),
-        "extract_flat": False,
-        "nocheckcertificate": True,
-        "retries": 2,
-        "fragment_retries": 3,
-        "extractor_retries": 2,
-        "socket_timeout": 20,
-    }
-
 def setup_cookies_file() -> Optional[str]:
     """Checks and returns active cookies file path if available."""
     if os.path.exists(COOKIES_FILE_ENV) and os.path.getsize(COOKIES_FILE_ENV) > 10:
         return COOKIES_FILE_ENV
     return None
 
-def _do_file_deletion(prefix: str):
-    """Deletes temporary files matching the job prefix cleanly."""
+def cleanup_job_files(prefix: str):
+    """Deletes temporary files matching the job prefix cleanly, deferring if worker is active."""
     if not prefix:
         return
     try:
+        job_state = JOB_STATES.get(prefix, {}).get("state")
+        if job_state == "running":
+            # Deferred cleanup: do not delete files while worker is actively running / writing
+            return
+
         for filepath in glob.glob(os.path.join(DOWNLOAD_DIR, f"{prefix}*")):
             if os.path.isfile(filepath):
                 try:
@@ -494,35 +358,6 @@ def _do_file_deletion(prefix: str):
                     logger.debug(f"Failed to remove file {filepath}: {ex}")
     except Exception as e:
         logger.debug(f"Error cleaning files for prefix {prefix}: {e}")
-
-def cleanup_job_files(prefix: str):
-    """Deletes temporary files matching the job prefix cleanly, deferring if worker is still writing."""
-    if not prefix:
-        return
-    try:
-        state_obj = JOB_STATES.get(prefix)
-        if state_obj:
-            fut = state_obj.get("future")
-            if fut is not None and not fut.done():
-                # Worker thread is active; schedule deferred cleanup once thread finishes
-                def _deferred_cleanup(f):
-                    try:
-                        state_obj["state"] = "finished"
-                        _do_file_deletion(prefix)
-                    except Exception as ex:
-                        logger.debug(f"Deferred cleanup error for {prefix}: {ex}")
-
-                if not state_obj.get("cleanup_scheduled"):
-                    state_obj["cleanup_scheduled"] = True
-                    fut.add_done_callback(_deferred_cleanup)
-                return
-
-            if state_obj.get("state") == "running":
-                return
-
-        _do_file_deletion(prefix)
-    except Exception as e:
-        logger.debug(f"Error in cleanup_job_files for prefix {prefix}: {e}")
 
 def get_cached_slide(cache_id: str, slide_idx: int) -> Optional[Dict[str, Any]]:
     """Safely fetches a slide from cache by ID and index while enforcing expiration checks."""
@@ -651,7 +486,7 @@ def extract_music_info_from_caption(caption: str) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def validate_downloaded_video_height(filepath: str, max_height: Optional[int]) -> bool:
-    """Validates that the downloaded video exists, has a valid video stream, positive duration, and height <= max_height."""
+    """Validates that the downloaded video exists, has a valid stream, and its height does not exceed max_height."""
     if not filepath or not os.path.exists(filepath):
         return False
     try:
@@ -660,24 +495,23 @@ def validate_downloaded_video_height(filepath: str, max_height: Optional[int]) -
     except Exception:
         return False
 
+    if max_height is None or max_height <= 0:
+        return True
+
     meta = sync_get_video_metadata(filepath)
     actual_height = meta.get("height", 0)
-    duration = meta.get("duration", 0)
-    vcodec = meta.get("vcodec", "")
-
-    if actual_height <= 0 or not vcodec:
-        logger.warning(f"Validation failed for {filepath}: duration={duration}, height={actual_height}, vcodec={vcodec}")
+    if actual_height <= 0:
+        logger.warning(f"Failed to probe video height or no video stream found for {filepath}")
         return False
 
-    if max_height is not None and max_height > 0:
-        if actual_height > max_height:
-            logger.warning(f"Video height validation failed: actual height {actual_height}p exceeds max_height {max_height}p")
-            return False
+    if actual_height > max_height:
+        logger.warning(f"Video height validation failed: actual height {actual_height}p exceeds max_height {max_height}p")
+        return False
 
     return True
 
 def find_downloaded_media(job_prefix: str, min_mtime: float = 0.0) -> Optional[str]:
-    """Locates downloaded video/media file for a given job_prefix, rejecting stale or intermediate files."""
+    """Locates downloaded video/media file for a given job_prefix, rejecting stale files."""
     if not job_prefix:
         return None
 
@@ -694,14 +528,10 @@ def find_downloaded_media(job_prefix: str, min_mtime: float = 0.0) -> Optional[s
 
         filename = os.path.basename(filepath)
 
-        # Ignore thumbnails, preps, audio slices, and temporary fragment downloads (.f137., .f140., .part, .ytdl)
         if (filename.startswith("thumb_") or 
             filename.startswith("prep_") or 
             filename.startswith("slice_") or 
-            "_slice_" in filename or
-            re.search(r'\.f\d+\.', filename) or
-            filename.endswith('.part') or
-            filename.endswith('.ytdl')):
+            "_slice_" in filename):
             continue
 
         ext = os.path.splitext(filename)[1].lower()
@@ -775,35 +605,14 @@ def sync_get_video_metadata(filepath: str) -> Dict[str, Any]:
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
             fmt = data.get("format", {})
-            dur_raw = fmt.get("duration")
-            if dur_raw and str(dur_raw).strip().lower() != "n/a":
-                try:
-                    meta["duration"] = int(float(dur_raw))
-                except (ValueError, TypeError):
-                    meta["duration"] = 0
-
+            meta["duration"] = int(float(fmt.get("duration", 0)))
             for stream in data.get("streams", []):
-                codec_type = stream.get("codec_type")
-                if codec_type == "video" and not meta["vcodec"]:
+                if stream.get("codec_type") == "video" and not meta["vcodec"]:
                     meta["vcodec"] = stream.get("codec_name", "")
-                    meta["width"] = int(stream.get("width", 0) or 0)
-                    meta["height"] = int(stream.get("height", 0) or 0)
-                    if meta["duration"] <= 0:
-                        s_dur = stream.get("duration")
-                        if s_dur and str(s_dur).strip().lower() != "n/a":
-                            try:
-                                meta["duration"] = int(float(s_dur))
-                            except (ValueError, TypeError):
-                                pass
-                elif codec_type == "audio" and not meta["acodec"]:
+                    meta["width"] = int(stream.get("width", 0))
+                    meta["height"] = int(stream.get("height", 0))
+                elif stream.get("codec_type") == "audio" and not meta["acodec"]:
                     meta["acodec"] = stream.get("codec_name", "")
-                    if meta["duration"] <= 0:
-                        s_dur = stream.get("duration")
-                        if s_dur and str(s_dur).strip().lower() != "n/a":
-                            try:
-                                meta["duration"] = int(float(s_dur))
-                            except (ValueError, TypeError):
-                                pass
     except subprocess.TimeoutExpired:
         logger.warning(f"ffprobe metadata extraction timed out after {FFPROBE_TIMEOUT_SECONDS}s for {filepath}")
     except Exception as e:
@@ -818,10 +627,6 @@ async def prepare_telegram_video(filepath: str, job_prefix: str) -> Dict[str, An
     loop = asyncio.get_running_loop()
     try:
         meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(filepath))
-        if meta.get("height", 0) == 0:
-            logger.error(f"Input file {filepath} is not a valid video file (height={meta.get('height')}, duration={meta.get('duration')})")
-            return {"filepath": None, "error": "Invalid video input"}
-
         filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
         vcodec = meta.get("vcodec", "").lower()
         acodec = meta.get("acodec", "").lower()
@@ -1528,16 +1333,11 @@ def parse_valid_formats_for_item(formats: List[Dict[str, Any]], duration: float)
     return valid_formats
 
 def build_format_selectors(slide: Dict[str, Any], param: str) -> List[str]:
-    """Builds yt-dlp selectors while preserving the requested maximum height.
-
-    The selectors intentionally follow yt-dlp's documented video+audio merge
-    pattern instead of requiring a particular container/codec combination.
-    YouTube does not guarantee MP4/M4A or H264/AAC for every resolution.
-    """
+    """For numeric quality parameter, format selectors MUST NOT contain unrestricted fallbacks."""
     if not param or param == "best":
         return [
-            "bestvideo*+bestaudio/best",
-            "bestvideo+bestaudio/best",
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]",
+            "bestvideo+bestaudio",
             "best"
         ]
 
@@ -1545,15 +1345,16 @@ def build_format_selectors(slide: Dict[str, Any], param: str) -> List[str]:
         requested_h = int(param)
     except (ValueError, TypeError):
         return [
-            "bestvideo*+bestaudio/best",
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
             "best"
         ]
 
-    return [
-        f"bestvideo[height<=?{requested_h}]+bestaudio/best[height<=?{requested_h}]",
-        f"bestvideo*[height<=?{requested_h}]+bestaudio/best[height<=?{requested_h}]",
-        f"best[height<=?{requested_h}]"
+    selectors = [
+        f"bestvideo[height<={requested_h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={requested_h}][vcodec^=avc]+bestaudio[acodec^=mp4a]",
+        f"bestvideo[height<={requested_h}]+bestaudio",
+        f"best[height<={requested_h}]"
     ]
+    return selectors
 
 def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Dict[str, Any]]:
     """Normalizes yt-dlp single / playlist / carousel extraction result into independent slide dicts."""
@@ -1647,7 +1448,7 @@ def normalize_extraction_entries(info: Dict[str, Any], root_url: str) -> List[Di
     return slides
 
 async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
-    """Extract YouTube through independent fallback layers; preserve existing behavior for other sites."""
+    """Extracts media metadata using yt-dlp with explicit safe executor handling and timeout/retry safety."""
     clean_url = clean_media_url(url)
 
     if is_spotify_url(clean_url):
@@ -1668,48 +1469,58 @@ async def extract_media_info_robust(url: str) -> Optional[Dict[str, Any]]:
             }
 
     cookie_file = setup_cookies_file()
-    layers = youtube_client_layers() if is_youtube_url(clean_url) else [{"name": "default", "clients": None}]
+    loop = asyncio.get_running_loop()
+
+    strategies = [
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+        },
+        {
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
+            }
+        }
+    ]
+
     job_prefix = f"ext_{uuid.uuid4().hex[:6]}"
 
-    for layer in layers:
-        ydl_opts = youtube_base_opts()
-        ydl_opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
+    for strat in strategies:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'nocheckcertificate': True,
+            'http_headers': strat.get('http_headers', {}),
         }
-        if is_youtube_url(clean_url):
-            if layer["clients"]:
-                ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
-            else:
-                ydl_opts = apply_youtube_extractor_options(ydl_opts)
-        else:
-            ydl_opts = apply_youtube_extractor_options(ydl_opts)
-        if cookie_file:
-            ydl_opts["cookiefile"] = cookie_file
 
-        def _fetch(opts=ydl_opts):
-            with yt_dlp.YoutubeDL(opts) as ydl:
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+
+        def _fetch():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(clean_url, download=False)
 
         try:
-            logger.info(f"[YouTube] extraction layer={layer['name']} url={clean_url}")
             result = await safe_execute_ytdlp(
-                job_prefix=f"{job_prefix}_{layer['name']}",
-                target_func=_fetch,
+                job_prefix=job_prefix,
+                coro_func=lambda: loop.run_in_executor(executor, _fetch),
                 timeout_seconds=EXTRACTION_TIMEOUT_SECONDS,
-                max_attempts=1,
+                max_attempts=2
             )
-            if result and (result.get("formats") or result.get("url") or result.get("entries")):
+            if result:
                 return result
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            logger.warning(f"[YouTube] extraction layer failed: {layer['name']}: {type(ex).__name__}: {ex}")
+            logger.debug(f"Extraction strategy attempt failed: {ex}")
 
     return None
 
 async def download_media_video(url: str, param: str, job_prefix: str, slide: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Download YouTube video through independent client/format fallback layers."""
+    """Downloads requested video quality with strict timeout safety, per-job running locks, height validation & concurrency safety."""
     if not url:
         return None
 
@@ -1717,67 +1528,82 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
 
     async with JOB_SEMAPHORE:
         try:
+            cleanup_job_files(job_prefix)
             download_started_at = time.time()
+
             cookie_file = setup_cookies_file()
-            format_selectors = build_format_selectors(slide or {}, param)
+            slide_dict = slide or {}
+            format_selectors = build_format_selectors(slide_dict, param)
+            loop = asyncio.get_running_loop()
 
-            is_yt = is_youtube_url(url)
-            layers = youtube_client_layers() if is_yt else [{"name": "default", "clients": None}]
+            for fmt in format_selectors:
+                attempt = 0
 
-            for layer_idx, layer in enumerate(layers):
-                for fmt_idx, fmt in enumerate(format_selectors):
-                    fmt_prefix = f"{job_prefix}_yt{layer_idx}_f{fmt_idx}"
-                    fmt_template = os.path.join(DOWNLOAD_DIR, f"{fmt_prefix}.%(ext)s")
-                    ydl_opts = youtube_base_opts()
-                    ydl_opts.update({
-                        "format": fmt,
-                        "outtmpl": fmt_template,
-                        "merge_output_format": "mp4",
-                        "concurrent_fragment_downloads": 4,
-                        "http_headers": {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                            "Accept-Language": "en-US,en;q=0.9",
-                        },
-                    })
-                    if is_yt:
-                        if layer["clients"]:
-                            ydl_opts = apply_youtube_extractor_options(ydl_opts, layer["clients"])
-                        else:
-                            ydl_opts = apply_youtube_extractor_options(ydl_opts)
-                    else:
-                        ydl_opts = apply_youtube_extractor_options(ydl_opts)
+                async def _do_attempt():
+                    nonlocal attempt
+                    attempt += 1
+                    att_prefix = f"{job_prefix}_a{attempt}"
+                    att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
+
+                    ydl_opts = {
+                        'format': fmt,
+                        'outtmpl': att_template,
+                        'quiet': True,
+                        'no_warnings': True,
+                        'merge_output_format': 'mp4',
+                        'nocheckcertificate': True,
+                        'concurrent_fragment_downloads': 8,
+                        'http_headers': {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        }
+                    }
+
                     if cookie_file:
-                        ydl_opts["cookiefile"] = cookie_file
+                        ydl_opts['cookiefile'] = cookie_file
 
-                    def _download(opts=ydl_opts):
-                        with yt_dlp.YoutubeDL(opts) as ydl:
+                    def _download():
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             ydl.extract_info(url, download=True)
 
                     try:
-                        logger.info(f"[YouTube] download layer={layer['name']} format={fmt}")
                         await safe_execute_ytdlp(
-                            job_prefix=fmt_prefix,
-                            target_func=_download,
+                            job_prefix=att_prefix,
+                            coro_func=lambda: loop.run_in_executor(executor, _download),
                             timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                            max_attempts=1,
+                            max_attempts=1
                         )
-
-                        found_file = find_downloaded_media(fmt_prefix, min_mtime=download_started_at)
-                        if found_file:
-                            if validate_downloaded_video_height(found_file, max_height):
-                                return found_file
-                            logger.warning(f"[YouTube] rejecting output due to height/validation: {found_file}")
-
-                        cleanup_job_files(fmt_prefix)
                     except asyncio.CancelledError:
-                        cleanup_job_files(fmt_prefix)
+                        cleanup_job_files(att_prefix)
                         raise
                     except Exception as ex:
-                        logger.warning(
-                            f"[YouTube] download layer={layer['name']} format={fmt} failed: "
-                            f"{type(ex).__name__}: {ex}"
-                        )
-                        cleanup_job_files(fmt_prefix)
+                        cleanup_job_files(att_prefix)
+                        raise ex
+
+                    found_file = find_downloaded_media(att_prefix, min_mtime=download_started_at)
+                    if found_file:
+                        if validate_downloaded_video_height(found_file, max_height):
+                            return found_file
+                        else:
+                            logger.warning(f"Rejecting output file {found_file} due to height validation failure (> {max_height}p).")
+                            cleanup_job_files(att_prefix)
+                            raise DownloadError(f"Height validation failed for quality {param}", is_transient=False)
+
+                    cleanup_job_files(att_prefix)
+                    raise DownloadError("Download finished but no valid file found", is_transient=True)
+
+                try:
+                    res_file = await safe_execute_ytdlp(
+                        job_prefix=f"{job_prefix}_fmt",
+                        coro_func=_do_attempt,
+                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                        max_attempts=2
+                    )
+                    if res_file:
+                        return res_file
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.debug(f"Video download attempt failed for format {fmt}: {ex}")
 
             return None
         except asyncio.CancelledError:
@@ -1785,8 +1611,9 @@ async def download_media_video(url: str, param: str, job_prefix: str, slide: Opt
             raise
         except Exception as e:
             logger.exception(f"Unexpected download error in download_media_video for {job_prefix}: {e}")
-            cleanup_job_files(job_prefix)
             return None
+        finally:
+            cleanup_job_files(job_prefix)
 
 async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optional[str]:
     """Extracts MP3 audio track from source slide URL with safe execution, timeout protection & cleanup safety."""
@@ -1797,62 +1624,80 @@ async def download_media_audio(url: str, bitrate: str, job_prefix: str) -> Optio
         try:
             cleanup_job_files(job_prefix)
             download_started_at = time.time()
+
             cookie_file = setup_cookies_file()
+            loop = asyncio.get_running_loop()
+            attempt = 0
 
-            att_prefix = f"{job_prefix}_aud"
-            att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
+            async def _do_attempt():
+                nonlocal attempt
+                attempt += 1
+                att_prefix = f"{job_prefix}_a{attempt}"
+                att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
 
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': att_template,
-                'nocheckcertificate': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': bitrate if bitrate in ["128", "320"] else "128",
-                }],
-                'quiet': True,
-                'no_warnings': True,
-            }
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': att_template,
+                    'nocheckcertificate': True,
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': bitrate if bitrate in ["128", "320"] else "128",
+                    }],
+                    'quiet': True,
+                    'no_warnings': True,
+                }
 
-            if cookie_file:
-                ydl_opts['cookiefile'] = cookie_file
+                if cookie_file:
+                    ydl_opts['cookiefile'] = cookie_file
 
-            def _download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                def _download():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.extract_info(url, download=True)
+
+                try:
+                    await safe_execute_ytdlp(
+                        job_prefix=att_prefix,
+                        coro_func=lambda: loop.run_in_executor(executor, _download),
+                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                        max_attempts=1
+                    )
+                except asyncio.CancelledError:
+                    cleanup_job_files(att_prefix)
+                    raise
+                except Exception as ex:
+                    cleanup_job_files(att_prefix)
+                    raise ex
+
+                found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
+                if found_audio and os.path.exists(found_audio):
+                    meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
+                    if meta.get("duration", 0) > 0 and os.path.getsize(found_audio) > 0:
+                        return found_audio
+
+                cleanup_job_files(att_prefix)
+                raise DownloadError("Audio extraction produced invalid output", is_transient=True)
 
             try:
-                await safe_execute_ytdlp(
-                    job_prefix=att_prefix,
-                    target_func=_download,
+                return await safe_execute_ytdlp(
+                    job_prefix=f"{job_prefix}_aud",
+                    coro_func=_do_attempt,
                     timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
                     max_attempts=2
                 )
             except asyncio.CancelledError:
-                cleanup_job_files(att_prefix)
                 raise
             except Exception as ex:
                 logger.debug(f"Audio download attempt failed: {ex}")
-                cleanup_job_files(att_prefix)
                 return None
-
-            found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
-            if found_audio and os.path.exists(found_audio):
-                loop = asyncio.get_running_loop()
-                meta = await loop.run_in_executor(executor, lambda: sync_get_video_metadata(found_audio))
-                if meta.get("duration", 0) > 0 and os.path.getsize(found_audio) > 0:
-                    return found_audio
-
-            cleanup_job_files(att_prefix)
-            return None
         except asyncio.CancelledError:
             cleanup_job_files(job_prefix)
             raise
         except Exception as e:
             logger.exception(f"Error downloading audio for job {job_prefix}: {e}")
-            cleanup_job_files(job_prefix)
             return None
+        finally:
+            cleanup_job_files(job_prefix)
 
 async def search_and_download_full_track(track_title: str, artist_name: str, caption: str, job_prefix: str) -> Optional[Dict[str, Any]]:
     """Full track search & download pipeline with strict validation, safe yt-dlp execution & concurrency protection."""
@@ -1925,36 +1770,47 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
 
             for cand_idx, (score, cand) in enumerate(valid_candidates):
                 target_url = cand['webpage_url']
-                att_prefix = f"{job_prefix}_c{cand_idx}"
-                att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
+                attempt = 0
 
-                ydl_opts = {
-                    'format': 'bestaudio[ext=m4a]/bestaudio/best',
-                    'outtmpl': att_template,
-                    'nocheckcertificate': True,
-                    'ignoreerrors': True,
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '320',
-                    }],
-                    'quiet': True,
-                    'no_warnings': True,
-                }
-                if cookie_file:
-                    ydl_opts['cookiefile'] = cookie_file
+                async def _dl_cand_attempt():
+                    nonlocal attempt
+                    attempt += 1
+                    att_prefix = f"{job_prefix}_c{cand_idx}_a{attempt}"
+                    att_template = os.path.join(DOWNLOAD_DIR, f"{att_prefix}.%(ext)s")
 
-                def _dl():
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([target_url])
+                    ydl_opts = {
+                        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                        'outtmpl': att_template,
+                        'nocheckcertificate': True,
+                        'ignoreerrors': True,
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '320',
+                        }],
+                        'quiet': True,
+                        'no_warnings': True,
+                    }
+                    if cookie_file:
+                        ydl_opts['cookiefile'] = cookie_file
 
-                try:
-                    await safe_execute_ytdlp(
-                        job_prefix=att_prefix,
-                        target_func=_dl,
-                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
-                        max_attempts=2
-                    )
+                    def _dl():
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([target_url])
+
+                    try:
+                        await safe_execute_ytdlp(
+                            job_prefix=att_prefix,
+                            coro_func=lambda: loop.run_in_executor(executor, _dl),
+                            timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                            max_attempts=1
+                        )
+                    except asyncio.CancelledError:
+                        cleanup_job_files(att_prefix)
+                        raise
+                    except Exception as ex:
+                        cleanup_job_files(att_prefix)
+                        raise ex
 
                     found_audio = find_downloaded_audio(att_prefix, min_mtime=download_started_at)
                     if found_audio and os.path.exists(found_audio):
@@ -1973,12 +1829,21 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
                             }
 
                     cleanup_job_files(att_prefix)
+                    raise DownloadError("Candidate download produced invalid file", is_transient=True)
+
+                try:
+                    res = await safe_execute_ytdlp(
+                        job_prefix=f"{job_prefix}_cand_{cand_idx}",
+                        coro_func=_dl_cand_attempt,
+                        timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS,
+                        max_attempts=2
+                    )
+                    if res:
+                        return res
                 except asyncio.CancelledError:
-                    cleanup_job_files(att_prefix)
                     raise
                 except Exception as ex:
                     logger.debug(f"Candidate download failed for {target_url}: {ex}")
-                    cleanup_job_files(att_prefix)
 
             return None
         except asyncio.CancelledError:
@@ -1987,6 +1852,8 @@ async def search_and_download_full_track(track_title: str, artist_name: str, cap
         except Exception as e:
             logger.exception(f"Unexpected error in search_and_download_full_track for job {job_prefix}: {e}")
             return None
+        finally:
+            cleanup_job_files(job_prefix)
 
 # ---------------------------------------------------------------------------
 # TELEGRAM BOT HANDLERS & CALLBACKS
@@ -2330,41 +2197,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif action_type == "vid":
             status_msg = await query.message.reply_text("⏳ در حال دانلود و بهینه‌سازی ویدیو...")
-            try:
-                raw_path = await download_media_video(url, param, job_prefix, slide=slide)
-                if raw_path and os.path.exists(raw_path):
-                    prep_res = await prepare_telegram_video(raw_path, job_prefix)
-                    filepath = prep_res.get("filepath")
-                    thumb_path = prep_res.get("thumb_path")
+            raw_path = await download_media_video(url, param, job_prefix, slide=slide)
+            if raw_path and os.path.exists(raw_path):
+                prep_res = await prepare_telegram_video(raw_path, job_prefix)
+                filepath = prep_res.get("filepath")
+                thumb_path = prep_res.get("thumb_path")
 
-                    if not filepath or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-                        await status_msg.edit_text("❌ خطا در پردازش یا تبدیل فرمت ویدیو.")
-                        return
+                if not filepath or not os.path.exists(filepath):
+                    await status_msg.edit_text("❌ خطا در پردازش یا تبدیل فرمت ویدیو.")
+                    return
 
-                    if prep_res.get("filesize", 0) > 49.5 * 1024 * 1024:
-                        await status_msg.edit_text("❌ حجم ویدیو بیشتر از حد مجاز تلگرام (۵۰ مگابایت) است.")
-                        return
+                if prep_res.get("filesize", 0) > 49.5 * 1024 * 1024:
+                    await status_msg.edit_text("❌ حجم ویدیو بیشتر از حد مجاز تلگرام (۵۰ مگابایت) است.")
+                    return
 
-                    await status_msg.edit_text("⬆️ در حال آپلود ویدیو...")
-                    kwargs = {"supports_streaming": True, "caption": "✨ دانلود شده توسط ربات"}
-                    if prep_res.get("width"): kwargs["width"] = prep_res["width"]
-                    if prep_res.get("height"): kwargs["height"] = prep_res["height"]
-                    if prep_res.get("duration"): kwargs["duration"] = prep_res["duration"]
+                await status_msg.edit_text("⬆️ در حال آپلود ویدیو...")
+                kwargs = {"supports_streaming": True, "caption": "✨ دانلود شده توسط ربات"}
+                if prep_res.get("width"): kwargs["width"] = prep_res["width"]
+                if prep_res.get("height"): kwargs["height"] = prep_res["height"]
+                if prep_res.get("duration"): kwargs["duration"] = prep_res["duration"]
 
-                    if thumb_path and os.path.exists(thumb_path):
-                        with open(thumb_path, 'rb') as th, open(filepath, 'rb') as vf:
-                            kwargs["thumbnail"] = th
-                            await query.message.reply_video(video=vf, **kwargs)
-                    else:
-                        with open(filepath, 'rb') as vf:
-                            await query.message.reply_video(video=vf, **kwargs)
-
-                    await status_msg.delete()
+                if thumb_path and os.path.exists(thumb_path):
+                    with open(thumb_path, 'rb') as th, open(filepath, 'rb') as vf:
+                        kwargs["thumbnail"] = th
+                        await query.message.reply_video(video=vf, **kwargs)
                 else:
-                    await status_msg.edit_text("❌ کیفیت درخواستی موجود نیست یا زمان دانلود به پایان رسید.")
-            finally:
-                cleanup_job_files(job_prefix)
-                cleanup_job_files(f"prep_{job_prefix}")
+                    with open(filepath, 'rb') as vf:
+                        await query.message.reply_video(video=vf, **kwargs)
+
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ کیفیت درخواستی موجود نیست یا زمان دانلود به پایان رسید.")
 
         elif action_type == "aud":
             status_msg = await query.message.reply_text(f"⏳ در حال استخراج ویس ({param}kbps)...")
@@ -2397,77 +2260,168 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await status_msg.edit_text("❌ خطا در آماده‌سازی فایل برای شزام.")
 
         elif action_type == "fullm":
-            status_msg = await query.message.reply_text("🔎 در حال جستجو و دانلود آهنگ اصلی...")
-            try:
-                track_title = slide.get("track_title", "")
-                artist_name = slide.get("artist_name", "")
-                caption = slide.get("description", "") or slide.get("title", "")
-                full_res = await search_and_download_full_track(track_title, artist_name, caption, job_prefix)
-                if full_res and os.path.exists(full_res['filepath']):
-                    with open(full_res['filepath'], 'rb') as af:
-                        await query.message.reply_audio(
-                            audio=af,
-                            title=full_res['title'],
-                            performer=full_res['uploader'],
-                            caption=f"🎧 <b>{html_escape(full_res['uploader'])} - {html_escape(full_res['title'])}</b>\n⚡️ {html_escape(full_res.get('engine','Engine'))}",
-                            parse_mode=ParseMode.HTML
-                        )
-                    await status_msg.delete()
-                else:
-                    await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ پیدا نشد.")
-            except Exception as e:
-                logger.exception(f"Error in fullm callback: {e}")
-                if status_msg:
-                    await status_msg.edit_text("❌ خطا در دانلود آهنگ اصلی.")
+            status_msg = await query.message.reply_text("🟢 🔎 در حال آنالیز و جستجوی چندگانه موزیک اصلی...")
+            track_title = slide.get("track_title", "")
+            artist_name = slide.get("artist_name", "")
+            caption = slide.get("description", "")
 
-        elif action_type == "cap":
-            raw_caption = slide.get("description") or slide.get("title") or "کپشن ندارد."
-            safe_cap = html_escape(raw_caption)
-            try:
-                await query.message.reply_text(f"<b>📜 کپشن کامل:</b>\n\n{safe_cap}", parse_mode=ParseMode.HTML)
-            except Exception as e:
-                logger.warning(f"Failed sending caption text: {e}")
+            res = await search_and_download_full_track(track_title, artist_name, caption, job_prefix)
+            if res and os.path.exists(res['filepath']):
+                eng = html_escape(res.get('engine', 'Multi-Engine'))
+                caption_audio = f"🎧 <b>{html_escape(res['uploader'])} - {html_escape(res['title'])}</b>\n⚡️ موتور: {eng}"
+                with open(res['filepath'], 'rb') as af:
+                    await query.message.reply_audio(audio=af, title=res['title'], performer=res['uploader'], caption=caption_audio, parse_mode=ParseMode.HTML)
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ مطابق مشخصات یافت نشد.")
 
         elif action_type == "img":
-            thumbnail = slide.get("thumbnail")
-            if thumbnail:
-                try:
-                    await query.message.reply_photo(photo=thumbnail, caption="🖼 کاور اصلی پست")
-                except Exception as e:
-                    logger.warning(f"Failed sending thumbnail image: {e}")
+            thumb = slide.get("thumbnail")
+            if thumb:
+                await query.message.reply_photo(photo=thumb, caption="🖼 کاور اصلی")
             else:
-                try:
-                    await query.message.reply_text("❌ کاور اصلی یافت نشد.")
-                except Exception as e:
-                    pass
+                await query.message.reply_text("❌ کاور برای این اسلاید موجود نیست.")
 
+        elif action_type == "cap":
+            full_cap = slide.get("description") or slide.get("title") or "بدون کپشن"
+            await query.message.reply_text(f"📜 <b>کپشن کامل:</b>\n\n{html_escape(full_cap)}", parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.exception(f"Unhandled exception in handle_callback_query: {e}")
+        logger.exception(f"Exception in handle_callback_query for action {action_type}: {e}")
         if status_msg:
             try:
-                await status_msg.edit_text("❌ خطا در پردازش درخواست.")
+                await status_msg.edit_text("❌ در اجرای درخواست شما خطایی رخ داد. لطفاً دوباره تلاش کنید.")
             except Exception:
                 pass
+    finally:
+        cleanup_job_files(job_prefix)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler for the bot application."""
-    logger.error(f"Update {update} caused error {context.error}")
+async def handle_direct_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles directly sent voice or audio messages for Shazam identification & candidate search safely."""
+    msg = update.message
+    file_obj = msg.audio or msg.voice
+    if not file_obj:
+        return
+
+    job_prefix = f"job_dir_aud_{uuid.uuid4().hex[:6]}"
+    temp_path = os.path.join(DOWNLOAD_DIR, f"{job_prefix}.mp3")
+    status_msg = None
+
+    try:
+        status_msg = await msg.reply_text("🔍 🎧 در حال دریافت و آنالیز ویس با شزام...")
+        tg_file = await file_obj.get_file()
+        await tg_file.download_to_drive(temp_path)
+
+        shz_res = await recognize_audio_shazam(temp_path, job_prefix)
+        if shz_res:
+            s_t, s_a = shz_res['title'], shz_res['artist']
+            await status_msg.edit_text(f"🎯 <b>شناسایی شد:</b> {html_escape(s_a)} - {html_escape(s_t)}\n🟢 در حال آنالیز و دانلود نسخه مطمئن...", parse_mode=ParseMode.HTML)
+            full_res = await search_and_download_full_track(s_t, s_a, f"{s_t} {s_a}", f"full_{job_prefix}")
+            if full_res and os.path.exists(full_res['filepath']):
+                with open(full_res['filepath'], 'rb') as af:
+                    await msg.reply_audio(audio=af, title=full_res['title'], performer=full_res['uploader'], caption=f"🎧 <b>{html_escape(full_res['uploader'])} - {html_escape(full_res['title'])}</b>\n⚡️ {html_escape(full_res.get('engine','Engine'))}", parse_mode=ParseMode.HTML)
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ نسخه مطمئن و موثقی از آهنگ پیدا نشد.")
+        else:
+            await status_msg.edit_text("❌ متأسفانه این آهنگ در شزام پیدا نشد.")
+    except Exception as ex:
+        logger.exception(f"Direct audio handler error: {ex}")
+        if status_msg:
+            try:
+                await status_msg.edit_text("❌ خطا در پردازش فایل صوتی.")
+            except Exception:
+                pass
+    finally:
+        cleanup_job_files(job_prefix)
+
+async def handle_direct_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles directly sent video messages and provides video utilities."""
+    msg = update.message
+    video_obj = msg.video or msg.video_note or msg.document
+    if not video_obj:
+        return
+
+    try:
+        cache_id = f"vfile_{uuid.uuid4().hex[:8]}"
+        MEDIA_CACHE[cache_id] = {
+            "file_id": video_obj.file_id,
+            "timestamp": time.time()
+        }
+
+        keyboard = [
+            [
+                InlineKeyboardButton("🎵 استخراج صوتی MP3 320", callback_data=f"vopt:extract_audio:{cache_id}"),
+                InlineKeyboardButton("🔍 تشخیص با شزام", callback_data=f"vopt:shazam:{cache_id}")
+            ],
+            [
+                InlineKeyboardButton("🎧 دانلود کامل آهنگ 320", callback_data=f"vopt:full_music:{cache_id}")
+            ]
+        ]
+
+        await msg.reply_text(
+            "🎬 <b>ویدیو دریافت شد!</b>\nیکی از گزینه‌های زیر را انتخاب کنید:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as ex:
+        logger.exception(f"Direct video message handler error: {ex}")
+
+async def global_telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global Telegram error handler to prevent unhandled exceptions from crashing the bot."""
+    err = context.error
+    if not err:
+        return
+
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning(f"Telegram network transient error caught: {err}")
+    elif isinstance(err, BadRequest):
+        logger.warning(f"Telegram BadRequest error caught: {err}")
+    elif isinstance(err, TelegramError):
+        logger.error(f"Telegram API exception caught: {err}", exc_info=err)
+    elif isinstance(err, asyncio.TimeoutError):
+        logger.warning(f"Asyncio TimeoutError caught in Telegram handler: {err}")
+    else:
+        logger.error(f"Unhandled exception caught in global Telegram handler: {err}", exc_info=err)
+
+async def post_init(application: Application):
+    """Cleans up active webhooks and drops old updates on startup."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Cleared webhook and pending updates successfully.")
+    except Exception as ex:
+        logger.warning(f"Error dropping pending updates: {ex}")
+
+# ---------------------------------------------------------------------------
+# MAIN EXECUTION ENTRYPOINT
+# ---------------------------------------------------------------------------
 
 def main():
+    """Starts Telegram Bot application."""
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set in environment variables! Exiting...")
+        logger.error("BOT_TOKEN environment variable is required.")
         sys.exit(1)
 
     check_ffmpeg_installed()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(180)
+        .write_timeout(180)
+        .connect_timeout(60)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_error_handler(global_telegram_error_handler)
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_link))
-    app.add_error_handler(error_handler)
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_direct_audio_message))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO, handle_direct_video_message))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    logger.info("Bot started successfully. Listening for updates...")
+    logger.info("Bot started polling with Timeout & Retry Safety PATCH...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
