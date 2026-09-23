@@ -1,9 +1,11 @@
 """
-ربات تلگرام دانلود اینستاگرام
-------------------------------
-کاربر لینک پست/ریلز/استوری اینستاگرام رو می‌فرسته، ربات کیفیت‌های
-موجود رو به صورت دکمه نشون می‌ده. کاربر یا یه کیفیت ویدیو انتخاب
-می‌کنه یا گزینه‌ی "فقط صدا" رو می‌زنه که صدا جدا استخراج و ارسال میشه.
+ربات تلگرام دانلود اینستاگرام + یوتیوب
+----------------------------------------
+کاربر لینک پست/ریلز/استوری اینستاگرام یا ویدیو/شورتز یوتیوب رو می‌فرسته،
+ربات کیفیت‌های موجود رو به صورت دکمه (با حجم دقیق) نشون می‌ده. کاربر یا
+یه کیفیت ویدیو انتخاب می‌کنه یا گزینه‌ی "فقط صدا" رو می‌زنه که صدا جدا
+استخراج و ارسال میشه. حین دانلود، یه نوار پیشرفت زنده (درصد + حجم
+دانلودشده/کل) نمایش داده می‌شه.
 
 نیازمندی‌ها (requirements.txt):
     python-telegram-bot==21.*
@@ -21,14 +23,15 @@
     - سرور رسمی تلگرام برای بات‌ها آپلود فایل رو تا ۵۰ مگابایت اجازه میده.
       برای فایل‌های بزرگ‌تر باید از Local Bot API Server استفاده کنید
       (خودتون سرور تلگرام رو لوکال اجرا کنید) که سقف تا ۲ گیگابایت میشه.
-    - دانلود از پست‌های خصوصی اینستاگرام بدون لاگین ممکن نیست. اگر لازم
-      شد، فایل کوکی اینستاگرام (cookies.txt) رو به yt-dlp بدید
-      (پایین‌تر توضیح داده شده).
+    - دانلود از پست‌های خصوصی اینستاگرام یا ویدیوهای محدود یوتیوب بدون
+      لاگین ممکن نیست. اگر لازم شد، فایل کوکی (cookies.txt) رو به
+      yt-dlp بدید (پایین‌تر توضیح داده شده).
     - این ابزار فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده
-      دارید به کار ببرید؛ رعایت قوانین اینستاگرام و کپی‌رایت به عهده‌ی
+      دارید به کار ببرید؛ رعایت قوانین پلتفرم‌ها و کپی‌رایت به عهده‌ی
       خودتونه.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -42,7 +45,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,11 +60,13 @@ from telegram.ext import (
 # ------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
 
-# اگر پست‌های خصوصی/محدود دارید، مسیر فایل کوکی اینستاگرام رو اینجا بدید
+# اگر پست‌های خصوصی/محدود دارید، مسیر فایل کوکی رو اینجا بدید
 # (با اکستنشن‌هایی مثل "Get cookies.txt" از مرورگر خودتون export بگیرید)
 COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE", "")  # مثلا "cookies.txt"
 
 MAX_TELEGRAM_UPLOAD_MB = 50  # محدودیت سرور رسمی بات تلگرام
+PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه، فاصله‌ی به‌روزرسانی نوار پیشرفت
+PROGRESS_BAR_LENGTH = 18  # تعداد بلوک‌های نوار پیشرفت
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -71,6 +76,13 @@ logger = logging.getLogger(__name__)
 
 INSTAGRAM_URL_RE = re.compile(
     r"(https?://)?(www\.)?instagram\.com/(p|reel|reels|stories|tv)/[\w\-/.]+"
+)
+YOUTUBE_URL_RE = re.compile(
+    r"(https?://)?(www\.|m\.)?youtube\.com/(watch\?v=|shorts/|embed/|live/)[\w\-]+[\w\-?&=%.]*"
+    r"|(https?://)?youtu\.be/[\w\-]+[\w\-?&=%.]*"
+)
+SUPPORTED_URL_RE = re.compile(
+    f"({INSTAGRAM_URL_RE.pattern})|({YOUTUBE_URL_RE.pattern})"
 )
 
 # نگهداری موقت اطلاعات هر لینک تا زمانی که کاربر کیفیت رو انتخاب کنه
@@ -109,6 +121,90 @@ def format_size(num_bytes) -> str:
         return f"{mb:.1f}MB"
     kb = num_bytes / 1024
     return f"{kb:.0f}KB"
+
+
+def make_progress_bar(percent: float, length: int = PROGRESS_BAR_LENGTH) -> str:
+    """یه نوار پیشرفت متنی می‌سازه: [▓▓▓▓░░░░] """
+    percent = max(0, min(100, percent))
+    filled = int(length * percent / 100)
+    return "▓" * filled + "░" * (length - filled)
+
+
+class ProgressState:
+    """وضعیت زنده‌ی دانلود که بین ترد دانلود و تسک آپدیت پیام مشترکه."""
+
+    def __init__(self):
+        self.status = "starting"  # starting | downloading | processing | done | error
+        self.downloaded = 0
+        self.total = 0
+        self.percent = 0.0
+        self.speed = 0
+        self.eta = 0
+
+    def render(self) -> str:
+        if self.status == "processing":
+            return "⚙️ در حال پردازش نهایی (تبدیل/ترکیب فایل)..."
+        bar = make_progress_bar(self.percent)
+        downloaded_txt = format_size(self.downloaded) or "0KB"
+        total_txt = format_size(self.total) if self.total else "؟"
+        line2 = f"{downloaded_txt} / {total_txt}"
+        if self.speed:
+            line2 += f"  •  {format_size(self.speed)}/s"
+        if self.eta:
+            line2 += f"  •  {int(self.eta)}s مونده"
+        return f"⬇️ در حال دانلود...\n[{bar}] {self.percent:.0f}%\n{line2}"
+
+
+def make_progress_hook(state: ProgressState):
+    """هوک yt-dlp که توی ترد دانلود صدا زده می‌شه و state رو آپدیت می‌کنه."""
+
+    def hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes") or 0
+            state.status = "downloading"
+            state.total = total
+            state.downloaded = downloaded
+            state.percent = (downloaded / total * 100) if total else 0
+            state.speed = d.get("speed") or 0
+            state.eta = d.get("eta") or 0
+        elif d.get("status") == "finished":
+            # این فرمت تموم شد؛ اگه merge/convert لازم باشه بعدش میاد
+            state.percent = 100
+            state.status = "processing"
+
+    return hook
+
+
+async def set_status(query, text: str):
+    """چه پیام اصلی عکس (تامبنیل) باشه چه متن ساده، وضعیت رو به‌روز می‌کنه."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=text)
+        else:
+            await query.edit_message_text(text)
+    except BadRequest as e:
+        # "Message is not modified" وقتی متن عوض نشده - بی‌خطره، نادیده بگیر
+        if "not modified" not in str(e).lower():
+            logger.warning("set_status failed: %s", e)
+    except Exception:
+        logger.exception("set_status unexpected failure")
+
+
+async def run_progress_updates(query, state: ProgressState, stop_event: asyncio.Event):
+    """هر چند ثانیه یک‌بار پیام رو با وضعیت جدید آپدیت می‌کنه تا دانلود تموم بشه."""
+    last_shown = -100
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=PROGRESS_UPDATE_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        if state.status == "downloading" and abs(state.percent - last_shown) < 4:
+            continue  # تغییر خیلی کمه، از ادیت اضافه صرف‌نظر کن (جلوگیری از فلود)
+        last_shown = state.percent
+        await set_status(query, state.render())
 
 
 def best_audio_format(formats):
@@ -179,14 +275,16 @@ def pick_quality_options(info: dict):
     return options
 
 
-def download_media(url: str, format_id: str, kind: str, out_dir: str) -> str:
+def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_state=None) -> str:
     """دانلود ویدیو با فرمت انتخابی یا استخراج فقط صدا. مسیر فایل نهایی رو برمی‌گردونه."""
     out_tmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
+    hooks = [make_progress_hook(progress_state)] if progress_state is not None else []
 
     if kind == "audio":
         opts = build_ydl_opts(
             format="bestaudio/best",
             outtmpl=out_tmpl,
+            progress_hooks=hooks,
             postprocessors=[
                 {
                     "key": "FFmpegExtractAudio",
@@ -201,6 +299,7 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str) -> str:
             format=fmt,
             outtmpl=out_tmpl,
             merge_output_format="mp4",
+            progress_hooks=hooks,
         )
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -222,18 +321,20 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str) -> str:
 # ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! لینک پست، ریلز یا استوری اینستاگرام رو برام بفرست 🙂\n"
-        "بعدش کیفیت مورد نظرت رو از بین دکمه‌ها انتخاب کن، یا اگه فقط"
-        " آهنگش رو می‌خوای، گزینه‌ی «فقط صدا» رو بزن."
+        "سلام! لینک پست/ریلز/استوری اینستاگرام یا ویدیو/شورتز یوتیوب رو"
+        " برام بفرست 🙂\nبعدش کیفیت مورد نظرت رو از بین دکمه‌ها انتخاب کن"
+        " (با حجم دقیق هر کدوم)، یا اگه فقط آهنگش رو می‌خوای، گزینه‌ی"
+        " «فقط صدا» رو بزن."
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    match = INSTAGRAM_URL_RE.search(text)
+    match = SUPPORTED_URL_RE.search(text)
     if not match:
         await update.message.reply_text(
-            "این یه لینک معتبر اینستاگرام نیست. لطفاً لینک پست/ریلز/استوری رو بفرست."
+            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام یا"
+            " ویدیو/شورتز یوتیوب رو بفرست."
         )
         return
 
@@ -292,18 +393,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def set_status(query, text: str):
-    """چه پیام اصلی عکس باشه چه متن، وضعیت رو به‌روز می‌کنه."""
-    try:
-        if query.message.photo:
-            await query.edit_message_caption(caption=text)
-        else:
-            await query.edit_message_text(text)
-    except Exception:
-        # اگه ادیت ممکن نبود (مثلا پیام خیلی قدیمی شده)، یه پیام جدید بفرست
-        await query.message.reply_text(text)
-
-
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -320,11 +409,22 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     url = entry["url"]
-    await set_status(query, "⬇️ در حال دانلود... (بسته به حجم فایل ممکنه کمی طول بکشه)")
+    state = ProgressState()
+    await set_status(query, "⏳ در حال آماده‌سازی دانلود...")
 
-    tmp_dir = tempfile.mkdtemp(prefix="insta_dl_")
+    tmp_dir = tempfile.mkdtemp(prefix="dl_")
+    stop_event = asyncio.Event()
+    progress_task = asyncio.create_task(run_progress_updates(query, state, stop_event))
+
     try:
-        file_path = download_media(url, format_id, kind, tmp_dir)
+        try:
+            file_path = await asyncio.to_thread(
+                download_media, url, format_id, kind, tmp_dir, state
+            )
+        finally:
+            stop_event.set()
+            await progress_task
+
         size_mb = os.path.getsize(file_path) / 1024 / 1024
 
         if size_mb > MAX_TELEGRAM_UPLOAD_MB:
@@ -336,6 +436,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+        await set_status(query, "📤 در حال ارسال فایل...")
         chat_id = query.message.chat_id
         with open(file_path, "rb") as f:
             if kind == "audio":
@@ -346,6 +447,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         await set_status(query, "✅ ارسال شد!")
     except Exception as e:
         logger.exception("download/send failed")
+        stop_event.set()
         await set_status(query, "❌ دانلود یا ارسال فایل با خطا مواجه شد:\n" + str(e)[:300])
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
