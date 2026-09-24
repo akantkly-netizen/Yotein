@@ -35,6 +35,7 @@
 import asyncio
 import base64
 import logging
+import math
 import os
 import re
 import subprocess
@@ -137,6 +138,11 @@ PENDING = {}
 # مجموعه‌ی chat_id هایی که منتظر فرستادن اسم آهنگ هستن (بعد از زدن دکمه‌ی جستجو)
 WAITING_MUSIC_QUERY = set()
 
+# نگهداری موقت نتایج جستجوی موزیک برای صفحه‌بندی
+# key: کد کوتاه (chat_id_msgid) -> {"entries": [...], "query": "..."}
+MUSIC_SESSIONS = {}
+MUSIC_PAGE_SIZE = 10
+
 
 # ------------------------------------------------------------------
 # توابع کمکی yt-dlp
@@ -198,35 +204,112 @@ def extract_info(url: str) -> dict:
     return _run_with_cookie_fallback(_extract_info_impl, url)
 
 
-def search_music(query: str, limit: int = 5):
+def search_music(query: str, limit: int = 8):
     """
-    توی یوتیوب دنبال آهنگ می‌گرده (چون yt-dlp مستقیم به یوتیوب/گوگل
-    دسترسی داره) و ترجیحاً نسخه‌ی "Official Audio/Video" رو انتخاب
-    می‌کنه. یه dict اطلاعات (بدون فرمت‌های کامل) برمی‌گردونه یا None.
+    اول تو یوتیوب‌میوزیک می‌گرده (کاتالوگ رسمی گوگل)، اگه چیزی پیدا نشد
+    (مثلاً برای خیلی از آهنگ‌های فارسی) به یوتیوب عادی فال‌بک می‌کنه.
+    امتیازدهی طوریه که نسخه‌ی رسمی/آفیشیال رو در اولویت می‌ذاره و
+    ریمیکس/کاور/لایو/اسپیدآپ رو عقب می‌زنه مگه خود متن جستجو دنبال
+    اونا باشه.
     """
-    search_query = f"ytsearch{limit}:{query} official audio"
-    with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
-        result = ydl.extract_info(search_query, download=False)
+    entries = []
+    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:"):
+        try:
+            with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
+                result = ydl.extract_info(prefix + query, download=False)
+            entries = [e for e in (result.get("entries") or []) if e]
+            if entries:
+                break
+        except Exception:
+            logger.exception("search_music failed for prefix %s", prefix)
 
-    entries = [e for e in (result.get("entries") or []) if e]
     if not entries:
         return None
+
+    query_lower = query.lower()
+    wants_variant = any(w in query_lower for w in ("remix", "cover", "live", "ریمیکس", "کاور"))
 
     def score(entry):
         title = (entry.get("title") or "").lower()
         s = 0
         if "official audio" in title:
+            s += 4
+        elif "official music video" in title or "official video" in title:
             s += 3
-        elif "official video" in title or "official music video" in title:
-            s += 2
         elif "official" in title:
             s += 1
         if "lyric" in title:
             s += 1
+        if not wants_variant:
+            for bad in (
+                "remix", "cover", "ریمیکس", "کاور", "live", "sped up",
+                "slowed", "nightcore", "8d audio", "karaoke", "instrumental", "reaction",
+            ):
+                if bad in title:
+                    s -= 4
         return s
 
     best = max(entries, key=score)
     return best
+
+
+def search_music_list(query: str, limit: int = 50):
+    """
+    برای جستجوی موزیک با لیست کامل: اول تو یوتیوب‌میوزیک (که کاتالوگ
+    رسمی گوگل/یوتیوب‌میوزیکه، بدون کاور و ریمیکس‌های الکی) می‌گرده؛
+    اگه چیزی پیدا نشد، به جستجوی عادی یوتیوب فال‌بک می‌کنه. برای یه
+    اسم خواننده، معمولاً همه‌ی آهنگ‌های شناخته‌شده‌اش برمی‌گرده.
+    """
+    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:"):
+        try:
+            with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
+                result = ydl.extract_info(prefix + query, download=False)
+            entries = [e for e in (result.get("entries") or []) if e]
+            if entries:
+                return entries
+        except Exception:
+            logger.exception("search_music_list failed for prefix %s", prefix)
+    return []
+
+
+def format_music_entry_label(entry: dict, number: int) -> str:
+    title = entry.get("title") or "بدون‌نام"
+    artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
+    duration = entry.get("duration")
+    dur_txt = ""
+    if duration:
+        m, s = divmod(int(duration), 60)
+        dur_txt = f" ({m}:{s:02d})"
+    label = f"{number}. {title}"
+    if artist and artist.lower() not in title.lower():
+        label += f" - {artist}"
+    label += dur_txt
+    if len(label) > 64:
+        label = label[:61] + "…"
+    return label
+
+
+def build_music_page(key: str, entries: list, page: int):
+    """صفحه‌ی مشخصی از نتایج (۱۰تا-۱۰تا) رو با دکمه‌ها می‌سازه."""
+    start = page * MUSIC_PAGE_SIZE
+    page_entries = entries[start:start + MUSIC_PAGE_SIZE]
+    total_pages = max(1, math.ceil(len(entries) / MUSIC_PAGE_SIZE))
+
+    buttons = []
+    for i, e in enumerate(page_entries):
+        idx = start + i
+        label = format_music_entry_label(e, idx + 1)
+        buttons.append([InlineKeyboardButton(label, callback_data=f"mpick|{key}|{idx}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"mpage|{key}|{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("▶️ صفحه بعد", callback_data=f"mpage|{key}|{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    return InlineKeyboardMarkup(buttons), total_pages
 
 
 def extract_track_from_metadata(info: dict):
@@ -541,29 +624,57 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_s
 # ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام! لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب یا"
-        " ویدیوی تیک‌تاک رو"
-        " برام بفرست 🙂\nبعدش کیفیت مورد نظرت رو از بین دکمه‌ها انتخاب کن"
-        " (با حجم دقیق هر کدوم)، یا اگه فقط آهنگش رو می‌خوای، گزینه‌ی"
-        " «فقط صدا» رو بزن.",
+        "درود به روی ماهت 🧘🏾🌚\n"
+        "من ربات دانلودرم 🧸\n\n"
+        "با من می‌تونی ویدئو ها، موزیک ها و پست های هر پلتفرمی رو که"
+        " بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
+        "و همچنین میتونی موزیک پست و ویدئو دلخواهت رو با استفاده از من"
+        " پیدا و دانلود کنی 🧘🏾🎧\n\n"
+        "کافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸",
         reply_markup=MAIN_KEYBOARD,
     )
 
 
 async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 راهنمای استفاده:\n\n"
-        "۱. لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب یا"
-        " ویدیوی تیک‌تاک"
-        " رو بفرست\n"
-        "۲. تامبنیل و توضیحات محتوا نشون داده می‌شه\n"
-        "۳. از بین دکمه‌های کیفیت (هرکدوم با حجم دقیق) یکی رو انتخاب کن\n"
-        "۴. اگه فقط صدا می‌خوای، دکمه‌ی «🎵 فقط صدا» رو بزن\n"
-        "۵. یه نوار پیشرفت زنده می‌بینی تا دانلود و ارسال تموم بشه\n\n"
-        f"🎵 با دکمه‌ی «{BTN_MUSIC}» هم می‌تونی فقط اسم یه آهنگ رو بفرستی؛"
-        " نسخه‌ی رسمیش رو پیدا می‌کنم و برات می‌فرستم.\n\n"
-        "نکته: پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل"
-        " دانلود نیستن.",
+        "📖 راهنمای کامل ربات\n\n"
+        "🔗 دانلود از لینک (اینستاگرام / یوتیوب / تیک‌تاک)\n"
+        "۱. لینک پست، ریلز، استوری اینستاگرام، ویدیو یا شورتز یوتیوب،"
+        " یا ویدیوی تیک‌تاک رو برام بفرست\n"
+        "۲. تامبنیل و توضیحات محتوا رو نشونت می‌دم\n"
+        "۳. زیرش چند دکمه‌ی کیفیت می‌بینی، هرکدوم با حجم دقیق فایل"
+        " (مثلاً «1080p - 24.3MB»)؛ هرکدوم رو بخوای انتخاب کن\n"
+        "۴. اگه فقط صدای ویدیو رو می‌خوای (نه خود ویدیو)، دکمه‌ی"
+        " «🎵 فقط صدا» رو بزن\n"
+        "۵. حین دانلود یه نوار پیشرفت زنده می‌بینی (درصد، حجم دانلودشده"
+        " از کل، سرعت)؛ در آخر فایل برات ارسال می‌شه\n\n"
+        f"🎵 جستجوی موزیک (دکمه‌ی «{BTN_MUSIC}»)\n"
+        "۱. روی دکمه بزن و اسم آهنگ یا فقط اسم خواننده رو بفرست\n"
+        "۲. اگه اسم خواننده بفرستی، همه‌ی آهنگ‌های شناخته‌شده‌اش رو"
+        " پیدا می‌کنم؛ نتیجه‌ها ۱۰تا-۱۰تا صفحه‌بندی شدن و با دکمه‌های"
+        " «◀️ صفحه قبل» و «▶️ صفحه بعد» می‌تونی بین صفحه‌ها بری\n"
+        "۳. روی اسم هر آهنگ که بزنی، همون دکمه‌های کیفیت/فقط‌صدای بالا"
+        " براش میاد تا انتخاب کنی\n"
+        "۴. جستجو اول تو یوتیوب‌میوزیک می‌گرده (کاتالوگ رسمی) و اگه چیزی"
+        " پیدا نشد (مثلاً خیلی از آهنگ‌های فارسی) خودکار به یوتیوب عادی"
+        " هم سر می‌زنه\n\n"
+        "🎧 پیدا کردن آهنگ اصلی یه ویدیو\n"
+        "زیر دکمه‌های کیفیت هر ویدیو، یه دکمه‌ی «🎵 پیدا کردن آهنگ اصلی"
+        " ویدیو» هم هست. با زدنش:\n"
+        "۱. اول چک می‌کنم خود پلتفرم (بیشتر تیک‌تاک) اسم آهنگ رو تو"
+        " متادیتاش داده یا نه\n"
+        "۲. اگه نداشت، یه تیکه از صدای خود ویدیو رو می‌گیرم و با سرویس"
+        " تشخیص آهنگ شناساییش می‌کنم\n"
+        "۳. بعد از پیدا کردن نسخه‌ی رسمی، خودم هم ویدیو هم نسخه‌ی صوتیش"
+        " رو با اسم درست و تمیز آهنگ برات می‌فرستم (نیازی به انتخاب"
+        " دستی نیست)\n"
+        "۴. اگه پیدا نشد، لااقل اسم خواننده رو (اگه شناسایی شده باشه)"
+        " بهت می‌گم تا خودت دستی جستجو کنی\n\n"
+        "⚠️ نکات مهم\n"
+        "• پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل دانلود"
+        " نیستن\n"
+        "• فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده دارید"
+        " ازم استفاده کنید؛ مسئولیت رعایت کپی‌رایت با کاربره",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -590,34 +701,93 @@ async def music_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
     if not query_text:
-        await update.message.reply_text("یه اسم آهنگ بفرست تا جستجو کنم.")
+        await update.message.reply_text("یه اسم آهنگ یا خواننده بفرست تا جستجو کنم.")
         return
 
     status_msg = await update.message.reply_text(f"🔎 دارم دنبال «{query_text}» می‌گردم...")
     chat_id = update.effective_chat.id
-    await resolve_music_query_and_show(update.message, chat_id, query_text, status_msg)
 
-
-async def resolve_music_query_and_show(message, chat_id: int, query_text: str, status_msg):
-    """جستجوی یوتیوب برای یه عبارت (اسم آهنگ) و نمایش نتیجه با show_quality_picker."""
     try:
-        best = await asyncio.to_thread(search_music, query_text)
+        entries = await asyncio.to_thread(search_music_list, query_text)
     except Exception as e:
-        logger.exception("search_music failed")
+        logger.exception("search_music_list failed")
         await status_msg.edit_text("❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
         return
 
-    if not best:
+    if not entries:
         await status_msg.edit_text(
-            "چیزی برای این آهنگ پیدا نکردم. اسم دقیق‌تر یا اسم خواننده رو هم اضافه کن."
+            "چیزی پیدا نکردم. اسم دقیق‌تر یا اسم درست خواننده رو امتحان کن."
         )
         return
 
-    video_url = best.get("url") or best.get("webpage_url") or best.get("id")
-    if best.get("id") and not str(video_url).startswith("http"):
-        video_url = f"https://www.youtube.com/watch?v={best['id']}"
+    key = f"{chat_id}_{status_msg.message_id}"
+    MUSIC_SESSIONS[key] = {"entries": entries, "query": query_text}
 
-    await show_quality_picker(message, chat_id, video_url, status_msg, offer_find_song=False)
+    markup, total_pages = build_music_page(key, entries, 0)
+    text = (
+        f"🎵 نتایج برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
+        "یکی رو انتخاب کن:"
+    )
+    await status_msg.edit_text(text, reply_markup=markup)
+
+
+async def handle_music_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر دکمه‌ی صفحه‌ی بعد/قبل رو زده."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, key, page_str = query.data.split("|", 2)
+        page = int(page_str)
+    except ValueError:
+        return
+
+    session = MUSIC_SESSIONS.get(key)
+    if not session:
+        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        return
+
+    entries = session["entries"]
+    markup, total_pages = build_music_page(key, entries, page)
+    text = (
+        f"🎵 نتایج برای «{session['query']}» ({len(entries)} مورد) — صفحه {page + 1} از {total_pages}:\n"
+        "یکی رو انتخاب کن:"
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("music page edit failed: %s", e)
+
+
+async def handle_music_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر یکی از آهنگ‌های لیست رو انتخاب کرده."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, key, idx_str = query.data.split("|", 2)
+        idx = int(idx_str)
+    except ValueError:
+        return
+
+    session = MUSIC_SESSIONS.get(key)
+    if not session:
+        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        return
+
+    entries = session["entries"]
+    if idx < 0 or idx >= len(entries):
+        return
+
+    entry = entries[idx]
+    video_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
+    if entry.get("id") and not str(video_url).startswith("http"):
+        video_url = f"https://www.youtube.com/watch?v={entry['id']}"
+
+    chat_id = query.message.chat_id
+    status_msg = await query.message.reply_text("⏳ در حال گرفتن اطلاعات...")
+    await show_quality_picker(query.message, chat_id, video_url, status_msg, offer_find_song=False)
 
 
 async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, offer_find_song: bool = True):
@@ -776,6 +946,61 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         PENDING.pop(key, None)
 
 
+async def deliver_song(query, context, chat_id: int, url: str, title: str, artist: str = None):
+    """
+    برای فیچر «پیدا کردن آهنگ اصلی»: خودکار هم ویدیو هم نسخه‌ی صوتی رو
+    دانلود و می‌فرسته، و نسخه‌ی صوتی رو با اسم درست و تمیز آهنگ (نه
+    اسم خام فایل یوتیوب) تگ‌گذاری می‌کنه تا تو تلگرام درست نشون داده بشه.
+    """
+    label = f"{title} - {artist}" if artist else title
+    tmp_dir = tempfile.mkdtemp(prefix="song_dl_")
+    try:
+        # --- ویدیو ---
+        state = ProgressState()
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(run_progress_updates(query, state, stop_event))
+        try:
+            video_path = await asyncio.to_thread(download_media, url, "best", "video", tmp_dir, state)
+        finally:
+            stop_event.set()
+            await progress_task
+
+        video_size_mb = os.path.getsize(video_path) / 1024 / 1024
+        if video_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
+            with open(video_path, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=chat_id, video=f, supports_streaming=True, caption=f"🎬 {label}"
+                )
+        else:
+            await query.message.reply_text(
+                f"⚠️ حجم ویدیو {video_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
+            )
+
+        # --- نسخه‌ی صوتی ---
+        await set_status(query, f"⬇️ در حال دانلود نسخه‌ی صوتی «{label}»...")
+        audio_path = await asyncio.to_thread(download_media, url, "bestaudio", "audio", tmp_dir)
+        audio_size_mb = os.path.getsize(audio_path) / 1024 / 1024
+        if audio_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
+            with open(audio_path, "rb") as f:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=f,
+                    title=title,
+                    performer=artist or None,
+                )
+        else:
+            await query.message.reply_text(
+                f"⚠️ حجم فایل صوتی {audio_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
+            )
+
+        await set_status(query, f"✅ «{label}» ارسال شد!")
+    except Exception as e:
+        logger.exception("deliver_song failed")
+        await set_status(query, "❌ ارسال آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """کاربر دکمه‌ی «پیدا کردن آهنگ اصلی ویدیو» رو زده."""
     query = update.callback_query
@@ -799,29 +1024,29 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # حالت ۱: خود پلتفرم اسم آهنگ رو تو متادیتا داده بود (مثلاً تیک‌تاک)
     if known_track:
         title, artist = known_track
-        label = f"{title} - {artist}" if artist else title
-        await set_status(query, f"🎵 آهنگ اصلی این ویدیو: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی...")
-        query_text = label
-        status_msg = await query.message.reply_text("⏳ در حال جستجو...")
-        await resolve_music_query_and_show(query.message, chat_id, query_text, status_msg)
-        return
+    else:
+        # حالت ۲: متادیتا نداشتیم -> باید از روی خود صدای ویدیو تشخیص بدیم
+        if not AUDD_API_KEY:
+            await set_status(
+                query,
+                "ℹ️ این ویدیو اسم آهنگ رو تو متادیتاش نداره، و برای تشخیص از"
+                " روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان از"
+                " audd.io بگیر و در تنظیمات ربات قرار بده).",
+            )
+            return
 
-    # حالت ۲: متادیتا نداشتیم -> باید از روی خود صدای ویدیو تشخیص بدیم
-    if not AUDD_API_KEY:
-        await set_status(
-            query,
-            "ℹ️ این ویدیو اسم آهنگ رو تو متادیتاش نداره، و برای تشخیص از"
-            " روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان از"
-            " audd.io بگیر و در تنظیمات ربات قرار بده).",
-        )
-        return
-
-    await set_status(query, "⬇️ در حال دانلود قطعه‌ی صدا برای تشخیص...")
-    tmp_dir = tempfile.mkdtemp(prefix="song_id_")
-    try:
-        snippet_path = await asyncio.to_thread(download_audio_snippet, url, tmp_dir)
-        await set_status(query, "🎧 در حال تشخیص آهنگ...")
-        result = await asyncio.to_thread(recognize_song_via_audd, snippet_path)
+        await set_status(query, "⬇️ در حال دانلود قطعه‌ی صدا برای تشخیص...")
+        tmp_dir = tempfile.mkdtemp(prefix="song_id_")
+        try:
+            snippet_path = await asyncio.to_thread(download_audio_snippet, url, tmp_dir)
+            await set_status(query, "🎧 در حال تشخیص آهنگ...")
+            result = await asyncio.to_thread(recognize_song_via_audd, snippet_path)
+        except Exception as e:
+            logger.exception("find_song audio recognition failed")
+            await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+            return
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if not result:
             await set_status(
@@ -830,18 +1055,32 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 " واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.",
             )
             return
-
         title, artist = result
-        label = f"{title} - {artist}" if artist else title
-        status_msg = await query.message.reply_text(
-            f"🎵 آهنگ تشخیص داده‌شده: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
-        )
-        await resolve_music_query_and_show(query.message, chat_id, label, status_msg)
+
+    label = f"{title} - {artist}" if artist else title
+    await set_status(query, f"🎵 آهنگ اصلی این ویدیو: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی...")
+
+    try:
+        best = await asyncio.to_thread(search_music, label)
     except Exception as e:
-        logger.exception("find_song failed")
-        await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.exception("search_music failed in find_song")
+        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        return
+
+    if not best:
+        artist_txt = f"\nخواننده: {artist}" if artist else ""
+        await set_status(
+            query,
+            f"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\n"
+            "می‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.",
+        )
+        return
+
+    best_url = best.get("url") or best.get("webpage_url") or best.get("id")
+    if best.get("id") and not str(best_url).startswith("http"):
+        best_url = f"https://www.youtube.com/watch?v={best['id']}"
+
+    await deliver_song(query, context, chat_id, best_url, title, artist)
 
 
 def main():
@@ -859,6 +1098,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_find_song, pattern=r"^song\|"))
+    app.add_handler(CallbackQueryHandler(handle_music_page, pattern=r"^mpage\|"))
+    app.add_handler(CallbackQueryHandler(handle_music_pick, pattern=r"^mpick\|"))
 
     logger.info("ربات در حال اجراست...")
     app.run_polling()
