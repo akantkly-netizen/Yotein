@@ -86,9 +86,20 @@ if COOKIES_FILE_B64 and not (COOKIES_FILE and Path(COOKIES_FILE).exists()):
     except Exception:
         logging.getLogger(__name__).exception("failed to decode COOKIES_FILE_B64")
 
-MAX_TELEGRAM_UPLOAD_MB = 50  # محدودیت سرور رسمی بات تلگرام
+MAX_TELEGRAM_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "50"))  # با Local Bot API Server می‌شه تا 2000
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه، فاصله‌ی به‌روزرسانی نوار پیشرفت
 PROGRESS_BAR_LENGTH = 18  # تعداد بلوک‌های نوار پیشرفت
+
+# اگه یه Local Bot API Server (سقف آپلود ۲ گیگ به‌جای ۵۰ مگ) راه‌اندازی
+# کردید، آدرسش رو اینجا بدید (پیش‌فرض همون آدرسیه که start.sh باهاش
+# سرور رو بالا میاره). اگه ست نشه، از سرور رسمی تلگرام استفاده می‌شه.
+LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "")
+if not LOCAL_API_URL and os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
+    # start.sh با همین آدرس سرور محلی رو بالا میاره؛ نیازی به ست کردن
+    # دستی LOCAL_API_URL نیست، فقط کافیه TELEGRAM_API_ID/HASH رو بدید.
+    LOCAL_API_URL = "http://localhost:8081"
+if LOCAL_API_URL and "MAX_UPLOAD_MB" not in os.environ:
+    MAX_TELEGRAM_UPLOAD_MB = 2000
 
 # برای تشخیص آهنگ از روی صدای ویدیو (وقتی متادیتای پلتفرم اسم آهنگ رو
 # نداره). یه توکن رایگان از https://dashboard.audd.io بگیر.
@@ -1090,7 +1101,12 @@ def main():
             " مستقیم توی کد جایگزین کن."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if LOCAL_API_URL:
+        base = LOCAL_API_URL.rstrip("/")
+        builder = builder.base_url(f"{base}/bot").base_file_url(f"{base}/file/bot")
+        logger.info("using local Bot API server at %s", base)
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ABOUT)}$"), about_button))
