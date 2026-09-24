@@ -36,11 +36,13 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import shutil
 from pathlib import Path
 
 import yt_dlp
+import requests
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -69,6 +71,11 @@ COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE", "")  # مثلا "cookies
 MAX_TELEGRAM_UPLOAD_MB = 50  # محدودیت سرور رسمی بات تلگرام
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه، فاصله‌ی به‌روزرسانی نوار پیشرفت
 PROGRESS_BAR_LENGTH = 18  # تعداد بلوک‌های نوار پیشرفت
+
+# برای تشخیص آهنگ از روی صدای ویدیو (وقتی متادیتای پلتفرم اسم آهنگ رو
+# نداره). یه توکن رایگان از https://dashboard.audd.io بگیر.
+AUDD_API_KEY = os.environ.get("AUDD_API_KEY", "")
+SONG_SNIPPET_SECONDS = 20  # طول قطعه‌ی صوتی که برای تشخیص فرستاده می‌شه
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -165,6 +172,90 @@ def search_music(query: str, limit: int = 5):
 
     best = max(entries, key=score)
     return best
+
+
+def extract_track_from_metadata(info: dict):
+    """
+    اگه پلتفرم (مثلاً تیک‌تاک) اسم آهنگ استفاده‌شده رو توی متادیتا داده
+    باشه برش می‌گردونه: (title, artist) یا None اگه چیزی پیدا نشد.
+    """
+    title = info.get("track")
+    artist = info.get("artist")
+    if not artist:
+        artists = info.get("artists")
+        if artists:
+            artist = artists[0] if isinstance(artists, list) else artists
+    # بعضی وقتا تیک‌تاک اسم صدا رو تو "album" می‌ذاره اگه track نباشه
+    if not title:
+        title = info.get("alt_title")
+    if title and title.strip().lower() not in ("original sound", "original audio", ""):
+        return title.strip(), (artist.strip() if artist else None)
+    return None
+
+
+def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS) -> str:
+    """یه قطعه‌ی کوتاه از صدای ویدیو رو دانلود می‌کنه (برای فرستادن به سرویس تشخیص آهنگ)."""
+    out_tmpl = os.path.join(out_dir, "snippet.%(ext)s")
+    opts = build_ydl_opts(
+        format="bestaudio/best",
+        outtmpl=out_tmpl,
+        postprocessors=[
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}
+        ],
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+
+    base, _ = os.path.splitext(filename)
+    mp3_path = base + ".mp3"
+    if not os.path.exists(mp3_path):
+        mp3_path = filename
+
+    trimmed_path = os.path.join(out_dir, "snippet_trim.mp3")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path, "-t", str(duration), "-vn", trimmed_path],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        if os.path.exists(trimmed_path):
+            return trimmed_path
+    except Exception:
+        logger.exception("ffmpeg trim failed, using full snippet")
+
+    return mp3_path
+
+
+def recognize_song_via_audd(audio_path: str):
+    """
+    قطعه‌ی صوتی رو به سرویس AudD می‌فرسته و اسم آهنگ/خواننده رو
+    برمی‌گردونه: (title, artist) یا None. نیاز به AUDD_API_KEY داره.
+    """
+    if not AUDD_API_KEY:
+        return None
+    try:
+        with open(audio_path, "rb") as f:
+            resp = requests.post(
+                "https://api.audd.io/",
+                data={"api_token": AUDD_API_KEY, "return": "spotify"},
+                files={"file": f},
+                timeout=30,
+            )
+        data = resp.json()
+    except Exception:
+        logger.exception("AudD request failed")
+        return None
+
+    result = data.get("result") if isinstance(data, dict) else None
+    if not result:
+        return None
+    title = result.get("title")
+    artist = result.get("artist")
+    if not title:
+        return None
+    return title, artist
 
 
 def format_size(num_bytes) -> str:
@@ -429,7 +520,12 @@ async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     status_msg = await update.message.reply_text(f"🔎 دارم دنبال «{query_text}» می‌گردم...")
+    chat_id = update.effective_chat.id
+    await resolve_music_query_and_show(update.message, chat_id, query_text, status_msg)
 
+
+async def resolve_music_query_and_show(message, chat_id: int, query_text: str, status_msg):
+    """جستجوی یوتیوب برای یه عبارت (اسم آهنگ) و نمایش نتیجه با show_quality_picker."""
     try:
         best = await asyncio.to_thread(search_music, query_text)
     except Exception as e:
@@ -447,16 +543,16 @@ async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if best.get("id") and not str(video_url).startswith("http"):
         video_url = f"https://www.youtube.com/watch?v={best['id']}"
 
-    chat_id = update.effective_chat.id
-    await show_quality_picker(update.message, chat_id, video_url, status_msg)
+    await show_quality_picker(message, chat_id, video_url, status_msg, offer_find_song=False)
 
 
-async def show_quality_picker(message, chat_id: int, url: str, status_msg=None):
+async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, offer_find_song: bool = True):
     """
     اطلاعات لینک رو می‌گیره، تامبنیل+توضیحات رو نشون می‌ده و دکمه‌های
     کیفیت رو می‌سازه. هم برای لینک مستقیم استفاده می‌شه هم برای نتیجه‌ی
     جستجوی موزیک. اگه status_msg داده بشه (پیام "در حال جستجو/گرفتن
-    اطلاعات")، در پایان حذف می‌شه.
+    اطلاعات")، در پایان حذف می‌شه. offer_find_song=False برای وقتی که
+    خودش نتیجه‌ی جستجوی آهنگه (نیازی به دکمه‌ی پیدا کردن آهنگ نیست).
     """
     try:
         info = extract_info(url)
@@ -473,6 +569,7 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None):
         return
 
     options = pick_quality_options(info)
+    known_track = extract_track_from_metadata(info) if offer_find_song else None
 
     thumbnail_url = info.get("thumbnail")
     uploader = info.get("uploader") or info.get("uploader_id") or ""
@@ -504,12 +601,19 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None):
         sent_msg = await message.reply_text(caption)
 
     key = f"{chat_id}_{sent_msg.message_id}"
-    PENDING[key] = {"url": url, "options": {o["format_id"] + "_" + o["kind"]: o for o in options}}
+    PENDING[key] = {
+        "url": url,
+        "options": {o["format_id"] + "_" + o["kind"]: o for o in options},
+        "known_track": known_track,
+    }
 
     buttons = []
     for o in options:
         cb_data = f"dl|{key}|{o['format_id']}|{o['kind']}"
         buttons.append([InlineKeyboardButton(o["label"], callback_data=cb_data)])
+
+    if offer_find_song:
+        buttons.append([InlineKeyboardButton("🎵 پیدا کردن آهنگ اصلی ویدیو", callback_data=f"song|{key}")])
 
     await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -598,6 +702,74 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         PENDING.pop(key, None)
 
 
+async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر دکمه‌ی «پیدا کردن آهنگ اصلی ویدیو» رو زده."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        await set_status(query, "❌ خطای داخلی، دوباره لینک رو بفرست.")
+        return
+
+    entry = PENDING.get(key)
+    if not entry:
+        await set_status(query, "⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.")
+        return
+
+    url = entry["url"]
+    known_track = entry.get("known_track")
+    chat_id = query.message.chat_id
+
+    # حالت ۱: خود پلتفرم اسم آهنگ رو تو متادیتا داده بود (مثلاً تیک‌تاک)
+    if known_track:
+        title, artist = known_track
+        label = f"{title} - {artist}" if artist else title
+        await set_status(query, f"🎵 آهنگ اصلی این ویدیو: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی...")
+        query_text = label
+        status_msg = await query.message.reply_text("⏳ در حال جستجو...")
+        await resolve_music_query_and_show(query.message, chat_id, query_text, status_msg)
+        return
+
+    # حالت ۲: متادیتا نداشتیم -> باید از روی خود صدای ویدیو تشخیص بدیم
+    if not AUDD_API_KEY:
+        await set_status(
+            query,
+            "ℹ️ این ویدیو اسم آهنگ رو تو متادیتاش نداره، و برای تشخیص از"
+            " روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان از"
+            " audd.io بگیر و در تنظیمات ربات قرار بده).",
+        )
+        return
+
+    await set_status(query, "⬇️ در حال دانلود قطعه‌ی صدا برای تشخیص...")
+    tmp_dir = tempfile.mkdtemp(prefix="song_id_")
+    try:
+        snippet_path = await asyncio.to_thread(download_audio_snippet, url, tmp_dir)
+        await set_status(query, "🎧 در حال تشخیص آهنگ...")
+        result = await asyncio.to_thread(recognize_song_via_audd, snippet_path)
+
+        if not result:
+            await set_status(
+                query,
+                "❌ نتونستم آهنگ این ویدیو رو تشخیص بدم. شاید صدای پس‌زمینه"
+                " واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.",
+            )
+            return
+
+        title, artist = result
+        label = f"{title} - {artist}" if artist else title
+        status_msg = await query.message.reply_text(
+            f"🎵 آهنگ تشخیص داده‌شده: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
+        )
+        await resolve_music_query_and_show(query.message, chat_id, label, status_msg)
+    except Exception as e:
+        logger.exception("find_song failed")
+        await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     if BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
         raise SystemExit(
@@ -612,6 +784,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_MUSIC)}$"), music_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
+    app.add_handler(CallbackQueryHandler(handle_find_song, pattern=r"^song\|"))
 
     logger.info("ربات در حال اجراست...")
     app.run_polling()
