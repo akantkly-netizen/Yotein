@@ -34,6 +34,7 @@
 
 import asyncio
 import base64
+import json
 import logging
 import math
 import os
@@ -106,6 +107,12 @@ if LOCAL_API_URL and "MAX_UPLOAD_MB" not in os.environ:
 AUDD_API_KEY = os.environ.get("AUDD_API_KEY", "")
 SONG_SNIPPET_SECONDS = 20  # طول قطعه‌ی صوتی که برای تشخیص فرستاده می‌شه
 
+# برای بهتر شدن دقت تشخیص آهنگ اصلی: قبل از تشخیص از روی صدا (که کندتر
+# و محدودتره)، Gemini عنوان/کپشن ویدیو رو می‌خونه چون خیلی وقتا خود
+# کپشن اسم آهنگ رو داره. کلید رایگان از https://aistudio.google.com بگیر.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -123,6 +130,10 @@ TIKTOK_URL_RE = re.compile(
     r"(https?://)?(www\.|m\.)?tiktok\.com/@[\w.\-]+/video/\d+[\w\-?&=%.]*"
     r"|(https?://)?(vm|vt)\.tiktok\.com/[\w\-]+/?[\w\-?&=%.]*"
     r"|(https?://)?(www\.)?tiktok\.com/t/[\w\-]+/?[\w\-?&=%.]*"
+)
+PINTEREST_URL_RE = re.compile(
+    r"(https?://)?(www\.)?pinterest\.[a-z.]+/pin/[\w\-]+/?[\w\-?&=%.]*"
+    r"|(https?://)?pin\.it/[\w\-]+"
 )
 SUPPORTED_URL_RE = re.compile(
     f"({INSTAGRAM_URL_RE.pattern})|({YOUTUBE_URL_RE.pattern})|({TIKTOK_URL_RE.pattern})"
@@ -384,6 +395,83 @@ def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_
     return _run_with_cookie_fallback(
         _download_audio_snippet_impl, url, out_dir, duration=duration
     )
+
+
+def call_gemini(prompt: str, timeout: int = 20):
+    """یه پرامپت به Gemini می‌فرسته و متن خام پاسخ رو برمی‌گردونه، یا None اگه شکست خورد."""
+    if not GEMINI_API_KEY:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    try:
+        resp = requests.post(
+            url,
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+            },
+            timeout=timeout,
+        )
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        logger.exception("Gemini call failed")
+        return None
+
+
+def ai_identify_song(video_title: str, description: str, uploader: str):
+    """
+    با کمک Gemini از روی عنوان/کپشن/آپلودکننده‌ی ویدیو، اسم آهنگ و
+    خواننده‌ی واقعی استفاده‌شده رو حدس می‌زنه (وقتی متادیتای صریح
+    پلتفرم اسم آهنگ رو نداشت). خیلی وقتا خود کپشن اسم آهنگ رو داره،
+    مخصوصاً برای آهنگ‌های فارسی/گمنام که تو یوتیوب‌میوزیک نیستن. ریمیکس
+    و کاور و امثالش رو هم تشخیص می‌ده.
+    برمی‌گردونه: (title, artist, variant_label) یا None.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = (
+        "You are helping identify the background music/song used in a short "
+        "social-media video (Instagram Reel, TikTok, or YouTube Short). Given "
+        "the video's title, caption/description, and uploader name below, "
+        "figure out the actual song name and artist IF it is explicitly "
+        "mentioned or clearly implied in the text (e.g. 'audio used: X by Y', "
+        "hashtags naming a song, or the caption itself naming a track). The "
+        "caption may be in Persian/Farsi or English or mixed. Do not guess "
+        "randomly — if the text gives no real clue, respond with title=null.\n\n"
+        f"Video title: {video_title}\n"
+        f"Description/caption: {description[:1500]}\n"
+        f"Uploader: {uploader}\n\n"
+        "Respond ONLY with compact JSON in exactly this shape, no extra text:\n"
+        '{"title": string|null, "artist": string|null, '
+        '"is_remix_or_cover": boolean, "variant_label": string|null}\n'
+        'variant_label should be a short tag like "Remix", "Cover", '
+        '"Funk Version", "Slowed + Reverb" if the audio is clearly a variant '
+        "of the original, otherwise null."
+    )
+    raw = call_gemini(prompt)
+    if not raw:
+        return None
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        logger.warning("could not parse Gemini JSON response: %s", raw[:200])
+        return None
+
+    title = data.get("title")
+    if not title:
+        return None
+    artist = data.get("artist")
+    variant = data.get("variant_label")
+    return title, artist, variant
 
 
 def recognize_song_via_audd(audio_path: str):
@@ -860,6 +948,11 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         "url": url,
         "options": {o["format_id"] + "_" + o["kind"]: o for o in options},
         "known_track": known_track,
+        "video_meta": {
+            "title": info.get("title") or "",
+            "description": info.get("description") or "",
+            "uploader": uploader,
+        },
     }
 
     buttons = []
@@ -1030,19 +1123,47 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = entry["url"]
     known_track = entry.get("known_track")
+    video_meta = entry.get("video_meta") or {}
     chat_id = query.message.chat_id
+
+    title = artist = variant = None
 
     # حالت ۱: خود پلتفرم اسم آهنگ رو تو متادیتا داده بود (مثلاً تیک‌تاک)
     if known_track:
         title, artist = known_track
-    else:
-        # حالت ۲: متادیتا نداشتیم -> باید از روی خود صدای ویدیو تشخیص بدیم
+
+    # حالت ۲: با کمک Gemini از روی عنوان/کپشن ویدیو حدس می‌زنیم (سریع‌تر
+    # و رایگان‌تر از تشخیص از روی صدا، و برای آهنگ‌های فارسی/گمنام هم
+    # بهتر جواب می‌ده)
+    if not title and GEMINI_API_KEY:
+        await set_status(query, "🤖 در حال بررسی کپشن ویدیو با هوش مصنوعی...")
+        try:
+            ai_result = await asyncio.to_thread(
+                ai_identify_song,
+                video_meta.get("title", ""),
+                video_meta.get("description", ""),
+                video_meta.get("uploader", ""),
+            )
+        except Exception:
+            logger.exception("ai_identify_song failed")
+            ai_result = None
+        if ai_result:
+            title, artist, variant = ai_result
+
+    # حالت ۳: هیچ‌کدوم بالا جواب نداد -> از روی خود صدای ویدیو تشخیص بدیم
+    if not title:
         if not AUDD_API_KEY:
+            hint = (
+                " یا یه GEMINI_API_KEY رایگان از aistudio.google.com بگیر تا"
+                " از روی کپشن ویدیو حدس بزنم"
+                if not GEMINI_API_KEY
+                else ""
+            )
             await set_status(
                 query,
-                "ℹ️ این ویدیو اسم آهنگ رو تو متادیتاش نداره، و برای تشخیص از"
-                " روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان از"
-                " audd.io بگیر و در تنظیمات ربات قرار بده).",
+                "ℹ️ نتونستم از متادیتا یا کپشن ویدیو آهنگ رو تشخیص بدم. برای"
+                " تشخیص از روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان"
+                f" از audd.io بگیر){hint}.",
             )
             return
 
@@ -1069,10 +1190,14 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title, artist = result
 
     label = f"{title} - {artist}" if artist else title
-    await set_status(query, f"🎵 آهنگ اصلی این ویدیو: {label}\n🔎 در حال پیدا کردن نسخه‌ی رسمی...")
+    variant_txt = f" ({variant})" if variant else ""
+    await set_status(
+        query, f"🎵 آهنگ اصلی این ویدیو: {label}{variant_txt}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
+    )
 
+    search_query = label if not variant else f"{label} {variant}"
     try:
-        best = await asyncio.to_thread(search_music, label)
+        best = await asyncio.to_thread(search_music, search_query)
     except Exception as e:
         logger.exception("search_music failed in find_song")
         await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
