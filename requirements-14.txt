@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+yt-dlp[default]>=2026.1.29
+deno
+requests>=2.31.0
