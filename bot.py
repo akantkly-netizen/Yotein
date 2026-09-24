@@ -141,23 +141,61 @@ WAITING_MUSIC_QUERY = set()
 # ------------------------------------------------------------------
 # توابع کمکی yt-dlp
 # ------------------------------------------------------------------
-def build_ydl_opts(**overrides):
+def build_ydl_opts(use_cookies: bool = False, **overrides):
+    """
+    use_cookies=False (پیش‌فرض): بدون کوکی درخواست می‌ده، مثل یه کاربر
+    عادی. use_cookies=True: فقط وقتی سایت صریحاً خطای "sign in / not a
+    bot" داده، به‌عنوان تلاش دوم کوکی رو اضافه می‌کنه.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
     }
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+    if use_cookies and COOKIES_FILE and Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
     opts.update(overrides)
     return opts
 
 
+BOT_CHECK_SIGNS = (
+    "sign in to confirm",
+    "not a bot",
+    "confirm you're not a bot",
+    "confirm you are not a bot",
+    "login required",
+    "this video is only available",
+)
+
+
+def _looks_like_bot_check(err_text: str) -> bool:
+    t = err_text.lower()
+    return any(s in t for s in BOT_CHECK_SIGNS)
+
+
+def _run_with_cookie_fallback(func, *args, **kwargs):
+    """
+    اول بدون کوکی امتحان می‌کنه. اگه خطا مشخصاً «ثابت کن ربات نیستی»
+    بود و کوکی داریم، فقط همون یه‌بار با کوکی دوباره امتحان می‌کنه.
+    برای هر خطای دیگه (لینک اشتباه، پست خصوصی و ...) مستقیم پرتاب می‌شه.
+    """
+    try:
+        return func(*args, use_cookies=False, **kwargs)
+    except Exception as e:
+        if COOKIES_FILE and Path(COOKIES_FILE).exists() and _looks_like_bot_check(str(e)):
+            logger.info("bot-check detected, retrying with cookies")
+            return func(*args, use_cookies=True, **kwargs)
+        raise
+
+
+def _extract_info_impl(url: str, use_cookies: bool = False) -> dict:
+    with yt_dlp.YoutubeDL(build_ydl_opts(use_cookies=use_cookies)) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 def extract_info(url: str) -> dict:
     """اطلاعات لینک (فرمت‌های موجود و ...) رو بدون دانلود می‌گیره."""
-    with yt_dlp.YoutubeDL(build_ydl_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return info
+    return _run_with_cookie_fallback(_extract_info_impl, url)
 
 
 def search_music(query: str, limit: int = 5):
@@ -210,10 +248,12 @@ def extract_track_from_metadata(info: dict):
     return None
 
 
-def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS) -> str:
-    """یه قطعه‌ی کوتاه از صدای ویدیو رو دانلود می‌کنه (برای فرستادن به سرویس تشخیص آهنگ)."""
+def _download_audio_snippet_impl(
+    url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS, use_cookies: bool = False
+) -> str:
     out_tmpl = os.path.join(out_dir, "snippet.%(ext)s")
     opts = build_ydl_opts(
+        use_cookies=use_cookies,
         format="bestaudio/best",
         outtmpl=out_tmpl,
         postprocessors=[
@@ -243,6 +283,13 @@ def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_
         logger.exception("ffmpeg trim failed, using full snippet")
 
     return mp3_path
+
+
+def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS) -> str:
+    """یه قطعه‌ی کوتاه از صدای ویدیو رو دانلود می‌کنه (برای فرستادن به سرویس تشخیص آهنگ)."""
+    return _run_with_cookie_fallback(
+        _download_audio_snippet_impl, url, out_dir, duration=duration
+    )
 
 
 def recognize_song_via_audd(audio_path: str):
@@ -438,13 +485,15 @@ def pick_quality_options(info: dict):
     return options
 
 
-def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_state=None) -> str:
-    """دانلود ویدیو با فرمت انتخابی یا استخراج فقط صدا. مسیر فایل نهایی رو برمی‌گردونه."""
+def _download_media_impl(
+    url: str, format_id: str, kind: str, out_dir: str, progress_state=None, use_cookies: bool = False
+) -> str:
     out_tmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
     hooks = [make_progress_hook(progress_state)] if progress_state is not None else []
 
     if kind == "audio":
         opts = build_ydl_opts(
+            use_cookies=use_cookies,
             format="bestaudio/best",
             outtmpl=out_tmpl,
             progress_hooks=hooks,
@@ -459,6 +508,7 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_s
     else:
         fmt = format_id if format_id == "best" else f"{format_id}+bestaudio/best"
         opts = build_ydl_opts(
+            use_cookies=use_cookies,
             format=fmt,
             outtmpl=out_tmpl,
             merge_output_format="mp4",
@@ -477,6 +527,13 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_s
             return mp3_path
 
     return filename
+
+
+def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_state=None) -> str:
+    """دانلود ویدیو با فرمت انتخابی یا استخراج فقط صدا. مسیر فایل نهایی رو برمی‌گردونه."""
+    return _run_with_cookie_fallback(
+        _download_media_impl, url, format_id, kind, out_dir, progress_state=progress_state
+    )
 
 
 # ------------------------------------------------------------------
