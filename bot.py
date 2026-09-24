@@ -33,6 +33,7 @@
 """
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -64,9 +65,25 @@ from telegram.ext import (
 # ------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
 
-# اگر پست‌های خصوصی/محدود دارید، مسیر فایل کوکی رو اینجا بدید
-# (با اکستنشن‌هایی مثل "Get cookies.txt" از مرورگر خودتون export بگیرید)
-COOKIES_FILE = os.environ.get("INSTAGRAM_COOKIES_FILE", "")  # مثلا "cookies.txt"
+# اگر پست‌های خصوصی/محدود دارید یا یوتیوب می‌گه "Sign in to confirm
+# you're not a bot"، باید کوکی بدید. دو راه:
+#  ۱) مسیر یه فایل cookies.txt رو تو COOKIES_FILE بدید (اجرای لوکال)
+#  ۲) محتوای همون فایل رو با base64 اینکود کنید و تو متغیر محیطی
+#     COOKIES_FILE_B64 بذارید (برای سرورهایی مثل Railway که نمی‌شه
+#     مستقیم فایل آپلود کرد) - ربات موقع استارت خودش دیکودش می‌کنه.
+# فایل cookies.txt رو با اکستنشنی مثل "Get cookies.txt LOCALLY" از
+# مرورگری که توش لاگین یوتیوب/اینستاگرام هستید export بگیرید.
+COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.environ.get("INSTAGRAM_COOKIES_FILE", "")
+COOKIES_FILE_B64 = os.environ.get("COOKIES_FILE_B64", "")
+
+if COOKIES_FILE_B64 and not (COOKIES_FILE and Path(COOKIES_FILE).exists()):
+    try:
+        _cookies_path = os.path.join(tempfile.gettempdir(), "ytdlp_cookies.txt")
+        with open(_cookies_path, "wb") as _f:
+            _f.write(base64.b64decode(COOKIES_FILE_B64))
+        COOKIES_FILE = _cookies_path
+    except Exception:
+        logging.getLogger(__name__).exception("failed to decode COOKIES_FILE_B64")
 
 MAX_TELEGRAM_UPLOAD_MB = 50  # محدودیت سرور رسمی بات تلگرام
 PROGRESS_UPDATE_INTERVAL = 2.0  # ثانیه، فاصله‌ی به‌روزرسانی نوار پیشرفت
