@@ -285,24 +285,28 @@ def search_music(query: str, limit: int = 8):
     return best
 
 
-def search_music_list(query: str, limit: int = 50):
+SOURCE_PREFIXES = {
+    "ytmusic": "ytmsearch",
+    "youtube": "ytsearch",
+    "soundcloud": "scsearch",
+}
+
+
+def search_music_list(query: str, limit: int = 50, source: str = "ytmusic"):
     """
-    برای جستجوی موزیک با لیست کامل: اول تو یوتیوب‌میوزیک (که کاتالوگ
-    رسمی گوگل/یوتیوب‌میوزیکه، بدون کاور و ریمیکس‌های الکی) می‌گرده؛
-    اگه چیزی پیدا نشد، به جستجوی عادی یوتیوب و بعد ساندکلاود فال‌بک
-    می‌کنه. برای یه اسم خواننده، معمولاً همه‌ی آهنگ‌های شناخته‌شده‌اش
-    برمی‌گرده.
+    فقط تو همون منبع مشخص‌شده می‌گرده (پیش‌فرض یوتیوب‌میوزیک که کاتالوگ
+    رسمیه، بدون کاور/ریمیکس الکی). برای خواننده‌های خارجی معمولاً همه‌ی
+    آهنگ‌های شناخته‌شده‌شون از همینجا درمیاد. اگه کاربر دستی خواست
+    (source='youtube')، جستجوی عادی یوتیوب انجام می‌شه.
     """
-    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:", f"scsearch{limit}:"):
-        try:
-            with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
-                result = ydl.extract_info(prefix + query, download=False)
-            entries = [e for e in (result.get("entries") or []) if e]
-            if entries:
-                return entries
-        except Exception:
-            logger.exception("search_music_list failed for prefix %s", prefix)
-    return []
+    prefix = SOURCE_PREFIXES.get(source, "ytmsearch")
+    try:
+        with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
+            result = ydl.extract_info(f"{prefix}{limit}:{query}", download=False)
+        return [e for e in (result.get("entries") or []) if e]
+    except Exception:
+        logger.exception("search_music_list failed for source %s", source)
+        return []
 
 
 def format_music_entry_label(entry: dict, number: int) -> str:
@@ -322,7 +326,7 @@ def format_music_entry_label(entry: dict, number: int) -> str:
     return label
 
 
-def build_music_page(key: str, entries: list, page: int):
+def build_music_page(key: str, entries: list, page: int, source: str = "ytmusic"):
     """صفحه‌ی مشخصی از نتایج (۱۰تا-۱۰تا) رو با دکمه‌ها می‌سازه."""
     start = page * MUSIC_PAGE_SIZE
     page_entries = entries[start:start + MUSIC_PAGE_SIZE]
@@ -341,6 +345,11 @@ def build_music_page(key: str, entries: list, page: int):
         nav_row.append(InlineKeyboardButton("▶️ صفحه بعد", callback_data=f"mpage|{key}|{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
+
+    # فقط وقتی هنوز رو یوتیوب‌میوزیک هستیم این گزینه رو نشون بده؛ وقتی
+    # کاربر خودش زده رو یوتیوب عادی، دیگه نیازی به این دکمه نیست
+    if source != "youtube":
+        buttons.append([InlineKeyboardButton("🔍 جستجو در یوتیوب", callback_data=f"myoutube|{key}")])
 
     return InlineKeyboardMarkup(buttons), total_pages
 
@@ -820,14 +829,16 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         " از کل، سرعت)؛ در آخر فایل برات ارسال می‌شه\n\n"
         f"🎵 جستجوی موزیک (دکمه‌ی «{BTN_MUSIC}»)\n"
         "۱. روی دکمه بزن و اسم آهنگ یا فقط اسم خواننده رو بفرست\n"
-        "۲. اگه اسم خواننده بفرستی، همه‌ی آهنگ‌های شناخته‌شده‌اش رو"
-        " پیدا می‌کنم؛ نتیجه‌ها ۱۰تا-۱۰تا صفحه‌بندی شدن و با دکمه‌های"
-        " «◀️ صفحه قبل» و «▶️ صفحه بعد» می‌تونی بین صفحه‌ها بری\n"
+        "۲. اول تو یوتیوب‌میوزیک (کاتالوگ رسمی) می‌گردم؛ اگه اسم خواننده"
+        " بفرستی، همه‌ی آهنگ‌های شناخته‌شده‌اش از همونجا میاد (برای"
+        " خواننده‌های خارجی معمولاً کامله)؛ نتیجه‌ها ۱۰تا-۱۰تا"
+        " صفحه‌بندی شدن با دکمه‌های «◀️ صفحه قبل» / «▶️ صفحه بعد»\n"
         "۳. روی اسم هر آهنگ که بزنی، همون دکمه‌های کیفیت/فقط‌صدای بالا"
         " براش میاد تا انتخاب کنی\n"
-        "۴. جستجو اول تو یوتیوب‌میوزیک می‌گرده (کاتالوگ رسمی) و اگه چیزی"
-        " پیدا نشد (مثلاً خیلی از آهنگ‌های فارسی) خودکار به یوتیوب عادی"
-        " هم سر می‌زنه\n\n"
+        "۴. اگه چیزی پیدا نشد یا کم بود (مثلاً خیلی از آهنگ‌های فارسی"
+        " تو یوتیوب‌میوزیک نیستن)، پایین لیست دکمه‌ی «🔍 جستجو در"
+        " یوتیوب» هست؛ بزن تا همون جستجو رو تو یوتیوب عادی هم انجام"
+        " بدم\n\n"
         "🎧 پیدا کردن آهنگ اصلی یه ویدیو\n"
         "زیر دکمه‌های کیفیت هر ویدیو، یه دکمه‌ی «🎵 پیدا کردن آهنگ اصلی"
         " ویدیو» هم هست. با زدنش:\n"
@@ -874,29 +885,32 @@ async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("یه اسم آهنگ یا خواننده بفرست تا جستجو کنم.")
         return
 
-    status_msg = await update.message.reply_text(f"🔎 دارم دنبال «{query_text}» می‌گردم...")
+    status_msg = await update.message.reply_text(f"🔎 دارم تو یوتیوب‌میوزیک دنبال «{query_text}» می‌گردم...")
     chat_id = update.effective_chat.id
 
     try:
-        entries = await asyncio.to_thread(search_music_list, query_text)
+        entries = await asyncio.to_thread(search_music_list, query_text, 50, "ytmusic")
     except Exception as e:
         logger.exception("search_music_list failed")
         await status_msg.edit_text("❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
         return
 
+    key = f"{chat_id}_{status_msg.message_id}"
+    MUSIC_SESSIONS[key] = {"entries": entries, "query": query_text, "source": "ytmusic"}
+
     if not entries:
+        markup, _ = build_music_page(key, [], 0, "ytmusic")
         await status_msg.edit_text(
-            "چیزی پیدا نکردم. اسم دقیق‌تر یا اسم درست خواننده رو امتحان کن."
+            f"تو یوتیوب‌میوزیک چیزی برای «{query_text}» پیدا نشد. می‌تونی از دکمه‌ی"
+            " پایین تو یوتیوب عادی هم جستجو کنی:",
+            reply_markup=markup,
         )
         return
 
-    key = f"{chat_id}_{status_msg.message_id}"
-    MUSIC_SESSIONS[key] = {"entries": entries, "query": query_text}
-
-    markup, total_pages = build_music_page(key, entries, 0)
+    markup, total_pages = build_music_page(key, entries, 0, "ytmusic")
     text = (
-        f"🎵 نتایج برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
-        "یکی رو انتخاب کن:"
+        f"🎵 نتایج یوتیوب‌میوزیک برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
+        "یکی رو انتخاب کن، یا اگه کافی نبود پایین «جستجو در یوتیوب» رو بزن:"
     )
     await status_msg.edit_text(text, reply_markup=markup)
 
@@ -918,9 +932,11 @@ async def handle_music_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     entries = session["entries"]
-    markup, total_pages = build_music_page(key, entries, page)
+    source = session.get("source", "ytmusic")
+    source_label = "یوتیوب‌میوزیک" if source == "ytmusic" else "یوتیوب"
+    markup, total_pages = build_music_page(key, entries, page, source)
     text = (
-        f"🎵 نتایج برای «{session['query']}» ({len(entries)} مورد) — صفحه {page + 1} از {total_pages}:\n"
+        f"🎵 نتایج {source_label} برای «{session['query']}» ({len(entries)} مورد) — صفحه {page + 1} از {total_pages}:\n"
         "یکی رو انتخاب کن:"
     )
     try:
@@ -928,6 +944,51 @@ async def handle_music_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             logger.warning("music page edit failed: %s", e)
+
+
+async def handle_music_youtube_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر دکمه‌ی «جستجو در یوتیوب» رو زده (چون نتایج یوتیوب‌میوزیک کم یا هیچی نبود)."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        return
+
+    session = MUSIC_SESSIONS.get(key)
+    if not session:
+        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        return
+
+    query_text = session["query"]
+    await set_status(query, f"🔎 دارم تو یوتیوب دنبال «{query_text}» می‌گردم...")
+
+    try:
+        entries = await asyncio.to_thread(search_music_list, query_text, 50, "youtube")
+    except Exception as e:
+        logger.exception("youtube fallback search failed")
+        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        return
+
+    session["entries"] = entries
+    session["source"] = "youtube"
+
+    if not entries:
+        await set_status(query, f"تو یوتیوب هم چیزی برای «{query_text}» پیدا نشد.")
+        return
+
+    markup, total_pages = build_music_page(key, entries, 0, "youtube")
+    text = (
+        f"🎵 نتایج یوتیوب برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
+        "یکی رو انتخاب کن:"
+    )
+    await set_status(query, text)
+    try:
+        await query.edit_message_reply_markup(reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("music youtube fallback markup edit failed: %s", e)
 
 
 async def handle_music_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1329,6 +1390,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_find_song, pattern=r"^song\|"))
     app.add_handler(CallbackQueryHandler(handle_music_page, pattern=r"^mpage\|"))
+    app.add_handler(CallbackQueryHandler(handle_music_youtube_fallback, pattern=r"^myoutube\|"))
     app.add_handler(CallbackQueryHandler(handle_music_pick, pattern=r"^mpick\|"))
 
     logger.info("ربات در حال اجراست...")
