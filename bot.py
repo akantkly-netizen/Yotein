@@ -34,6 +34,8 @@
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -42,6 +44,7 @@ import re
 import subprocess
 import tempfile
 import shutil
+import time
 from pathlib import Path
 
 import yt_dlp
@@ -106,6 +109,12 @@ if LOCAL_API_URL and "MAX_UPLOAD_MB" not in os.environ:
 # نداره). یه توکن رایگان از https://dashboard.audd.io بگیر.
 AUDD_API_KEY = os.environ.get("AUDD_API_KEY", "")
 SONG_SNIPPET_SECONDS = 20  # طول قطعه‌ی صوتی که برای تشخیص فرستاده می‌شه
+
+# سرویس دوم تشخیص آهنگ (اختیاری) - وقتی AudD جواب نده امتحان می‌شه.
+# host/access_key/access_secret رو از پنل پروژه‌ی ACRCloud بگیر.
+ACR_ACCESS_KEY = os.environ.get("ACR_ACCESS_KEY", "")
+ACR_ACCESS_SECRET = os.environ.get("ACR_ACCESS_SECRET", "")
+ACR_HOST = os.environ.get("ACR_HOST", "")  # مثلا identify-eu-west-1.acrcloud.com
 
 # برای بهتر شدن دقت تشخیص آهنگ اصلی: قبل از تشخیص از روی صدا (که کندتر
 # و محدودتره)، Gemini عنوان/کپشن ویدیو رو می‌خونه چون خیلی وقتا خود
@@ -229,13 +238,14 @@ def extract_info(url: str) -> dict:
 def search_music(query: str, limit: int = 8):
     """
     اول تو یوتیوب‌میوزیک می‌گرده (کاتالوگ رسمی گوگل)، اگه چیزی پیدا نشد
-    (مثلاً برای خیلی از آهنگ‌های فارسی) به یوتیوب عادی فال‌بک می‌کنه.
+    (مثلاً برای خیلی از آهنگ‌های فارسی) به یوتیوب عادی و بعد به
+    ساندکلاود (برای ریمیکس/تولیدات مستقل) فال‌بک می‌کنه.
     امتیازدهی طوریه که نسخه‌ی رسمی/آفیشیال رو در اولویت می‌ذاره و
     ریمیکس/کاور/لایو/اسپیدآپ رو عقب می‌زنه مگه خود متن جستجو دنبال
     اونا باشه.
     """
     entries = []
-    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:"):
+    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:", f"scsearch{limit}:"):
         try:
             with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
                 result = ydl.extract_info(prefix + query, download=False)
@@ -279,10 +289,11 @@ def search_music_list(query: str, limit: int = 50):
     """
     برای جستجوی موزیک با لیست کامل: اول تو یوتیوب‌میوزیک (که کاتالوگ
     رسمی گوگل/یوتیوب‌میوزیکه، بدون کاور و ریمیکس‌های الکی) می‌گرده؛
-    اگه چیزی پیدا نشد، به جستجوی عادی یوتیوب فال‌بک می‌کنه. برای یه
-    اسم خواننده، معمولاً همه‌ی آهنگ‌های شناخته‌شده‌اش برمی‌گرده.
+    اگه چیزی پیدا نشد، به جستجوی عادی یوتیوب و بعد ساندکلاود فال‌بک
+    می‌کنه. برای یه اسم خواننده، معمولاً همه‌ی آهنگ‌های شناخته‌شده‌اش
+    برمی‌گرده.
     """
-    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:"):
+    for prefix in (f"ytmsearch{limit}:", f"ytsearch{limit}:", f"scsearch{limit}:"):
         try:
             with yt_dlp.YoutubeDL(build_ydl_opts(extract_flat="in_playlist")) as ydl:
                 result = ydl.extract_info(prefix + query, download=False)
@@ -353,10 +364,10 @@ def extract_track_from_metadata(info: dict):
     return None
 
 
-def _download_audio_snippet_impl(
-    url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS, use_cookies: bool = False
-) -> str:
-    out_tmpl = os.path.join(out_dir, "snippet.%(ext)s")
+def _download_full_audio_impl(url: str, out_dir: str, use_cookies: bool = False):
+    """کل صدای ویدیو رو دانلود می‌کنه (یه‌بار) تا از روش چند تیکه‌ی مختلفش
+    برای تشخیص استفاده کنیم، بدون نیاز به دانلود دوباره."""
+    out_tmpl = os.path.join(out_dir, "full.%(ext)s")
     opts = build_ydl_opts(
         use_cookies=use_cookies,
         format="bestaudio/best",
@@ -374,27 +385,29 @@ def _download_audio_snippet_impl(
     if not os.path.exists(mp3_path):
         mp3_path = filename
 
-    trimmed_path = os.path.join(out_dir, "snippet_trim.mp3")
+    return mp3_path, (info.get("duration") or 0)
+
+
+def download_full_audio(url: str, out_dir: str):
+    """(مسیر فایل mp3، طول ویدیو به ثانیه) رو برمی‌گردونه."""
+    return _run_with_cookie_fallback(_download_full_audio_impl, url, out_dir)
+
+
+def make_snippet(full_audio_path: str, out_dir: str, start: float = 0, duration: int = SONG_SNIPPET_SECONDS, name: str = "snippet") -> str:
+    """از یه فایل صوتی کامل، یه تیکه‌ی مشخص رو با ffmpeg می‌بره (بدون دانلود دوباره)."""
+    out_path = os.path.join(out_dir, f"{name}.mp3")
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", mp3_path, "-t", str(duration), "-vn", trimmed_path],
+            ["ffmpeg", "-y", "-ss", str(max(0, start)), "-i", full_audio_path, "-t", str(duration), "-vn", out_path],
             check=True,
             capture_output=True,
             timeout=60,
         )
-        if os.path.exists(trimmed_path):
-            return trimmed_path
+        if os.path.exists(out_path):
+            return out_path
     except Exception:
-        logger.exception("ffmpeg trim failed, using full snippet")
-
-    return mp3_path
-
-
-def download_audio_snippet(url: str, out_dir: str, duration: int = SONG_SNIPPET_SECONDS) -> str:
-    """یه قطعه‌ی کوتاه از صدای ویدیو رو دانلود می‌کنه (برای فرستادن به سرویس تشخیص آهنگ)."""
-    return _run_with_cookie_fallback(
-        _download_audio_snippet_impl, url, out_dir, duration=duration
-    )
+        logger.exception("ffmpeg snippet failed, using full audio")
+    return full_audio_path
 
 
 def call_gemini(prompt: str, timeout: int = 20):
@@ -437,9 +450,14 @@ def ai_identify_song(video_title: str, description: str, uploader: str):
         "the video's title, caption/description, and uploader name below, "
         "figure out the actual song name and artist IF it is explicitly "
         "mentioned or clearly implied in the text (e.g. 'audio used: X by Y', "
-        "hashtags naming a song, or the caption itself naming a track). The "
-        "caption may be in Persian/Farsi or English or mixed. Do not guess "
-        "randomly — if the text gives no real clue, respond with title=null.\n\n"
+        "hashtags naming a song, or the caption itself naming a track). Pay "
+        "special attention to Persian/Farsi text: captions are often written "
+        "in Finglish (Persian words spelled with Latin letters, e.g. "
+        "'ahangesh Sirvan Khosravi bood') or in Persian script, and may name "
+        "underground/regional artists not on YouTube Music — normalize any "
+        "Persian artist/song name you recognize to its standard Persian-script "
+        "or common transliterated form. Do not guess randomly — if the text "
+        "gives no real clue, respond with title=null.\n\n"
         f"Video title: {video_title}\n"
         f"Description/caption: {description[:1500]}\n"
         f"Uploader: {uploader}\n\n"
@@ -501,6 +519,59 @@ def recognize_song_via_audd(audio_path: str):
     artist = result.get("artist")
     if not title:
         return None
+    return title, artist
+
+
+def recognize_song_via_acrcloud(audio_path: str):
+    """
+    سرویس دوم تشخیص آهنگ (اختیاری). فقط وقتی AudD جواب نده امتحان می‌شه.
+    برمی‌گردونه: (title, artist) یا None.
+    """
+    if not (ACR_ACCESS_KEY and ACR_ACCESS_SECRET and ACR_HOST):
+        return None
+
+    http_method = "POST"
+    http_uri = "/v1/identify"
+    data_type = "audio"
+    signature_version = "1"
+    timestamp = str(time.time())
+    string_to_sign = "\n".join(
+        [http_method, http_uri, ACR_ACCESS_KEY, data_type, signature_version, timestamp]
+    )
+    sign = base64.b64encode(
+        hmac.new(
+            ACR_ACCESS_SECRET.encode("ascii"), string_to_sign.encode("ascii"), digestmod=hashlib.sha1
+        ).digest()
+    ).decode("ascii")
+
+    try:
+        sample_bytes = os.path.getsize(audio_path)
+        with open(audio_path, "rb") as f:
+            files = {"sample": (os.path.basename(audio_path), f, "audio/mpeg")}
+            data = {
+                "access_key": ACR_ACCESS_KEY,
+                "sample_bytes": sample_bytes,
+                "timestamp": timestamp,
+                "signature": sign,
+                "data_type": data_type,
+                "signature_version": signature_version,
+            }
+            resp = requests.post(f"https://{ACR_HOST}/v1/identify", files=files, data=data, timeout=30)
+        result = resp.json()
+    except Exception:
+        logger.exception("ACRCloud request failed")
+        return None
+
+    try:
+        music = result["metadata"]["music"][0]
+    except Exception:
+        return None
+
+    title = music.get("title")
+    if not title:
+        return None
+    artists = music.get("artists") or []
+    artist = artists[0].get("name") if artists else None
     return title, artist
 
 
@@ -1152,7 +1223,7 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # حالت ۳: هیچ‌کدوم بالا جواب نداد -> از روی خود صدای ویدیو تشخیص بدیم
     if not title:
-        if not AUDD_API_KEY:
+        if not (AUDD_API_KEY or (ACR_ACCESS_KEY and ACR_ACCESS_SECRET and ACR_HOST)):
             hint = (
                 " یا یه GEMINI_API_KEY رایگان از aistudio.google.com بگیر تا"
                 " از روی کپشن ویدیو حدس بزنم"
@@ -1162,17 +1233,35 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await set_status(
                 query,
                 "ℹ️ نتونستم از متادیتا یا کپشن ویدیو آهنگ رو تشخیص بدم. برای"
-                " تشخیص از روی خود صدا باید یه AUDD_API_KEY تنظیم بشه (رایگان"
-                f" از audd.io بگیر){hint}.",
+                " تشخیص از روی خود صدا باید یه AUDD_API_KEY (یا ACRCloud)"
+                f" تنظیم بشه{hint}.",
             )
             return
 
-        await set_status(query, "⬇️ در حال دانلود قطعه‌ی صدا برای تشخیص...")
+        await set_status(query, "⬇️ در حال دانلود صدای ویدیو برای تشخیص...")
         tmp_dir = tempfile.mkdtemp(prefix="song_id_")
         try:
-            snippet_path = await asyncio.to_thread(download_audio_snippet, url, tmp_dir)
-            await set_status(query, "🎧 در حال تشخیص آهنگ...")
-            result = await asyncio.to_thread(recognize_song_via_audd, snippet_path)
+            full_audio_path, duration = await asyncio.to_thread(download_full_audio, url, tmp_dir)
+
+            await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی اول)...")
+            snippet1 = await asyncio.to_thread(
+                make_snippet, full_audio_path, tmp_dir, 0, SONG_SNIPPET_SECONDS, "snip1"
+            )
+            result = await asyncio.to_thread(recognize_song_via_audd, snippet1)
+            if not result:
+                result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet1)
+
+            # اگه تیکه‌ی اول (که ممکنه فقط حرف زدن باشه) جواب نداد و ویدیو
+            # به‌اندازه‌ی کافی طولانیه، یه تیکه‌ی دیگه از وسط ویدیو رو هم امتحان کن
+            if not result and duration and duration > 40:
+                await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی دوم)...")
+                mid_start = max(0, (duration / 2) - (SONG_SNIPPET_SECONDS / 2))
+                snippet2 = await asyncio.to_thread(
+                    make_snippet, full_audio_path, tmp_dir, mid_start, SONG_SNIPPET_SECONDS, "snip2"
+                )
+                result = await asyncio.to_thread(recognize_song_via_audd, snippet2)
+                if not result:
+                    result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet2)
         except Exception as e:
             logger.exception("find_song audio recognition failed")
             await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
