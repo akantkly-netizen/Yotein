@@ -768,7 +768,17 @@ def _download_media_impl(
             ],
         )
     else:
-        fmt = format_id if format_id == "best" else f"{format_id}+bestaudio/best"
+        # یوتیوب دیگه معمولاً فرمت تکی (صدا+تصویر با هم) نمی‌ده، پس "best"
+        # ساده خطای "Requested format is not available" می‌ده. همیشه
+        # بهترین تصویر + بهترین صدا رو می‌گیریم و با ffmpeg ترکیب می‌کنیم؛
+        # فقط اگه جدا نبودن، فرمت تکی رو برمی‌داریم.
+        if format_id == "best720":
+            # برای ارسال آهنگ (حجم کمتر): حداکثر ۷۲۰p
+            fmt = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
+        elif format_id == "best":
+            fmt = "bv*+ba/b"
+        else:
+            fmt = f"{format_id}+ba/{format_id}/bv*+ba/b"
         opts = build_ydl_opts(
             use_cookies=use_cookies,
             format=fmt,
@@ -1204,7 +1214,7 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         stop_event = asyncio.Event()
         progress_task = asyncio.create_task(run_progress_updates(query, state, stop_event))
         try:
-            video_path = await asyncio.to_thread(download_media, url, "best", "video", tmp_dir, state)
+            video_path = await asyncio.to_thread(download_media, url, "best720", "video", tmp_dir, state)
         finally:
             stop_event.set()
             await progress_task
