@@ -178,7 +178,7 @@ MUSIC_PAGE_SIZE = 10
 # ------------------------------------------------------------------
 # توابع کمکی yt-dlp
 # ------------------------------------------------------------------
-def build_ydl_opts(use_cookies: bool = False, **overrides):
+def build_ydl_opts(use_cookies: bool = False, player_client=None, **overrides):
     """
     use_cookies=False (پیش‌فرض): بدون کوکی درخواست می‌ده، مثل یه کاربر
     عادی. use_cookies=True: فقط وقتی سایت صریحاً خطای "sign in / not a
@@ -191,6 +191,9 @@ def build_ydl_opts(use_cookies: bool = False, **overrides):
     }
     if use_cookies and COOKIES_FILE and Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
+    if player_client:
+        # فقط روی یوتیوب اثر داره؛ برای سایت‌های دیگه نادیده گرفته می‌شه
+        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
     opts.update(overrides)
     return opts
 
@@ -204,29 +207,60 @@ BOT_CHECK_SIGNS = (
     "this video is only available",
 )
 
+# خطای ۴۰۳ بعد از اینکه اطلاعات ویدیو با موفقیت گرفته شد: یوتیوب خود فایل
+# رو نمی‌ده (IP سرور، کوکی، یا کلاینتی که PO Token می‌خواد)
+FORBIDDEN_SIGNS = (
+    "http error 403",
+    "403: forbidden",
+    "unable to download video data",
+)
+
+ALT_YOUTUBE_CLIENT = "android_vr"  # کلاینت جایگزین که معمولاً PO Token نمی‌خواد
+
 
 def _looks_like_bot_check(err_text: str) -> bool:
     t = err_text.lower()
     return any(s in t for s in BOT_CHECK_SIGNS)
 
 
+def _is_retryable(err_text: str) -> bool:
+    t = err_text.lower()
+    return _looks_like_bot_check(t) or any(s in t for s in FORBIDDEN_SIGNS)
+
+
 def _run_with_cookie_fallback(func, *args, **kwargs):
     """
-    اول بدون کوکی امتحان می‌کنه. اگه خطا مشخصاً «ثابت کن ربات نیستی»
-    بود و کوکی داریم، فقط همون یه‌بار با کوکی دوباره امتحان می‌کنه.
+    اول بدون کوکی و با کلاینت پیش‌فرض امتحان می‌کنه. اگه خطا «ثابت کن ربات
+    نیستی» یا ۴۰۳ بود، به ترتیب تلاش‌های بعدی رو انجام می‌ده:
+      ۱) با کوکی (اگه داریم)
+      ۲) بدون کوکی با کلاینت جایگزین یوتیوب (android_vr)
     برای هر خطای دیگه (لینک اشتباه، پست خصوصی و ...) مستقیم پرتاب می‌شه.
     """
     try:
-        return func(*args, use_cookies=False, **kwargs)
-    except Exception as e:
-        if COOKIES_FILE and Path(COOKIES_FILE).exists() and _looks_like_bot_check(str(e)):
-            logger.info("bot-check detected, retrying with cookies")
-            return func(*args, use_cookies=True, **kwargs)
-        raise
+        return func(*args, use_cookies=False, player_client=None, **kwargs)
+    except Exception as first_error:
+        if not _is_retryable(str(first_error)):
+            raise
+        last_error = first_error
+
+    steps = []
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        steps.append((True, None))
+    steps.append((False, ALT_YOUTUBE_CLIENT))
+
+    for use_cookies, client in steps:
+        logger.info("retrying (cookies=%s, client=%s) after: %s", use_cookies, client, str(last_error)[:120])
+        try:
+            return func(*args, use_cookies=use_cookies, player_client=client, **kwargs)
+        except Exception as e:
+            last_error = e
+            if not _is_retryable(str(e)):
+                raise
+    raise last_error
 
 
-def _extract_info_impl(url: str, use_cookies: bool = False) -> dict:
-    with yt_dlp.YoutubeDL(build_ydl_opts(use_cookies=use_cookies)) as ydl:
+def _extract_info_impl(url: str, use_cookies: bool = False, player_client=None) -> dict:
+    with yt_dlp.YoutubeDL(build_ydl_opts(use_cookies=use_cookies, player_client=player_client)) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -373,12 +407,13 @@ def extract_track_from_metadata(info: dict):
     return None
 
 
-def _download_full_audio_impl(url: str, out_dir: str, use_cookies: bool = False):
+def _download_full_audio_impl(url: str, out_dir: str, use_cookies: bool = False, player_client=None):
     """کل صدای ویدیو رو دانلود می‌کنه (یه‌بار) تا از روش چند تیکه‌ی مختلفش
     برای تشخیص استفاده کنیم، بدون نیاز به دانلود دوباره."""
     out_tmpl = os.path.join(out_dir, "full.%(ext)s")
     opts = build_ydl_opts(
         use_cookies=use_cookies,
+        player_client=player_client,
         format="bestaudio/best",
         outtmpl=out_tmpl,
         postprocessors=[
@@ -748,7 +783,7 @@ def pick_quality_options(info: dict):
 
 
 def _download_media_impl(
-    url: str, format_id: str, kind: str, out_dir: str, progress_state=None, use_cookies: bool = False
+    url: str, format_id: str, kind: str, out_dir: str, progress_state=None, use_cookies: bool = False, player_client=None
 ) -> str:
     out_tmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
     hooks = [make_progress_hook(progress_state)] if progress_state is not None else []
@@ -756,6 +791,7 @@ def _download_media_impl(
     if kind == "audio":
         opts = build_ydl_opts(
             use_cookies=use_cookies,
+            player_client=player_client,
             format="bestaudio/best",
             outtmpl=out_tmpl,
             progress_hooks=hooks,
@@ -781,6 +817,7 @@ def _download_media_impl(
             fmt = f"{format_id}+ba/{format_id}/bv*+ba/b"
         opts = build_ydl_opts(
             use_cookies=use_cookies,
+            player_client=player_client,
             format=fmt,
             outtmpl=out_tmpl,
             merge_output_format="mp4",
@@ -1579,6 +1616,29 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
     await find_and_deliver_song(query, context, chat_id, title, artist, variant)
 
 
+def log_ytdlp_environment():
+    """نسخه‌ی yt-dlp، پیدا شدن Deno و وجود کوکی رو تو لاگ می‌نویسه (برای عیب‌یابی خطای ۴۰۳)."""
+    try:
+        import yt_dlp.version as ytv
+
+        deno_path = shutil.which("deno")
+        if not deno_path:
+            try:
+                import deno  # پکیج pip که باینری Deno رو میاره
+
+                deno_path = deno.find_deno_exe()
+            except Exception:
+                deno_path = None
+        logger.info(
+            "yt-dlp %s | deno: %s | cookies: %s",
+            ytv.__version__,
+            deno_path or "NOT FOUND",
+            bool(COOKIES_FILE and Path(COOKIES_FILE).exists()),
+        )
+    except Exception:
+        logger.exception("could not log yt-dlp environment")
+
+
 def main():
     if BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
         raise SystemExit(
@@ -1586,6 +1646,7 @@ def main():
             " مستقیم توی کد جایگزین کن."
         )
 
+    log_ytdlp_environment()
     builder = Application.builder().token(BOT_TOKEN)
     if LOCAL_API_URL:
         base = LOCAL_API_URL.rstrip("/")
