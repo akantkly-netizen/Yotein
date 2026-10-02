@@ -839,6 +839,14 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         " تو یوتیوب‌میوزیک نیستن)، پایین لیست دکمه‌ی «🔍 جستجو در"
         " یوتیوب» هست؛ بزن تا همون جستجو رو تو یوتیوب عادی هم انجام"
         " بدم\n\n"
+        "🎞 ارسال خود فایل ویدیو (نه لینک)\n"
+        "اگه خود کلیپ/ویدیو رو برام بفرستی (مثلاً فایل یه ریلز)، می‌پرسم"
+        " «چیکار کنم؟» با دو دکمه: «🎵 استخراج صدا» (صدای ویدیو رو"
+        " mp3 می‌کنم و می‌فرستم) یا «🎧 پیدا کردن آهنگ اصلی» (آهنگ"
+        " ویدیو رو تشخیص می‌دم و نسخه‌ی رسمیش رو با ویس می‌فرستم)\n"
+        "• اگه برای ویدیو کپشن بنویسی، تشخیص دقیق‌تر می‌شه\n"
+        "• دریافت فایل بزرگ‌تر از ۲۰ مگابایت فقط با سرور محلی تلگرام"
+        " (TELEGRAM_API_ID/HASH) ممکنه\n\n"
         "🎧 پیدا کردن آهنگ اصلی یه ویدیو\n"
         "زیر دکمه‌های کیفیت هر ویدیو، یه دکمه‌ی «🎵 پیدا کردن آهنگ اصلی"
         " ویدیو» هم هست. با زدنش:\n"
@@ -1237,6 +1245,66 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def has_audio_recognition() -> bool:
+    return bool(AUDD_API_KEY or (ACR_ACCESS_KEY and ACR_ACCESS_SECRET and ACR_HOST))
+
+
+async def recognize_from_audio_file(query, audio_path: str, duration: float, tmp_dir: str):
+    """تشخیص آهنگ از روی یه فایل صوتی/ویدیویی (AudD، بعد ACRCloud، تیکه‌ی اول و وسط)."""
+    await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی اول)...")
+    snippet1 = await asyncio.to_thread(
+        make_snippet, audio_path, tmp_dir, 0, SONG_SNIPPET_SECONDS, "snip1"
+    )
+    result = await asyncio.to_thread(recognize_song_via_audd, snippet1)
+    if not result:
+        result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet1)
+
+    # اگه تیکه‌ی اول (که ممکنه فقط حرف زدن باشه) جواب نداد و فایل
+    # به‌اندازه‌ی کافی طولانیه، یه تیکه‌ی دیگه از وسطش رو هم امتحان کن
+    if not result and duration and duration > 40:
+        await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی دوم)...")
+        mid_start = max(0, (duration / 2) - (SONG_SNIPPET_SECONDS / 2))
+        snippet2 = await asyncio.to_thread(
+            make_snippet, audio_path, tmp_dir, mid_start, SONG_SNIPPET_SECONDS, "snip2"
+        )
+        result = await asyncio.to_thread(recognize_song_via_audd, snippet2)
+        if not result:
+            result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet2)
+    return result
+
+
+async def find_and_deliver_song(query, context, chat_id: int, title: str, artist, variant=None):
+    """بعد از شناسایی اسم آهنگ: نسخه‌ی رسمیش رو پیدا و ویدیو + ویس رو می‌فرسته."""
+    label = f"{title} - {artist}" if artist else title
+    variant_txt = f" ({variant})" if variant else ""
+    await set_status(
+        query, f"🎵 آهنگ اصلی: {label}{variant_txt}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
+    )
+
+    search_query = label if not variant else f"{label} {variant}"
+    try:
+        best = await asyncio.to_thread(search_music, search_query)
+    except Exception as e:
+        logger.exception("search_music failed in find_and_deliver_song")
+        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        return
+
+    if not best:
+        artist_txt = f"\nخواننده: {artist}" if artist else ""
+        await set_status(
+            query,
+            f"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\n"
+            "می‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.",
+        )
+        return
+
+    best_url = best.get("url") or best.get("webpage_url") or best.get("id")
+    if best.get("id") and not str(best_url).startswith("http"):
+        best_url = f"https://www.youtube.com/watch?v={best['id']}"
+
+    await deliver_song(query, context, chat_id, best_url, title, artist)
+
+
 async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """کاربر دکمه‌ی «پیدا کردن آهنگ اصلی ویدیو» رو زده."""
     query = update.callback_query
@@ -1284,7 +1352,7 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # حالت ۳: هیچ‌کدوم بالا جواب نداد -> از روی خود صدای ویدیو تشخیص بدیم
     if not title:
-        if not (AUDD_API_KEY or (ACR_ACCESS_KEY and ACR_ACCESS_SECRET and ACR_HOST)):
+        if not has_audio_recognition():
             hint = (
                 " یا یه GEMINI_API_KEY رایگان از aistudio.google.com بگیر تا"
                 " از روی کپشن ویدیو حدس بزنم"
@@ -1303,26 +1371,7 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_dir = tempfile.mkdtemp(prefix="song_id_")
         try:
             full_audio_path, duration = await asyncio.to_thread(download_full_audio, url, tmp_dir)
-
-            await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی اول)...")
-            snippet1 = await asyncio.to_thread(
-                make_snippet, full_audio_path, tmp_dir, 0, SONG_SNIPPET_SECONDS, "snip1"
-            )
-            result = await asyncio.to_thread(recognize_song_via_audd, snippet1)
-            if not result:
-                result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet1)
-
-            # اگه تیکه‌ی اول (که ممکنه فقط حرف زدن باشه) جواب نداد و ویدیو
-            # به‌اندازه‌ی کافی طولانیه، یه تیکه‌ی دیگه از وسط ویدیو رو هم امتحان کن
-            if not result and duration and duration > 40:
-                await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی دوم)...")
-                mid_start = max(0, (duration / 2) - (SONG_SNIPPET_SECONDS / 2))
-                snippet2 = await asyncio.to_thread(
-                    make_snippet, full_audio_path, tmp_dir, mid_start, SONG_SNIPPET_SECONDS, "snip2"
-                )
-                result = await asyncio.to_thread(recognize_song_via_audd, snippet2)
-                if not result:
-                    result = await asyncio.to_thread(recognize_song_via_acrcloud, snippet2)
+            result = await recognize_from_audio_file(query, full_audio_path, duration, tmp_dir)
         except Exception as e:
             logger.exception("find_song audio recognition failed")
             await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
@@ -1339,34 +1388,185 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         title, artist = result
 
-    label = f"{title} - {artist}" if artist else title
-    variant_txt = f" ({variant})" if variant else ""
-    await set_status(
-        query, f"🎵 آهنگ اصلی این ویدیو: {label}{variant_txt}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
-    )
+    await find_and_deliver_song(query, context, chat_id, title, artist, variant)
 
-    search_query = label if not variant else f"{label} {variant}"
+
+# ------------------------------------------------------------------
+# فایل ویدیوی ارسالی (نه لینک): کاربر خود کلیپ رو می‌فرسته
+# ------------------------------------------------------------------
+UPLOADS = {}  # key -> {"file_id", "file_size", "name", "caption"}
+TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB = 20  # سقف دریافت فایل با سرور رسمی تلگرام
+
+
+def probe_duration(path: str) -> float:
     try:
-        best = await asyncio.to_thread(search_music, search_query)
-    except Exception as e:
-        logger.exception("search_music failed in find_song")
-        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def extract_mp3(src: str, out_dir: str, name: str = "audio") -> str:
+    out_path = os.path.join(out_dir, f"{name}.mp3")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-vn", "-acodec", "libmp3lame", "-q:a", "2", out_path],
+        check=True, capture_output=True, timeout=600,
+    )
+    return out_path
+
+
+async def handle_uploaded_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر خود فایل ویدیو/صدا رو فرستاده -> می‌پرسیم چیکار کنم."""
+    message = update.message
+    media = message.video or message.video_note or message.audio or message.document
+    if not media:
         return
 
-    if not best:
-        artist_txt = f"\nخواننده: {artist}" if artist else ""
+    key = f"{message.chat_id}_{message.message_id}"
+    UPLOADS[key] = {
+        "file_id": media.file_id,
+        "file_size": media.file_size or 0,
+        "name": getattr(media, "file_name", None) or "",
+        "caption": message.caption or "",
+    }
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 استخراج صدا", callback_data=f"fa|{key}")],
+        [InlineKeyboardButton("🎧 پیدا کردن آهنگ اصلی", callback_data=f"fs|{key}")],
+    ])
+    await message.reply_text("🎞 فایلت رو گرفتم. چیکار کنم؟", reply_markup=markup, reply_to_message_id=message.message_id)
+
+
+async def download_uploaded_file(query, context, entry: dict, tmp_dir: str):
+    """فایل ارسالی کاربر رو از تلگرام دانلود می‌کنه؛ اگه نشد None برمی‌گردونه (و پیام خطا می‌ده)."""
+    size_mb = (entry["file_size"] or 0) / 1024 / 1024
+    if not LOCAL_API_URL and size_mb > TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB:
         await set_status(
             query,
-            f"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\n"
-            "می‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.",
+            f"❌ حجم فایل {size_mb:.1f}MB هست و ربات با سرور رسمی تلگرام فقط تا"
+            f" {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB رو می‌تونه دریافت کنه. برای فایل‌های"
+            " بزرگ‌تر باید TELEGRAM_API_ID و TELEGRAM_API_HASH ست بشن (سرور محلی).",
         )
+        return None
+
+    await set_status(query, "⬇️ در حال دریافت فایل از تلگرام...")
+    try:
+        tg_file = await context.bot.get_file(entry["file_id"])
+        ext = Path(entry["name"]).suffix or ".mp4"
+        path = os.path.join(tmp_dir, "input" + ext)
+        await tg_file.download_to_drive(path)
+    except BadRequest as e:
+        if "too big" in str(e).lower():
+            await set_status(query, "❌ این فایل برای دریافت توسط ربات خیلی بزرگه (سقف ۲۰ مگابایت بدون سرور محلی).")
+            return None
+        raise
+    return path
+
+
+async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        return
+    entry = UPLOADS.get(key)
+    if not entry:
+        await set_status(query, "⌛ این درخواست منقضی شده، فایل رو دوباره بفرست.")
         return
 
-    best_url = best.get("url") or best.get("webpage_url") or best.get("id")
-    if best.get("id") and not str(best_url).startswith("http"):
-        best_url = f"https://www.youtube.com/watch?v={best['id']}"
+    tmp_dir = tempfile.mkdtemp(prefix="up_audio_")
+    try:
+        path = await download_uploaded_file(query, context, entry, tmp_dir)
+        if not path:
+            return
+        await set_status(query, "🎶 در حال استخراج صدا...")
+        mp3_path = await asyncio.to_thread(extract_mp3, path, tmp_dir)
 
-    await deliver_song(query, context, chat_id, best_url, title, artist)
+        size_mb = os.path.getsize(mp3_path) / 1024 / 1024
+        if size_mb > MAX_TELEGRAM_UPLOAD_MB:
+            await set_status(query, f"❌ حجم فایل صوتی {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB بیشتره.")
+            return
+
+        title = Path(entry["name"]).stem or None
+        with open(mp3_path, "rb") as f:
+            await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
+        await set_status(query, "✅ صدا ارسال شد!")
+    except Exception as e:
+        logger.exception("upload extract audio failed")
+        await set_status(query, "❌ استخراج صدا با خطا مواجه شد:\n" + str(e)[:300])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        UPLOADS.pop(key, None)
+
+
+async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        return
+    entry = UPLOADS.get(key)
+    if not entry:
+        await set_status(query, "⌛ این درخواست منقضی شده، فایل رو دوباره بفرست.")
+        return
+
+    chat_id = query.message.chat_id
+    title = artist = variant = None
+
+    # اگه کاربر کپشن یا اسم فایل گذاشته، اول Gemini اون رو بررسی کنه
+    if GEMINI_API_KEY and (entry["caption"] or entry["name"]):
+        await set_status(query, "🤖 در حال بررسی کپشن با هوش مصنوعی...")
+        try:
+            ai_result = await asyncio.to_thread(
+                ai_identify_song, entry["name"], entry["caption"], ""
+            )
+        except Exception:
+            logger.exception("ai_identify_song failed for upload")
+            ai_result = None
+        if ai_result:
+            title, artist, variant = ai_result
+
+    if not title:
+        if not has_audio_recognition():
+            await set_status(
+                query,
+                "ℹ️ برای تشخیص آهنگ از روی صدای فایل باید یه AUDD_API_KEY (یا"
+                " ACRCloud) تنظیم بشه.",
+            )
+            UPLOADS.pop(key, None)
+            return
+
+        tmp_dir = tempfile.mkdtemp(prefix="up_song_")
+        try:
+            path = await download_uploaded_file(query, context, entry, tmp_dir)
+            if not path:
+                return
+            duration = await asyncio.to_thread(probe_duration, path)
+            result = await recognize_from_audio_file(query, path, duration, tmp_dir)
+        except Exception as e:
+            logger.exception("upload find song failed")
+            await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+            return
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if not result:
+            await set_status(
+                query,
+                "❌ نتونستم آهنگ این فایل رو تشخیص بدم. شاید صدای پس‌زمینه"
+                " واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.",
+            )
+            UPLOADS.pop(key, None)
+            return
+        title, artist = result
+
+    UPLOADS.pop(key, None)
+    await find_and_deliver_song(query, context, chat_id, title, artist, variant)
 
 
 def main():
@@ -1386,9 +1586,16 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ABOUT)}$"), about_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_MUSIC)}$"), music_button))
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.VIDEO_NOTE | filters.AUDIO
+        | filters.Document.VIDEO | filters.Document.AUDIO,
+        handle_uploaded_media,
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(handle_find_song, pattern=r"^song\|"))
+    app.add_handler(CallbackQueryHandler(handle_upload_extract_audio, pattern=r"^fa\|"))
+    app.add_handler(CallbackQueryHandler(handle_upload_find_song, pattern=r"^fs\|"))
     app.add_handler(CallbackQueryHandler(handle_music_page, pattern=r"^mpage\|"))
     app.add_handler(CallbackQueryHandler(handle_music_youtube_fallback, pattern=r"^myoutube\|"))
     app.add_handler(CallbackQueryHandler(handle_music_pick, pattern=r"^mpick\|"))
