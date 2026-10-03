@@ -205,6 +205,10 @@ BOT_CHECK_SIGNS = (
     "confirm you are not a bot",
     "login required",
     "this video is only available",
+    # اینستاگرام (مخصوصاً استوری‌ها) همیشه لاگین می‌خواد
+    "you need to log in",
+    "log in to access",
+    "use --cookies",
 )
 
 # خطای ۴۰۳ بعد از اینکه اطلاعات ویدیو با موفقیت گرفته شد: یوتیوب خود فایل
