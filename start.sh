@@ -27,6 +27,7 @@ if [ -n "$TELEGRAM_API_ID" ] && [ -n "$TELEGRAM_API_HASH" ]; then
     telegram-bot-api \
         --api-id="$TELEGRAM_API_ID" \
         --api-hash="$TELEGRAM_API_HASH" \
+        --local \
         --http-port=8081 \
         --dir=/data/telegram-bot-api \
         --verbosity=1 &

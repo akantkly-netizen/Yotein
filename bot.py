@@ -1180,6 +1180,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_quality_picker(update.message, chat_id, url, status_msg)
 
 
+async def send_media_file(bot, kind: str, chat_id: int, path: str, **kwargs):
+    """
+    فایل (video یا audio) رو به تلگرام می‌فرسته.
+    اگه سرور محلی فعاله، فقط «مسیر فایل» رو می‌دیم (file://) تا خود سرور فایل رو
+    از دیسک بخونه و آپلود کنه؛ این‌جوری کل فایل (که ممکنه چند صد مگ باشه)
+    تو رمِ ربات لود نمی‌شه و از طریق HTTP هم رد و بدل نمی‌شه.
+    اگه این روش با BadRequest شکست خورد، آپلود معمولی انجام می‌شه.
+    """
+    send = bot.send_video if kind == "video" else bot.send_audio
+    if LOCAL_API_URL:
+        try:
+            return await send(chat_id=chat_id, **{kind: path}, **kwargs)
+        except BadRequest:
+            logger.exception("sending by local path failed; falling back to normal upload")
+    with open(path, "rb") as f:
+        return await send(chat_id=chat_id, **{kind: f}, **kwargs)
+
+
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1223,13 +1241,18 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        await set_status(query, "📤 در حال ارسال فایل...")
+        await set_status(
+            query,
+            f"📤 در حال ارسال فایل ({size_mb:.0f}MB)...\n"
+            "فایل‌های بزرگ ممکنه چند دقیقه طول بکشه، صبور باش.",
+        )
         chat_id = query.message.chat_id
-        with open(file_path, "rb") as f:
-            if kind == "audio":
-                await context.bot.send_audio(chat_id=chat_id, audio=f)
-            else:
-                await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+        if kind == "audio":
+            await send_media_file(context.bot, "audio", chat_id, file_path)
+        else:
+            await send_media_file(
+                context.bot, "video", chat_id, file_path, supports_streaming=True
+            )
 
         await set_status(query, "✅ ارسال شد!")
     except Exception as e:
@@ -1262,10 +1285,11 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
 
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
         if video_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
-            with open(video_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=chat_id, video=f, supports_streaming=True, caption=f"🎬 {label}"
-                )
+            await set_status(query, f"📤 در حال ارسال ویدیو ({video_size_mb:.0f}MB)...")
+            await send_media_file(
+                context.bot, "video", chat_id, video_path,
+                supports_streaming=True, caption=f"🎬 {label}",
+            )
         else:
             await query.message.reply_text(
                 f"⚠️ حجم ویدیو {video_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
@@ -1276,13 +1300,10 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         audio_path = await asyncio.to_thread(download_media, url, "bestaudio", "audio", tmp_dir)
         audio_size_mb = os.path.getsize(audio_path) / 1024 / 1024
         if audio_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
-            with open(audio_path, "rb") as f:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=f,
-                    title=title,
-                    performer=artist or None,
-                )
+            await send_media_file(
+                context.bot, "audio", chat_id, audio_path,
+                title=title, performer=artist or None,
+            )
         else:
             await query.message.reply_text(
                 f"⚠️ حجم فایل صوتی {audio_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
@@ -1543,8 +1564,9 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
             return
 
         title = Path(entry["name"]).stem or None
-        with open(mp3_path, "rb") as f:
-            await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
+        await send_media_file(
+            context.bot, "audio", query.message.chat_id, mp3_path, title=title
+        )
         await set_status(query, "✅ صدا ارسال شد!")
     except Exception as e:
         logger.exception("upload extract audio failed")
@@ -1651,11 +1673,27 @@ def main():
         )
 
     log_ytdlp_environment()
-    builder = Application.builder().token(BOT_TOKEN)
+    builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # آپلود فایل‌های بزرگ دقیقه‌ها طول می‌کشه؛ تایم‌اوت پیش‌فرض (۵ تا ۲۰
+        # ثانیه) وسط ارسال قطعش می‌کرد
+        .connect_timeout(30)
+        .read_timeout(1800)
+        .write_timeout(1800)
+        .pool_timeout(30)
+        # تا وقتی یه فایل بزرگ داره ارسال می‌شه، ربات به بقیه (و بقیه‌ی
+        # کاربرها) هم جواب بده
+        .concurrent_updates(True)
+    )
     if LOCAL_API_URL:
         base = LOCAL_API_URL.rstrip("/")
-        builder = builder.base_url(f"{base}/bot").base_file_url(f"{base}/file/bot")
-        logger.info("using local Bot API server at %s", base)
+        builder = (
+            builder.base_url(f"{base}/bot")
+            .base_file_url(f"{base}/file/bot")
+            .local_mode(True)  # فایل‌ها با مسیر (file://) رد و بدل می‌شن
+        )
+        logger.info("using local Bot API server at %s (local mode)", base)
     app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
