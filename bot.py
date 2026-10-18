@@ -1189,13 +1189,50 @@ async def send_media_file(bot, kind: str, chat_id: int, path: str, **kwargs):
     اگه این روش با BadRequest شکست خورد، آپلود معمولی انجام می‌شه.
     """
     send = bot.send_video if kind == "video" else bot.send_audio
-    if LOCAL_API_URL:
-        try:
-            return await send(chat_id=chat_id, **{kind: path}, **kwargs)
-        except BadRequest:
-            logger.exception("sending by local path failed; falling back to normal upload")
-    with open(path, "rb") as f:
-        return await send(chat_id=chat_id, **{kind: f}, **kwargs)
+    size_mb = os.path.getsize(path) / 1024 / 1024
+    started = time.monotonic()
+    logger.info("sending %s (%.1fMB) to chat %s, local_mode=%s", kind, size_mb, chat_id, bool(LOCAL_API_URL))
+    try:
+        if LOCAL_API_URL:
+            try:
+                result = await send(chat_id=chat_id, **{kind: path}, **kwargs)
+                logger.info("sent %s in %.0fs (by local path)", kind, time.monotonic() - started)
+                return result
+            except BadRequest:
+                logger.exception("sending by local path failed; falling back to normal upload")
+        with open(path, "rb") as f:
+            result = await send(chat_id=chat_id, **{kind: f}, **kwargs)
+        logger.info("sent %s in %.0fs (normal upload)", kind, time.monotonic() - started)
+        return result
+    except Exception:
+        logger.exception("sending %s failed after %.0fs", kind, time.monotonic() - started)
+        raise
+
+
+async def with_heartbeat(query, text: str, coro, interval: int = 20):
+    """
+    coro (مثلاً ارسال فایل بزرگ) رو اجرا می‌کنه و تا وقتی تموم نشده، هر چند
+    ثانیه پیام وضعیت رو با زمان سپری‌شده آپدیت می‌کنه. اگه ربات وسط کار
+    بمیره/ری‌استارت بشه، شمارنده از حرکت می‌ایسته و کاربر می‌فهمه.
+    """
+    stop = asyncio.Event()
+    started = time.monotonic()
+
+    async def beat():
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                elapsed = int(time.monotonic() - started)
+                await set_status(query, f"{text}\n⏱ {elapsed // 60}:{elapsed % 60:02d}")
+
+    task = asyncio.create_task(beat())
+    try:
+        return await coro
+    finally:
+        stop.set()
+        await task
 
 
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1241,17 +1278,21 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        await set_status(
-            query,
+        sending_text = (
             f"📤 در حال ارسال فایل ({size_mb:.0f}MB)...\n"
-            "فایل‌های بزرگ ممکنه چند دقیقه طول بکشه، صبور باش.",
+            "فایل‌های بزرگ ممکنه چند دقیقه طول بکشه، صبور باش."
         )
+        await set_status(query, sending_text)
         chat_id = query.message.chat_id
         if kind == "audio":
-            await send_media_file(context.bot, "audio", chat_id, file_path)
+            await with_heartbeat(
+                query, sending_text,
+                send_media_file(context.bot, "audio", chat_id, file_path),
+            )
         else:
-            await send_media_file(
-                context.bot, "video", chat_id, file_path, supports_streaming=True
+            await with_heartbeat(
+                query, sending_text,
+                send_media_file(context.bot, "video", chat_id, file_path, supports_streaming=True),
             )
 
         await set_status(query, "✅ ارسال شد!")
@@ -1285,10 +1326,14 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
 
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
         if video_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
-            await set_status(query, f"📤 در حال ارسال ویدیو ({video_size_mb:.0f}MB)...")
-            await send_media_file(
-                context.bot, "video", chat_id, video_path,
-                supports_streaming=True, caption=f"🎬 {label}",
+            video_text = f"📤 در حال ارسال ویدیو ({video_size_mb:.0f}MB)..."
+            await set_status(query, video_text)
+            await with_heartbeat(
+                query, video_text,
+                send_media_file(
+                    context.bot, "video", chat_id, video_path,
+                    supports_streaming=True, caption=f"🎬 {label}",
+                ),
             )
         else:
             await query.message.reply_text(
