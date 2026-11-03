@@ -147,6 +147,13 @@ PINTEREST_URL_RE = re.compile(
 SUPPORTED_URL_RE = re.compile(
     f"({INSTAGRAM_URL_RE.pattern})|({YOUTUBE_URL_RE.pattern})|({TIKTOK_URL_RE.pattern})"
 )
+# لینک پلی‌لیست یوتیوب (همونی که /playlist?list=... داره). لینک ویدیو که
+# &list=... داره هنوز مثل قبل فقط همون یه ویدیو حساب می‌شه.
+PLAYLIST_URL_RE = re.compile(
+    r"(https?://)?(www\.|m\.|music\.)?youtube\.com/playlist\?[^\s]*list=[\w\-]+[^\s]*"
+)
+PLAYLIST_PAGE_SIZE = 5      # تعداد ویدیو تو هر صفحه
+PLAYLIST_MAX_ITEMS = 300    # سقف تعداد ویدیوهایی که از یه پلی‌لیست خونده می‌شه
 
 # ------------------------------------------------------------------
 # کیبورد پایین صفحه (Reply Keyboard)
@@ -172,6 +179,9 @@ WAITING_MUSIC_QUERY = set()
 # نگهداری موقت نتایج جستجوی موزیک برای صفحه‌بندی
 # key: کد کوتاه (chat_id_msgid) -> {"entries": [...], "query": "..."}
 MUSIC_SESSIONS = {}
+
+# نتایج پلی‌لیست‌های بازشده: key (chat_id_msgid) -> {"entries", "title", ...}
+PLAYLISTS = {}
 MUSIC_PAGE_SIZE = 10
 
 
@@ -890,6 +900,13 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         " تو یوتیوب‌میوزیک نیستن)، پایین لیست دکمه‌ی «🔍 جستجو در"
         " یوتیوب» هست؛ بزن تا همون جستجو رو تو یوتیوب عادی هم انجام"
         " بدم\n\n"
+        "📃 پلی‌لیست یوتیوب\n"
+        "لینک یه پلی‌لیست (همونی که /playlist?list=... داره) رو بفرست؛ اطلاعات"
+        " پلی‌لیست و ویدیوهاش ۵تا-۵تا صفحه‌بندی می‌شن. روی هر ویدیو بزنی،"
+        " اطلاعات و تصویرش میاد و می‌تونی کیفیت رو انتخاب و دانلودش کنی."
+        " با «▶️ صفحه بعد» و «◀️ صفحه قبل» بین صفحه‌ها برو و آخرش"
+        " «✅ کارم تموم شد» رو بزن تا دکمه‌ها بسته بشن (اطلاعات پلی‌لیست"
+        " می‌مونه)\n\n"
         "🎞 ارسال خود فایل ویدیو (نه لینک)\n"
         "اگه خود کلیپ/ویدیو رو برام بفرستی (مثلاً فایل یه ریلز)، می‌پرسم"
         " «چیکار کنم؟» با دو دکمه: «🎵 استخراج صدا» (صدای ویدیو رو"
@@ -1157,6 +1174,216 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
     await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
 
+# ------------------------------------------------------------------
+# پلی‌لیست یوتیوب: ۵تا-۵تا صفحه‌بندی، انتخاب ویدیو، «کارم تموم شد»
+# ------------------------------------------------------------------
+def _extract_playlist_impl(url: str, use_cookies: bool = False, player_client=None) -> dict:
+    opts = build_ydl_opts(
+        use_cookies=use_cookies,
+        player_client=player_client,
+        extract_flat="in_playlist",   # فقط فهرست (سریع)، بدون باز کردن تک‌تک ویدیوها
+        noplaylist=False,
+        playlistend=PLAYLIST_MAX_ITEMS,
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def extract_playlist(url: str) -> dict:
+    return _run_with_cookie_fallback(_extract_playlist_impl, url)
+
+
+def parse_playlist_entries(info: dict):
+    """(فهرست ویدیوهای قابل‌دانلود، تعداد موارد خصوصی/حذف‌شده) رو برمی‌گردونه."""
+    entries, skipped = [], 0
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        vid = e.get("id")
+        title = (e.get("title") or "").strip()
+        if not vid or title.startswith("[Private video]") or title.startswith("[Deleted video]"):
+            skipped += 1
+            continue
+        entries.append({
+            "id": vid,
+            "title": title or vid,
+            "duration": e.get("duration"),
+        })
+    return entries, skipped
+
+
+def playlist_info_text(session: dict) -> str:
+    """بلوک اطلاعات پلی‌لیست که همیشه تو پیام می‌مونه (حتی بعد از «کارم تموم شد»)."""
+    title = session["title"]
+    if len(title) > 200:
+        title = title[:200] + "…"
+    lines = [f"📃 {title}"]
+    if session["uploader"]:
+        lines.append(f"👤 {session['uploader']}")
+    count_line = f"🎞 {len(session['entries'])} ویدیو"
+    if session["skipped"]:
+        count_line += f" ({session['skipped']} مورد خصوصی/حذف‌شده نادیده گرفته شد)"
+    lines.append(count_line)
+    desc = (session["description"] or "").strip()
+    if desc:
+        lines.append(desc[:250] + ("…" if len(desc) > 250 else ""))
+    return "\n".join(lines)
+
+
+def playlist_total_pages(session: dict) -> int:
+    return max(1, math.ceil(len(session["entries"]) / PLAYLIST_PAGE_SIZE))
+
+
+def playlist_page_text(session: dict, page: int) -> str:
+    return (
+        f"{playlist_info_text(session)}\n\n"
+        f"صفحه {page + 1} از {playlist_total_pages(session)} — یکی رو انتخاب کن:"
+    )
+
+
+def build_playlist_markup(key: str, session: dict, page: int) -> InlineKeyboardMarkup:
+    """۵ ویدیو + (صفحه قبل/بعد) + «کارم تموم شد»."""
+    entries = session["entries"]
+    total_pages = playlist_total_pages(session)
+    start = page * PLAYLIST_PAGE_SIZE
+
+    buttons = []
+    for i, e in enumerate(entries[start:start + PLAYLIST_PAGE_SIZE]):
+        idx = start + i
+        label = f"{idx + 1}. {e['title']}"
+        if e.get("duration"):
+            m, sec = divmod(int(e["duration"]), 60)
+            h, m = divmod(m, 60)
+            label += f" ({h}:{m:02d}:{sec:02d})" if h else f" ({m}:{sec:02d})"
+        if len(label) > 62:
+            label = label[:59] + "…"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"plpick|{key}|{idx}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"plpage|{key}|{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️ صفحه بعد", callback_data=f"plpage|{key}|{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("✅ کارم تموم شد", callback_data=f"pldone|{key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def edit_message_with_markup(query, text: str, markup):
+    """متن/کپشن و دکمه‌های یه پیام رو یه‌جا عوض می‌کنه؛ markup=None دکمه‌ها رو می‌بنده."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=text, reply_markup=markup)
+        else:
+            await query.edit_message_text(text, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("edit_message_with_markup failed: %s", e)
+
+
+async def show_playlist(message, chat_id: int, url: str, status_msg):
+    try:
+        info = await asyncio.to_thread(extract_playlist, url)
+    except Exception as e:
+        logger.exception("extract_playlist failed")
+        await status_msg.edit_text(
+            "❌ نتونستم پلی‌لیست رو بخونم. ممکنه خصوصی باشه یا لینک اشتباه باشه.\n"
+            "جزئیات خطا: " + str(e)[:300]
+        )
+        return
+
+    entries, skipped = parse_playlist_entries(info)
+    if not entries:
+        await status_msg.edit_text("این پلی‌لیست ویدیوی قابل‌دسترسی نداره (خالیه یا همه‌ی ویدیوهاش خصوصی/حذف‌شده‌ان).")
+        return
+
+    session = {
+        "entries": entries,
+        "skipped": skipped,
+        "title": info.get("title") or "پلی‌لیست",
+        "uploader": info.get("uploader") or info.get("channel") or "",
+        "description": info.get("description") or "",
+    }
+
+    thumb = None
+    thumbs = info.get("thumbnails") or []
+    if thumbs and thumbs[-1].get("url"):
+        thumb = thumbs[-1]["url"]
+    if not thumb:
+        thumb = f"https://i.ytimg.com/vi/{entries[0]['id']}/hqdefault.jpg"
+
+    caption = playlist_page_text(session, 0)
+    await status_msg.delete()
+    try:
+        sent = await message.reply_photo(photo=thumb, caption=caption)
+    except Exception:
+        logger.exception("playlist thumbnail failed, falling back to text")
+        sent = await message.reply_text(caption)
+
+    key = f"{chat_id}_{sent.message_id}"
+    PLAYLISTS[key] = session
+    await sent.edit_reply_markup(reply_markup=build_playlist_markup(key, session, 0))
+
+
+async def handle_playlist_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, key, page_str = query.data.split("|", 2)
+        page = int(page_str)
+    except ValueError:
+        return
+    session = PLAYLISTS.get(key)
+    if not session:
+        await set_status(query, "⌛ این پلی‌لیست منقضی شده، لینکش رو دوباره بفرست.")
+        return
+    page = max(0, min(page, playlist_total_pages(session) - 1))
+    await edit_message_with_markup(
+        query, playlist_page_text(session, page), build_playlist_markup(key, session, page)
+    )
+
+
+async def handle_playlist_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """روی یکی از ویدیوهای پلی‌لیست زده شد -> اطلاعات و گرافیک و دکمه‌های دانلودش میاد."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, key, idx_str = query.data.split("|", 2)
+        idx = int(idx_str)
+    except ValueError:
+        return
+    session = PLAYLISTS.get(key)
+    if not session:
+        await set_status(query, "⌛ این پلی‌لیست منقضی شده، لینکش رو دوباره بفرست.")
+        return
+    if idx < 0 or idx >= len(session["entries"]):
+        return
+
+    entry = session["entries"][idx]
+    url = f"https://www.youtube.com/watch?v={entry['id']}"
+    chat_id = query.message.chat_id
+    status_msg = await query.message.reply_text("⏳ دارم اطلاعات ویدیو رو می‌گیرم...")
+    await show_quality_picker(query.message, chat_id, url, status_msg)
+
+
+async def handle_playlist_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«کارم تموم شد»: دکمه‌های شیشه‌ای بسته می‌شن ولی اطلاعات پلی‌لیست می‌مونه."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        return
+    session = PLAYLISTS.pop(key, None)
+    if session:
+        base = playlist_info_text(session)
+    else:
+        base = query.message.caption or query.message.text or ""
+    await edit_message_with_markup(query, f"{base}\n\n✅ کارم تموم شد.", None)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
@@ -1164,6 +1391,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in WAITING_MUSIC_QUERY:
         WAITING_MUSIC_QUERY.discard(chat_id)
         await handle_music_query(update, context, text)
+        return
+
+    pl_match = PLAYLIST_URL_RE.search(text)
+    if pl_match:
+        status_msg = await update.message.reply_text("⏳ دارم پلی‌لیست رو می‌خونم...")
+        await show_playlist(update.message, chat_id, pl_match.group(0), status_msg)
         return
 
     match = SUPPORTED_URL_RE.search(text)
@@ -1757,6 +1990,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_music_page, pattern=r"^mpage\|"))
     app.add_handler(CallbackQueryHandler(handle_music_youtube_fallback, pattern=r"^myoutube\|"))
     app.add_handler(CallbackQueryHandler(handle_music_pick, pattern=r"^mpick\|"))
+    app.add_handler(CallbackQueryHandler(handle_playlist_page, pattern=r"^plpage\|"))
+    app.add_handler(CallbackQueryHandler(handle_playlist_pick, pattern=r"^plpick\|"))
+    app.add_handler(CallbackQueryHandler(handle_playlist_done, pattern=r"^pldone\|"))
 
     logger.info("ربات در حال اجراست...")
     app.run_polling()
