@@ -928,6 +928,8 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "۴. اگه پیدا نشد، لااقل اسم خواننده رو (اگه شناسایی شده باشه)"
         " بهت می‌گم تا خودت دستی جستجو کنی\n\n"
         "⚠️ نکات مهم\n"
+        f"• برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست جدید"
+        " می‌تونی بدی؛ اگه زود بفرستی، می‌گم چند ثانیه صبر کنی\n"
         "• پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل دانلود"
         " نیستن\n"
         "• فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده دارید"
@@ -1097,7 +1099,7 @@ async def handle_music_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_quality_picker(query.message, chat_id, video_url, status_msg, offer_find_song=False)
 
 
-async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, offer_find_song: bool = True):
+async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, offer_find_song: bool = True, user_msg_id=None):
     """
     اطلاعات لینک رو می‌گیره، تامبنیل+توضیحات رو نشون می‌ده و دکمه‌های
     کیفیت رو می‌سازه. هم برای لینک مستقیم استفاده می‌شه هم برای نتیجه‌ی
@@ -1156,6 +1158,8 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         "url": url,
         "options": {o["format_id"] + "_" + o["kind"]: o for o in options},
         "known_track": known_track,
+        "user_msg_id": user_msg_id,   # پیام لینکِ خود کاربر (بعد از ارسال پاک می‌شه)
+        "link": normalize_link(url),
         "video_meta": {
             "title": info.get("title") or "",
             "description": info.get("description") or "",
@@ -1387,14 +1391,23 @@ async def handle_playlist_done(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+
+    remaining = cooldown_remaining(_last_message_at, user_id, record=False)
+    if remaining:
+        await warn_slow_down(update.message, user_id, remaining)
+        return
 
     if chat_id in WAITING_MUSIC_QUERY:
         WAITING_MUSIC_QUERY.discard(chat_id)
+        if text:
+            mark_request(_last_message_at, user_id)
         await handle_music_query(update, context, text)
         return
 
     pl_match = PLAYLIST_URL_RE.search(text)
     if pl_match:
+        mark_request(_last_message_at, user_id)
         status_msg = await update.message.reply_text("⏳ دارم پلی‌لیست رو می‌خونم...")
         await show_playlist(update.message, chat_id, pl_match.group(0), status_msg)
         return
@@ -1408,9 +1421,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    mark_request(_last_message_at, user_id)
     url = match.group(0)
     status_msg = await update.message.reply_text("⏳ دارم اطلاعات لینک رو می‌گیرم...")
-    await show_quality_picker(update.message, chat_id, url, status_msg)
+    await show_quality_picker(
+        update.message, chat_id, url, status_msg, user_msg_id=update.message.message_id
+    )
+
+
+# ------------------------------------------------------------------
+# ضد اسپم: هر کاربر هر REQUEST_COOLDOWN_SECONDS ثانیه فقط یه درخواست جدید بده
+# (دو شمارنده‌ی جدا: «پیام درخواست» مثل لینک/جستجو/فایل، و «شروع کار» مثل
+# زدن دکمه‌ی دانلود؛ پس لینک فرستادن و بعدش زدن دکمه‌ی دانلود به هم گیر نمی‌دن)
+# ------------------------------------------------------------------
+REQUEST_COOLDOWN_SECONDS = int(os.environ.get("REQUEST_COOLDOWN_SECONDS", "20"))
+_last_message_at = {}
+_last_job_at = {}
+_last_warn_at = {}
+
+
+def _prune_cooldowns(store: dict):
+    if len(store) > 5000:
+        cutoff = time.monotonic() - REQUEST_COOLDOWN_SECONDS * 2
+        for k in [k for k, v in store.items() if v < cutoff]:
+            store.pop(k, None)
+
+
+def cooldown_remaining(store: dict, user_id, record: bool = True) -> int:
+    """0 یعنی مجازه (و اگه record=True ثبت می‌شه)؛ وگرنه چند ثانیه‌ی باقی‌مونده."""
+    if REQUEST_COOLDOWN_SECONDS <= 0:
+        return 0
+    now = time.monotonic()
+    last = store.get(user_id)
+    if last is not None:
+        remaining = REQUEST_COOLDOWN_SECONDS - (now - last)
+        if remaining > 0:
+            return math.ceil(remaining)
+    if record:
+        store[user_id] = now
+        _prune_cooldowns(store)
+    return 0
+
+
+def mark_request(store: dict, user_id):
+    store[user_id] = time.monotonic()
+
+
+async def warn_slow_down(message, user_id, remaining: int):
+    """پیام «صبر کن» (حداکثر هر ۵ ثانیه یه بار، که خودش اسپم نشه)."""
+    now = time.monotonic()
+    last = _last_warn_at.get(user_id)
+    if last is not None and now - last < 5:
+        return
+    _last_warn_at[user_id] = now
+    await message.reply_text(
+        f"⏳ برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست"
+        f" می‌تونی بدی.\nلطفاً {remaining} ثانیه دیگه دوباره بفرست."
+    )
+
+
+async def job_allowed(query) -> bool:
+    """برای دکمه‌هایی که کار سنگین شروع می‌کنن (دانلود، تشخیص آهنگ، ...)."""
+    remaining = cooldown_remaining(_last_job_at, query.from_user.id)
+    if remaining:
+        await query.answer(
+            f"⏳ برای جلوگیری از اسپم، {remaining} ثانیه دیگه صبر کن و دوباره بزن.",
+            show_alert=True,
+        )
+        return False
+    await query.answer()
+    return True
+
+
+# ------------------------------------------------------------------
+# تمیزکاری بعد از ارسال + دکمه‌ی «لینک» زیر فایل
+# ------------------------------------------------------------------
+def normalize_link(url: str) -> str:
+    return url if url.startswith(("http://", "https://")) else "https://" + url
+
+
+def link_markup(url: str) -> InlineKeyboardMarkup:
+    """یه دکمه‌ی شیشه‌ای «🔗 لینک» که با زدنش لینک اصلی باز می‌شه."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 لینک", url=normalize_link(url))]])
+
+
+async def delete_quietly(message) -> bool:
+    try:
+        await message.delete()
+        return True
+    except Exception:
+        return False
+
+
+async def cleanup_after_send(context, query, user_msg_id=None):
+    """
+    بعد از ارسال موفق: پیام «در حال ارسال» پاک می‌شه، و اگه پیام لینکِ خود
+    کاربر هم مشخصه، اون هم پاک می‌شه (لینک زیر فایل تو دکمه‌ی «🔗 لینک» می‌مونه).
+    اگه پاک کردن ممکن نبود، فقط یه ✅ نشون می‌ده.
+    """
+    if not await delete_quietly(query.message):
+        await set_status(query, "✅ ارسال شد!")
+    if user_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_msg_id)
+        except Exception:
+            logger.info("could not delete the user's link message (no permission?)")
 
 
 async def send_media_file(bot, kind: str, chat_id: int, path: str, **kwargs):
@@ -1470,7 +1585,8 @@ async def with_heartbeat(query, text: str, coro, interval: int = 20):
 
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if not await job_allowed(query):
+        return
 
     try:
         _, key, format_id, kind = query.data.split("|", 3)
@@ -1517,18 +1633,22 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await set_status(query, sending_text)
         chat_id = query.message.chat_id
+        markup = link_markup(entry.get("link") or url)
         if kind == "audio":
             await with_heartbeat(
                 query, sending_text,
-                send_media_file(context.bot, "audio", chat_id, file_path),
+                send_media_file(context.bot, "audio", chat_id, file_path, reply_markup=markup),
             )
         else:
             await with_heartbeat(
                 query, sending_text,
-                send_media_file(context.bot, "video", chat_id, file_path, supports_streaming=True),
+                send_media_file(
+                    context.bot, "video", chat_id, file_path,
+                    supports_streaming=True, reply_markup=markup,
+                ),
             )
 
-        await set_status(query, "✅ ارسال شد!")
+        await cleanup_after_send(context, query, entry.get("user_msg_id"))
     except Exception as e:
         logger.exception("download/send failed")
         stop_event.set()
@@ -1538,13 +1658,14 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         PENDING.pop(key, None)
 
 
-async def deliver_song(query, context, chat_id: int, url: str, title: str, artist: str = None):
+async def deliver_song(query, context, chat_id: int, url: str, title: str, artist: str = None, user_msg_id=None):
     """
     برای فیچر «پیدا کردن آهنگ اصلی»: خودکار هم ویدیو هم نسخه‌ی صوتی رو
     دانلود و می‌فرسته، و نسخه‌ی صوتی رو با اسم درست و تمیز آهنگ (نه
     اسم خام فایل یوتیوب) تگ‌گذاری می‌کنه تا تو تلگرام درست نشون داده بشه.
     """
     label = f"{title} - {artist}" if artist else title
+    markup = link_markup(url)
     tmp_dir = tempfile.mkdtemp(prefix="song_dl_")
     try:
         # --- ویدیو ---
@@ -1565,7 +1686,7 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
                 query, video_text,
                 send_media_file(
                     context.bot, "video", chat_id, video_path,
-                    supports_streaming=True, caption=f"🎬 {label}",
+                    supports_streaming=True, caption=f"🎬 {label}", reply_markup=markup,
                 ),
             )
         else:
@@ -1580,17 +1701,19 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         if audio_size_mb <= MAX_TELEGRAM_UPLOAD_MB:
             await send_media_file(
                 context.bot, "audio", chat_id, audio_path,
-                title=title, performer=artist or None,
+                title=title, performer=artist or None, reply_markup=markup,
             )
         else:
             await query.message.reply_text(
                 f"⚠️ حجم فایل صوتی {audio_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
             )
 
-        await set_status(query, f"✅ «{label}» ارسال شد!")
+        await cleanup_after_send(context, query, user_msg_id)
+        return True
     except Exception as e:
         logger.exception("deliver_song failed")
         await set_status(query, "❌ ارسال آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+        return False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1623,7 +1746,7 @@ async def recognize_from_audio_file(query, audio_path: str, duration: float, tmp
     return result
 
 
-async def find_and_deliver_song(query, context, chat_id: int, title: str, artist, variant=None):
+async def find_and_deliver_song(query, context, chat_id: int, title: str, artist, variant=None, user_msg_id=None):
     """بعد از شناسایی اسم آهنگ: نسخه‌ی رسمیش رو پیدا و ویدیو + ویس رو می‌فرسته."""
     label = f"{title} - {artist}" if artist else title
     variant_txt = f" ({variant})" if variant else ""
@@ -1637,7 +1760,7 @@ async def find_and_deliver_song(query, context, chat_id: int, title: str, artist
     except Exception as e:
         logger.exception("search_music failed in find_and_deliver_song")
         await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
-        return
+        return False
 
     if not best:
         artist_txt = f"\nخواننده: {artist}" if artist else ""
@@ -1646,19 +1769,20 @@ async def find_and_deliver_song(query, context, chat_id: int, title: str, artist
             f"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\n"
             "می‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.",
         )
-        return
+        return False
 
     best_url = best.get("url") or best.get("webpage_url") or best.get("id")
     if best.get("id") and not str(best_url).startswith("http"):
         best_url = f"https://www.youtube.com/watch?v={best['id']}"
 
-    await deliver_song(query, context, chat_id, best_url, title, artist)
+    return await deliver_song(query, context, chat_id, best_url, title, artist, user_msg_id=user_msg_id)
 
 
 async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """کاربر دکمه‌ی «پیدا کردن آهنگ اصلی ویدیو» رو زده."""
     query = update.callback_query
-    await query.answer()
+    if not await job_allowed(query):
+        return
 
     try:
         _, key = query.data.split("|", 1)
@@ -1738,7 +1862,11 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         title, artist = result
 
-    await find_and_deliver_song(query, context, chat_id, title, artist, variant)
+    delivered = await find_and_deliver_song(
+        query, context, chat_id, title, artist, variant, user_msg_id=entry.get("user_msg_id")
+    )
+    if delivered:
+        PENDING.pop(key, None)
 
 
 # ------------------------------------------------------------------
@@ -1774,6 +1902,12 @@ async def handle_uploaded_media(update: Update, context: ContextTypes.DEFAULT_TY
     message = update.message
     media = message.video or message.video_note or message.audio or message.document
     if not media:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else message.chat_id
+    remaining = cooldown_remaining(_last_message_at, user_id)
+    if remaining:
+        await warn_slow_down(message, user_id, remaining)
         return
 
     key = f"{message.chat_id}_{message.message_id}"
@@ -1818,7 +1952,8 @@ async def download_uploaded_file(query, context, entry: dict, tmp_dir: str):
 
 async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if not await job_allowed(query):
+        return
     try:
         _, key = query.data.split("|", 1)
     except ValueError:
@@ -1845,7 +1980,7 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
         await send_media_file(
             context.bot, "audio", query.message.chat_id, mp3_path, title=title
         )
-        await set_status(query, "✅ صدا ارسال شد!")
+        await cleanup_after_send(context, query)
     except Exception as e:
         logger.exception("upload extract audio failed")
         await set_status(query, "❌ استخراج صدا با خطا مواجه شد:\n" + str(e)[:300])
@@ -1856,7 +1991,8 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
 
 async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if not await job_allowed(query):
+        return
     try:
         _, key = query.data.split("|", 1)
     except ValueError:
