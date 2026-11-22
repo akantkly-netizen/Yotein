@@ -242,6 +242,35 @@ FORBIDDEN_SIGNS = (
     "unable to download video data",
 )
 
+# اینستاگرام: پست برای بعضی مخاطب‌ها (محدودیت سن/مخاطب) در دسترس نیست.
+# با نشست واردشده یک‌بار دوباره امتحان می‌شه؛ اگه اون حساب هم اجازه نداشت،
+# دسترسی دور زده نمی‌شه و پیام روشن به کاربر داده می‌شه.
+AUDIENCE_RESTRICTED_SIGNS = (
+    "isn't available to everyone",
+    "can't be seen by certain audiences",
+)
+
+
+class InstagramAudienceRestricted(Exception):
+    """محتوا برای حسابِ (واردشده یا بدون ورود) قابل‌مشاهده نیست؛ نه خصوصی، نه لینک خراب."""
+
+    def __init__(self, had_session: bool):
+        self.had_session = had_session
+        if had_session:
+            msg = (
+                "🔒 این محتوا برای حسابی که ربات با آن وارد شده قابل‌مشاهده نیست "
+                "(اینستاگرام آن را فقط برای مخاطبان خاص یا با محدودیت سنی نشان می‌دهد).\n"
+                "پست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد."
+            )
+        else:
+            msg = (
+                "🔒 این محتوا فقط برای مخاطبان خاصی (مثلاً با محدودیت سنی) در "
+                "اینستاگرام قابل‌مشاهده است و ربات حساب واردشده‌ای برای امتحان "
+                "دوباره ندارد.\nپست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد."
+            )
+        super().__init__(msg)
+
+
 ALT_YOUTUBE_CLIENT = "android_vr"  # کلاینت جایگزین که معمولاً PO Token نمی‌خواد
 
 
@@ -255,6 +284,27 @@ def _is_retryable(err_text: str) -> bool:
     return _looks_like_bot_check(t) or any(s in t for s in FORBIDDEN_SIGNS)
 
 
+def _is_audience_restricted(err_text: str) -> bool:
+    t = err_text.lower().replace("\u2019", "'")  # apostrophe تایپوگرافیک
+    return any(s in t for s in AUDIENCE_RESTRICTED_SIGNS)
+
+
+def _retry_audience_restricted_once(func, first_error, *args, **kwargs):
+    """
+    فقط یک‌بار و فقط با نشست واردشده (کوکی) دوباره امتحان می‌کنه؛ بدون حلقه.
+    محتوای کوکی/متغیر هیچ‌جا لاگ نمی‌شه.
+    """
+    if not (COOKIES_FILE and Path(COOKIES_FILE).exists()):
+        raise InstagramAudienceRestricted(had_session=False) from first_error
+    logger.info("audience-restricted content, retrying once with the logged-in session")
+    try:
+        return func(*args, use_cookies=True, player_client=None, **kwargs)
+    except Exception as e:
+        if _is_audience_restricted(str(e)):
+            raise InstagramAudienceRestricted(had_session=True) from e
+        raise
+
+
 def _run_with_cookie_fallback(func, *args, **kwargs):
     """
     اول بدون کوکی و با کلاینت پیش‌فرض امتحان می‌کنه. اگه خطا «ثابت کن ربات
@@ -266,6 +316,8 @@ def _run_with_cookie_fallback(func, *args, **kwargs):
     try:
         return func(*args, use_cookies=False, player_client=None, **kwargs)
     except Exception as first_error:
+        if _is_audience_restricted(str(first_error)):
+            return _retry_audience_restricted_once(func, first_error, *args, **kwargs)
         if not _is_retryable(str(first_error)):
             raise
         last_error = first_error
@@ -280,6 +332,8 @@ def _run_with_cookie_fallback(func, *args, **kwargs):
         try:
             return func(*args, use_cookies=use_cookies, player_client=client, **kwargs)
         except Exception as e:
+            if _is_audience_restricted(str(e)):
+                raise InstagramAudienceRestricted(had_session=use_cookies) from e
             last_error = e
             if not _is_retryable(str(e)):
                 raise
@@ -1132,10 +1186,13 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         info = extract_info(url)
     except Exception as e:
         logger.exception("extract_info failed")
-        err_text = (
-            "❌ نتونستم اطلاعات این لینک رو بگیرم. ممکنه پست خصوصی باشه یا"
-            " لینک اشتباه باشه.\nجزئیات خطا: " + str(e)[:300]
-        )
+        if isinstance(e, InstagramAudienceRestricted):
+            err_text = str(e)
+        else:
+            err_text = (
+                "❌ نتونستم اطلاعات این لینک رو بگیرم. ممکنه پست خصوصی باشه یا"
+                " لینک اشتباه باشه.\nجزئیات خطا: " + str(e)[:300]
+            )
         if status_msg:
             await status_msg.edit_text(err_text)
         else:
