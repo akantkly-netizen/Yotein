@@ -9,10 +9,8 @@
 دانلودشده/کل) نمایش داده می‌شه.
 
 نیازمندی‌ها (requirements.txt):
-    python-telegram-bot[rate-limiter]==21.*
+    python-telegram-bot==21.*
     yt-dlp
-    shazamio>=0.9
-    (اختیاری) aria2 روی سیستم + متغیر USE_ARIA2C=1
 
 همچنین باید ffmpeg روی سیستم نصب باشه (برای استخراج صدا و مرج فرمت‌ها).
 
@@ -123,24 +121,6 @@ SONG_SNIPPET_SECONDS = 20  # طول قطعه‌ی صوتی که برای تشخ�
 # Shazam از طریق کتابخونه‌ی shazamio: رایگان، بدون ثبت‌نام و کلید، کاتالوگ بزرگ.
 # API غیررسمیه (ممکنه گاهی تغییر کنه یا محدود بشه)؛ برای خاموش کردنش SHAZAM_ENABLED=0
 SHAZAM_ENABLED = os.environ.get("SHAZAM_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-# فقط با shazamio>=0.9: اگه مثلاً 0.001 ست بشه، جواب‌هایی که با اختلاف زمانی/فرکانسی زیاد پیدا شدن رد می‌شن
-# (جواب غلط کمتر می‌شه). ولی آهنگ‌های اسپیدشده/پیچ‌شده‌ی تیک‌توک و ریلز هم رد می‌شن؛ پس پیش‌فرض خاموشه.
-try:
-    SHAZAM_MAX_SKEW = float(os.environ.get("SHAZAM_MAX_SKEW", "") or 0) or None
-except ValueError:
-    SHAZAM_MAX_SKEW = None
-if SHAZAM_MAX_SKEW is not None and SHAZAM_MAX_SKEW <= 0:
-    SHAZAM_MAX_SKEW = None
-
-# سرعت دانلود yt-dlp: تعداد قطعه‌های موازی برای HLS/DASH (۱ = خاموش)
-YTDLP_CONCURRENT_FRAGMENTS = max(1, int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "4")))
-# aria2c به‌عنوان دانلودر خارجی (اختیاری): هم باید نصب باشه (apt install aria2) هم USE_ARIA2C=1 ست بشه
-USE_ARIA2C = (
-    os.environ.get("USE_ARIA2C", "0").strip().lower() in ("1", "true", "yes", "on")
-    and shutil.which("aria2c") is not None
-)
-# کاور (تامبنیل) + متادیتا داخل فایل mp3 جاسازی می‌شه؛ اگه جاسازی خطا داد، یه‌بار بدون کاور دوباره می‌سازه
-EMBED_AUDIO_COVER = os.environ.get("EMBED_AUDIO_COVER", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # سرویس دوم تشخیص آهنگ (اختیاری) - وقتی AudD جواب نده امتحان می‌شه.
 # host/access_key/access_secret رو از پنل پروژه‌ی ACRCloud بگیر.
@@ -231,10 +211,7 @@ def build_ydl_opts(use_cookies: bool = False, player_client=None, **overrides):
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
     }
-    if USE_ARIA2C:
-        opts["external_downloader"] = {"default": "aria2c"}
     if use_cookies and COOKIES_FILE and Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
     if player_client:
@@ -893,29 +870,21 @@ def _download_media_impl(
     out_tmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
     hooks = [make_progress_hook(progress_state)] if progress_state is not None else []
 
-    def _audio_opts(with_cover: bool):
-        pps = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
-        extra = {}
-        if with_cover:
-            # تامبنیل رو به jpg تبدیل می‌کنه و همراه متادیتا داخل mp3 می‌ذاره (کاور آهنگ تو پلیر تلگرام)
-            extra["writethumbnail"] = True
-            pps = (
-                [{"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"}]
-                + pps
-                + [{"key": "FFmpegMetadata", "add_metadata": True}, {"key": "EmbedThumbnail"}]
-            )
-        return build_ydl_opts(
+    if kind == "audio":
+        opts = build_ydl_opts(
             use_cookies=use_cookies,
             player_client=player_client,
             format="bestaudio/best",
             outtmpl=out_tmpl,
             progress_hooks=hooks,
-            postprocessors=pps,
-            **extra,
+            postprocessors=[
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
         )
-
-    if kind == "audio":
-        opts = _audio_opts(EMBED_AUDIO_COVER)
     else:
         # یوتیوب دیگه معمولاً فرمت تکی (صدا+تصویر با هم) نمی‌ده، پس "best"
         # ساده خطای "Requested format is not available" می‌ده. همیشه
@@ -937,18 +906,9 @@ def _download_media_impl(
             progress_hooks=hooks,
         )
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-    except yt_dlp.utils.DownloadError as e:
-        # فقط اگه خطا از مرحله‌ی پردازش (جاسازی کاور) بود، یه‌بار بدون کاور دوباره می‌سازیم
-        if not (kind == "audio" and EMBED_AUDIO_COVER and "postprocessing" in str(e).lower()):
-            raise
-        logger.warning("cover embedding failed; retrying the audio once without a cover")
-        with yt_dlp.YoutubeDL(_audio_opts(False)) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
 
     if kind == "audio":
         # بعد از پردازش FFmpegExtractAudio، پسوند به mp3 تغییر می‌کنه
@@ -1611,13 +1571,10 @@ async def warn_slow_down(message, user_id, remaining: int):
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bot.db")
 # اگه ست باشه (مثلاً از Postgres خود Railway)، به‌جای فایل SQLite از PostgreSQL استفاده می‌شه
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-# اشتراک خودکار: هر کاربر بعد از AUTO_VIP_AFTER_DAYS روز عضویت، هر AUTO_VIP_DAYS روز یه اشتراک AUTO_VIP_DAYS روزه می‌گیره
+# هدیه‌ی خودکار: هر کاربر بعد از AUTO_VIP_AFTER_DAYS روز عضویت، AUTO_VIP_DAYS روز VIP می‌گیره (یه بار)
 AUTO_VIP_AFTER_DAYS = int(os.environ.get("AUTO_VIP_AFTER_DAYS", "10"))  # 0 = خاموش
 AUTO_VIP_DAYS = int(os.environ.get("AUTO_VIP_DAYS", "30"))
-AUTO_VIP_CHECK_SECONDS = 600
-# ارزش اشتراک روی فیش: هر VIP_PRICE_PERIOD_DAYS روز = VIP_PRICE_USD دلار (قیمت هر روز خودکار محاسبه می‌شه)
-VIP_PRICE_USD = float(os.environ.get("VIP_PRICE_USD", "5"))
-VIP_PRICE_PERIOD_DAYS = int(os.environ.get("VIP_PRICE_PERIOD_DAYS", "30"))
+AUTO_VIP_CHECK_SECONDS = 3600
 DAILY_QUOTA_MB = int(os.environ.get("DAILY_QUOTA_MB", "1536"))  # ۱.۵ گیگ (۱ گیگ و ۵۰۰ مگ)
 TZ_OFFSET_MINUTES = int(os.environ.get("TZ_OFFSET_MINUTES", "210"))  # ایران = UTC+3:30
 MB = 1024 * 1024
@@ -1684,15 +1641,6 @@ def fmt_date(dt: datetime, with_time: bool = False) -> str:
     return text
 
 
-def vip_value_usd(days: int) -> float:
-    """ارزش اشتراک به دلار: روزی VIP_PRICE_USD / VIP_PRICE_PERIOD_DAYS (مثلاً ۵ دلار / ۳۰ روز)."""
-    return days * VIP_PRICE_USD / VIP_PRICE_PERIOD_DAYS
-
-
-def fmt_usd(amount: float) -> str:
-    return f"${amount:,.2f}"
-
-
 SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -1701,8 +1649,7 @@ CREATE TABLE IF NOT EXISTS users (
     joined_at TEXT NOT NULL,
     downloads_total INTEGER NOT NULL DEFAULT 0,
     vip_until TEXT,
-    auto_vip_granted INTEGER NOT NULL DEFAULT 0,
-    auto_vip_blocked INTEGER NOT NULL DEFAULT 0
+    auto_vip_granted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id INTEGER NOT NULL, day TEXT NOT NULL,
@@ -1727,8 +1674,7 @@ CREATE TABLE IF NOT EXISTS users (
     joined_at TEXT NOT NULL,
     downloads_total INTEGER NOT NULL DEFAULT 0,
     vip_until TEXT,
-    auto_vip_granted INTEGER NOT NULL DEFAULT 0,
-    auto_vip_blocked INTEGER NOT NULL DEFAULT 0
+    auto_vip_granted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id BIGINT NOT NULL, day TEXT NOT NULL,
@@ -1845,14 +1791,11 @@ class Database:
             # مهاجرت برای دیتابیس‌هایی که با نسخه‌ی قدیمی‌تر ساخته شدن
             if self.is_pg:
                 t.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_vip_granted INTEGER NOT NULL DEFAULT 0")
-                t.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_vip_blocked INTEGER NOT NULL DEFAULT 0")
                 t.exec("ALTER TABLE vip_log ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'admin'")
             else:
                 cols = {r["name"] for r in t.exec("PRAGMA table_info(users)").fetchall()}
                 if "auto_vip_granted" not in cols:
                     t.exec("ALTER TABLE users ADD COLUMN auto_vip_granted INTEGER NOT NULL DEFAULT 0")
-                if "auto_vip_blocked" not in cols:
-                    t.exec("ALTER TABLE users ADD COLUMN auto_vip_blocked INTEGER NOT NULL DEFAULT 0")
                 cols = {r["name"] for r in t.exec("PRAGMA table_info(vip_log)").fetchall()}
                 if "source" not in cols:
                     t.exec("ALTER TABLE vip_log ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'")
@@ -1932,27 +1875,17 @@ class Database:
         return None
 
     def grant_vip(self, user_id: int, days: int, granted_by: int, auto: bool = False) -> dict:
-        """
-        اگه VIP فعال داشته، از پایانش تمدید می‌شه؛ وگرنه از همین الان شروع می‌شه.
-        تمدید خودکار اگه تازه (حداکثر ۱ روز) تموم شده باشه، از همون لحظه‌ی پایان ادامه پیدا می‌کنه
-        تا دوره‌های ماهانه فاصله نیفتن. فعال‌سازی دستی مدیر، لغوِ قبلی (توقف تمدید خودکار) رو برمی‌داره.
-        """
+        """اگه VIP فعال داشته، از پایانش تمدید می‌شه؛ وگرنه از همین الان شروع می‌شه."""
 
         def fn(t):
             now = utcnow()
             row = t.exec("SELECT vip_until FROM users WHERE user_id=?", (user_id,)).fetchone()
             current = None
-            end_old = None
             if row and row["vip_until"]:
                 end_old = from_iso(row["vip_until"])
                 if end_old > now:
                     current = end_old
-            if current:
-                start = current
-            elif auto and end_old and now - end_old <= timedelta(days=1):
-                start = end_old
-            else:
-                start = now
+            start = current if current else now
             end = start + timedelta(days=days)
             receipt_id = t.exec(
                 "INSERT INTO vip_log(user_id, days, granted_by, granted_at, start_at, end_at, source)"
@@ -1960,7 +1893,7 @@ class Database:
                 (user_id, days, granted_by, to_iso(now), to_iso(start), to_iso(end), "auto" if auto else "admin"),
             ).fetchone()["id"]
             t.exec(
-                "UPDATE users SET vip_until=?" + (", auto_vip_granted=1" if auto else ", auto_vip_blocked=0") + " WHERE user_id=?",
+                "UPDATE users SET vip_until=?" + (", auto_vip_granted=1" if auto else "") + " WHERE user_id=?",
                 (to_iso(end), user_id),
             )
             return {
@@ -1970,52 +1903,17 @@ class Database:
 
         return self.run(fn)
 
-    def cancel_vip(self, user_id: int) -> dict:
-        """اشتراک فعال رو همین الان تموم می‌کنه و تمدید خودکار رو برای این کاربر متوقف می‌کنه."""
-
-        def fn(t):
-            now = utcnow()
-            row = t.exec("SELECT vip_until FROM users WHERE user_id=?", (user_id,)).fetchone()
-            old_end = None
-            if row and row["vip_until"]:
-                end = from_iso(row["vip_until"])
-                if end > now:
-                    old_end = end
-            if old_end:
-                t.exec("UPDATE users SET vip_until=?, auto_vip_blocked=1 WHERE user_id=?", (to_iso(now), user_id))
-            else:
-                t.exec("UPDATE users SET auto_vip_blocked=1 WHERE user_id=?", (user_id,))
-            return {"was_active": old_end is not None, "old_end": old_end}
-
-        return self.run(fn)
-
-    def users_due_for_auto_vip(self, cutoff_iso: str, now_iso: str, exclude_ids=(), limit: int = 200):
-        """کاربرهایی که قبل از cutoff عضو شدن، الان اشتراک فعال ندارن و تمدید خودکارشون لغو نشده."""
-
-        def fn(t):
-            sql = (
-                "SELECT * FROM users WHERE joined_at <= ? AND auto_vip_blocked = 0"
-                " AND (vip_until IS NULL OR vip_until <= ?)"
-            )
-            params = [cutoff_iso, now_iso]
-            ids = [int(i) for i in exclude_ids]
-            if ids:
-                sql += " AND user_id NOT IN (" + ",".join("?" * len(ids)) + ")"
-                params += ids
-            sql += " ORDER BY joined_at LIMIT ?"
-            params.append(limit)
-            return t.exec(sql, tuple(params)).fetchall()
-
-        return self.run(fn)
-
-    def total_bytes(self, user_id: int) -> int:
-        """مجموع حجم دانلودِ کاربر از ابتدا."""
-        row = self.run(
+    def users_due_for_auto_vip(self, cutoff_iso: str, limit: int = 200):
+        """کاربرهایی که قبل از cutoff عضو شدن و هنوز VIP خودکار نگرفتن."""
+        return self.run(
             lambda t: t.exec(
-                "SELECT COALESCE(SUM(bytes_used), 0) AS s FROM usage_daily WHERE user_id=?", (user_id,)
-            ).fetchone()
+                "SELECT * FROM users WHERE auto_vip_granted=0 AND joined_at <= ? ORDER BY joined_at LIMIT ?",
+                (cutoff_iso, limit),
+            ).fetchall()
         )
-        return int(row["s"]) if row else 0
+
+    def mark_auto_vip(self, user_id: int):
+        self.run(lambda t: t.exec("UPDATE users SET auto_vip_granted=1 WHERE user_id=?", (user_id,)))
 
 
 _db = None
@@ -2169,23 +2067,16 @@ class AdminOnly(filters.MessageFilter):
         return bool(message.from_user and is_admin(message.from_user.id))
 
 
-ADMIN_CANCEL_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="adm|cancel")]])
-
-
 def admin_panel_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💎 VIP کردن کاربر", callback_data="adm|vip")],
-        [InlineKeyboardButton("🚫 لغو اشتراک VIP", callback_data="adm|cxl")],
-        [InlineKeyboardButton("👤 مشخصات کاربر", callback_data="adm|info")],
         [InlineKeyboardButton("❌ بستن پنل", callback_data="adm|close")],
     ])
 
 
 def admin_days_markup() -> InlineKeyboardMarkup:
     def b(days):
-        return InlineKeyboardButton(
-            f"{days} روز · {fmt_usd(vip_value_usd(days))}", callback_data=f"admd|{days}"
-        )
+        return InlineKeyboardButton(f"{days} روز", callback_data=f"admd|{days}")
 
     return InlineKeyboardMarkup([
         [b(7), b(15), b(30)],
@@ -2214,26 +2105,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = query.from_user.id
 
     if action == "vip":
-        ADMIN_STATE[admin_id] = {"step": "await_id", "action": "vip"}
+        ADMIN_STATE[admin_id] = {"step": "await_id"}
         await query.edit_message_text(
             "💎 VIP کردن کاربر\n\nآیدی ۸ رقمی کاربر رو بفرست.\n"
             "(کاربر با نوشتن «آیدی» تو ربات اون رو می‌گیره)",
-            reply_markup=ADMIN_CANCEL_MARKUP,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="adm|cancel")]]),
         )
-    elif action == "cxl":
-        ADMIN_STATE[admin_id] = {"step": "await_id", "action": "cxl"}
-        await query.edit_message_text(
-            "🚫 لغو اشتراک VIP\n\nآیدی ۸ رقمی کاربر رو بفرست.",
-            reply_markup=ADMIN_CANCEL_MARKUP,
-        )
-    elif action == "info":
-        ADMIN_STATE[admin_id] = {"step": "await_id", "action": "info"}
-        await query.edit_message_text(
-            "👤 مشخصات کاربر\n\nآیدی ۸ رقمی کاربر رو بفرست.",
-            reply_markup=ADMIN_CANCEL_MARKUP,
-        )
-    elif action == "cxl_yes":
-        await admin_confirm_cancel(query, context, admin_id)
     elif action == "cancel":
         ADMIN_STATE.pop(admin_id, None)
         await query.edit_message_text("👑 پنل مدیریت\nیکی از گزینه‌ها رو انتخاب کن:", reply_markup=admin_panel_markup())
@@ -2243,97 +2120,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_receipt(row, info: dict) -> str:
-    days = info["days"]
     lines = [
         "🧾 <b>فیش فعال‌سازی اشتراک VIP</b>",
         "━━━━━━━━━━━━━━",
         f"شماره فیش: <code>#{info['receipt_id']:05d}</code>",
         f"👤 کاربر: {html.escape(display_name(row))} {html.escape(username_text(row))}",
         f"🆔 آیدی: <code>{row['public_id']}</code>",
-        f"⏳ مدت: {days} روز" + (" (تمدید)" if info["extended"] else ""),
+        f"⏳ مدت: {info['days']} روز" + (" (تمدید)" if info["extended"] else ""),
         (
-            f"🎁 نوع: اشتراک ماهانه‌ی خودکار (بعد از {AUTO_VIP_AFTER_DAYS} روز عضویت)"
+            f"🎁 نوع: هدیه‌ی خودکار (بعد از {AUTO_VIP_AFTER_DAYS} روز عضویت)"
             if info.get("auto")
             else "👑 نوع: فعال‌سازی توسط مدیر"
         ),
         f"📅 شروع: {fmt_date(info['start'], with_time=True)}",
         f"📅 پایان: {fmt_date(info['end'], with_time=True)}",
         "━━━━━━━━━━━━━━",
-        f"💵 ارزش اشتراک: <b>{fmt_usd(vip_value_usd(days))}</b>"
-        f" (هر روز {fmt_usd(vip_value_usd(1))})",
         "✅ اشتراک فعال شد.",
     ]
     return "\n".join(lines)
-
-
-def build_user_info(row) -> str:
-    """مشخصات کاربر برای پنل مدیر؛ مدت عضویت به‌صورت عدد (روز) نشون داده می‌شه."""
-    db_ = get_db()
-    uid = row["user_id"]
-    used, _ = db_.usage_today(uid)
-    total_bytes = db_.total_bytes(uid)
-    vip_end = db_.vip_until(uid)
-    member_days = max(0, (utcnow() - from_iso(row["joined_at"])).days)
-
-    lines = [
-        "👤 <b>مشخصات کاربر</b>",
-        "━━━━━━━━━━━━━━",
-        f"🏷 نام: {html.escape(display_name(row))} {html.escape(username_text(row))}",
-        f"🆔 آیدی اختصاصی: <code>{row['public_id']}</code>",
-        f"📅 مدت عضویت: {member_days} روز",
-        "━━━━━━━━━━━━━━",
-        f"⬇️ دانلود امروز: {format_volume(used)}",
-    ]
-    if is_admin(uid) or vip_end:
-        lines.append("📦 حجم باقی‌مونده‌ی امروز: نامحدود ♾")
-    else:
-        total = DAILY_QUOTA_MB * MB
-        lines.append(f"📦 حجم باقی‌مونده‌ی امروز: {format_volume(max(0, total - used))} از {format_volume(total)}")
-    lines.append(f"📊 مجموع حجم دانلود: {format_volume(total_bytes)} ({row['downloads_total']} دانلود)")
-    if is_admin(uid):
-        lines.append("👑 وضعیت: مدیر (بدون محدودیت)")
-    elif vip_end:
-        days_left = max(1, math.ceil((vip_end - utcnow()).total_seconds() / 86400))
-        lines.append(f"💎 اشتراک: VIP فعال ({days_left} روز مونده)")
-    else:
-        lines.append("💎 اشتراک: ندارد")
-    if row["auto_vip_blocked"]:
-        lines.append("🔁 تمدید خودکار: متوقف (لغو شده توسط مدیر)")
-    return "\n".join(lines)
-
-
-async def admin_confirm_cancel(query, context: ContextTypes.DEFAULT_TYPE, admin_id: int):
-    """بعد از تأیید مدیر: اشتراک رو لغو و تمدید خودکار رو متوقف می‌کنه."""
-    state = ADMIN_STATE.get(admin_id)
-    if not state or state.get("step") != "confirm_cancel":
-        await query.edit_message_text("⌛ این مرحله منقضی شده؛ دوباره «ادمین» رو بنویس.")
-        return
-    target = state["target_user_id"]
-    ADMIN_STATE.pop(admin_id, None)
-    db_ = get_db()
-    result = await asyncio.to_thread(db_.cancel_vip, target)
-    row = db_.get_user(target)
-
-    delivered = True
-    try:
-        await context.bot.send_message(
-            chat_id=target,
-            text=(
-                "ℹ️ اشتراک VIP شما توسط مدیر لغو شد.\n"
-                f"از این به بعد سهمیه‌ی روزانه‌ی عادی ({format_volume(DAILY_QUOTA_MB * MB)}) برای شما اعمال می‌شه."
-            ),
-        )
-    except Exception:
-        delivered = False
-        logger.info("could not notify the user about VIP cancellation")
-
-    head = "✅ اشتراک VIP لغو شد." if result["was_active"] else "✅ این کاربر اشتراک فعالی نداشت؛ تمدید خودکارش متوقف شد."
-    note = "📨 به کاربر هم اطلاع داده شد." if delivered else "⚠️ نتونستم به کاربر پیام بدم."
-    await query.edit_message_text(
-        f"{head}\n👤 {display_name(row)} {username_text(row)}\n🆔 {row['public_id']}\n"
-        "🔁 تمدید خودکار برای این کاربر متوقف شد (با «VIP کردن کاربر» دوباره فعال می‌شه).\n\n" + note,
-        reply_markup=admin_panel_markup(),
-    )
 
 
 async def admin_grant_vip(message, context: ContextTypes.DEFAULT_TYPE, admin_id: int, target_user_id: int, days: int):
@@ -2368,29 +2172,27 @@ async def admin_grant_vip(message, context: ContextTypes.DEFAULT_TYPE, admin_id:
 
 async def run_auto_vip_check(bot_) -> int:
     """
-    هر کاربری که AUTO_VIP_AFTER_DAYS روز از عضویتش گذشته، الان اشتراک فعال نداره و تمدید خودکارش
-    لغو نشده، یه اشتراک AUTO_VIP_DAYS روزه می‌گیره و فیش (با ارزش دلاری) براش ارسال می‌شه.
-    وقتی اشتراکش تموم بشه، دوباره همین چرخه تکرار می‌شه (یعنی هر ۳۰ روز یه اشتراک ۳۰ روزه).
+    هر کاربری که AUTO_VIP_AFTER_DAYS روز از عضویتش گذشته و هنوز هدیه‌ی خودکار نگرفته،
+    AUTO_VIP_DAYS روز VIP می‌گیره و فیش براش ارسال می‌شه. هر کاربر فقط یه بار.
     """
     if AUTO_VIP_AFTER_DAYS <= 0 or AUTO_VIP_DAYS <= 0:
         return 0
     db_ = get_db()
     granted = 0
-    skip = set(ADMIN_IDS)  # مدیر که از قبل نامحدوده؛ کاربرهایی که گرنت‌شون خطا داد هم تو این دور رد می‌شن
     for _ in range(20):  # دسته‌ای (هر دسته ۲۰۰ نفر)
-        now = utcnow()
-        rows = await asyncio.to_thread(
-            db_.users_due_for_auto_vip, to_iso(now - timedelta(days=AUTO_VIP_AFTER_DAYS)), to_iso(now), skip
-        )
+        cutoff = to_iso(utcnow() - timedelta(days=AUTO_VIP_AFTER_DAYS))
+        rows = await asyncio.to_thread(db_.users_due_for_auto_vip, cutoff)
         if not rows:
             break
         for row in rows:
             uid = row["user_id"]
+            if is_admin(uid):  # مدیر که از قبل نامحدوده
+                await asyncio.to_thread(db_.mark_auto_vip, uid)
+                continue
             try:
                 info = await asyncio.to_thread(db_.grant_vip, uid, AUTO_VIP_DAYS, 0, True)
             except Exception:
                 logger.exception("auto VIP grant failed for %s", uid)
-                skip.add(uid)
                 continue
             granted += 1
             try:
@@ -2398,9 +2200,8 @@ async def run_auto_vip_check(bot_) -> int:
                 await bot_.send_message(
                     chat_id=uid,
                     text=(
-                        "🎁 اشتراک ماهانه‌ات فعال شد!\n"
-                        f"چون بیشتر از {AUTO_VIP_AFTER_DAYS} روزه که با ما هستی، هر {AUTO_VIP_DAYS} روز یه اشتراک"
-                        f" {AUTO_VIP_DAYS} روزه‌ی VIP خودکار برات فعال می‌شه.\n\n"
+                        "🎁 هدیه‌ی همراهی!\n"
+                        f"چون {AUTO_VIP_AFTER_DAYS} روزه که با ما هستی، اشتراک VIP برات فعال شد.\n\n"
                         + build_receipt(fresh, info)
                         + f"\n\nتا {fmt_date(info['end'])} می‌تونی بدون محدودیت حجم دانلود کنی 💎"
                     ),
@@ -2452,37 +2253,6 @@ async def admin_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if not row:
             await update.message.reply_text("❌ کاربری با این آیدی پیدا نشد. آیدی رو چک کن و دوباره بفرست (یا «لغو»).")
             return
-        action = state.get("action", "vip")
-
-        if action == "info":
-            ADMIN_STATE.pop(admin_id, None)
-            info_text = await asyncio.to_thread(build_user_info, row)
-            await update.message.reply_text(info_text, parse_mode=ParseMode.HTML, reply_markup=admin_panel_markup())
-            return
-
-        if action == "cxl":
-            if is_admin(row["user_id"]):
-                await update.message.reply_text(
-                    "❌ این کاربر مدیره و اشتراکی نداره (دسترسی نامحدودش از ADMIN_IDS میاد). آیدی دیگه‌ای بفرست (یا «لغو»)."
-                )
-                return
-            vip_end = get_db().vip_until(row["user_id"])
-            if vip_end:
-                days_left = max(1, math.ceil((vip_end - utcnow()).total_seconds() / 86400))
-                status = f"💎 VIP فعال تا {fmt_date(vip_end)} ({days_left} روز مونده)"
-            else:
-                status = "💎 اشتراک فعالی نداره"
-            state.update(step="confirm_cancel", target_user_id=row["user_id"], public_id=value)
-            await update.message.reply_text(
-                f"🚫 لغو اشتراک VIP\n\n👤 {display_name(row)} {username_text(row)}\n🆔 {value}\n{status}\n\n"
-                "مطمئنی؟ اشتراک لغو و تمدید خودکار برای این کاربر متوقف می‌شه.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ بله، لغو کن", callback_data="adm|cxl_yes")],
-                    [InlineKeyboardButton("❌ انصراف", callback_data="adm|cancel")],
-                ]),
-            )
-            return
-
         state.update(step="choose_days", target_user_id=row["user_id"], public_id=value)
         vip_end = get_db().vip_until(row["user_id"])
         vip_line = f"\n💎 VIP فعلی تا {fmt_date(vip_end)} (روزهای جدید بهش اضافه می‌شه)" if vip_end else ""
@@ -2825,23 +2595,9 @@ async def recognize_song_via_shazam(audio_path: str):
     try:
         from shazamio import Shazam
 
-        kwargs = {"max_skew": SHAZAM_MAX_SKEW} if SHAZAM_MAX_SKEW else {}
-        shazam = Shazam()
-        try:
-            out = await asyncio.wait_for(shazam.recognize(audio_path, **kwargs), timeout=40)
-        finally:
-            # shazamio>=0.9 برای هر کلاینت یه نشست HTTP باز می‌کنه؛ بستنش جلوی نشتی رو می‌گیره
-            close = getattr(shazam, "close", None)
-            if close:
-                try:
-                    await close()
-                except Exception:
-                    pass
+        out = await asyncio.wait_for(Shazam().recognize(audio_path), timeout=40)
     except Exception as e:
-        if type(e).__name__ == "RateLimited":
-            logger.warning("Shazam rate limit (429); falling back to the next recognizer")
-        else:
-            logger.warning("Shazam recognition failed: %s", repr(e)[:200])
+        logger.warning("Shazam recognition failed: %s", repr(e)[:200])
         return None
     track = (out or {}).get("track") if isinstance(out, dict) else None
     if not track:
@@ -3261,14 +3017,6 @@ def main():
             .local_mode(True)  # فایل‌ها با مسیر (file://) رد و بدل می‌شن
         )
         logger.info("using local Bot API server at %s (local mode)", base)
-    # محدودکننده‌ی نرخ ارسال (جلوگیری از فلود تلگرام، مخصوصاً برای ارسال‌های پشت‌سرهم و پیام همگانی)
-    try:
-        from telegram.ext import AIORateLimiter
-
-        builder = builder.rate_limiter(AIORateLimiter(max_retries=3))
-        logger.info("rate limiter: enabled")
-    except (ImportError, RuntimeError):
-        logger.warning('rate limiter: disabled (pip install "python-telegram-bot[rate-limiter]==21.*" to enable)')
     app = builder.build()
 
     try:
