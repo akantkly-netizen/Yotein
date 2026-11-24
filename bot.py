@@ -159,6 +159,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx هر درخواست رو با URL کامل (شامل توکن ربات) لاگ می‌کنه؛ پس فقط هشدار/خطاش رو نگه می‌داریم
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 INSTAGRAM_URL_RE = re.compile(
     r"(https?://)?(www\.)?instagram\.com/(p|reel|reels|stories|tv)/[\w\-/.]+"
@@ -3231,6 +3234,37 @@ def log_ytdlp_environment():
         logger.exception("could not log yt-dlp environment")
 
 
+def wait_for_telegram_api(max_wait_seconds: int = 1800) -> None:
+    """
+    قبل از شروع پولینگ، getMe رو امتحان می‌کنه. اگه تلگرام جواب ۴۲۹ (Flood control) بده، به‌جای کرش و
+    ری‌استارت پشت‌سرهم، به اندازه‌ی retry_after صبر می‌کنه و دوباره امتحان می‌کنه.
+    (URL و توکن عمداً هیچ‌جا لاگ نمی‌شه.)
+    """
+    base = LOCAL_API_URL.rstrip("/") if LOCAL_API_URL else "https://api.telegram.org"
+    url = f"{base}/bot{BOT_TOKEN}/getMe"
+    deadline = time.monotonic() + max_wait_seconds
+    backoff = 5
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.post(url, timeout=20)
+        except requests.RequestException as e:
+            logger.warning("Telegram getMe network error (%s); retrying in %ss", type(e).__name__, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        if resp.status_code == 429:
+            try:
+                wait = int(resp.json().get("parameters", {}).get("retry_after", 30))
+            except Exception:
+                wait = 30
+            wait = min(max(wait, 1), 300) + 3
+            logger.warning("Telegram flood control (429); waiting %ss before retrying", wait)
+            time.sleep(wait)
+            continue
+        return  # موفق (یا خطای دیگه‌ای مثل توکن اشتباه که خود PTB گزارشش می‌کنه)
+    logger.error("Telegram is still rate-limiting after %ss; continuing anyway", max_wait_seconds)
+
+
 def main():
     if BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
         raise SystemExit(
@@ -3239,6 +3273,7 @@ def main():
         )
 
     log_ytdlp_environment()
+    wait_for_telegram_api()
     builder = (
         Application.builder()
         .token(BOT_TOKEN)
