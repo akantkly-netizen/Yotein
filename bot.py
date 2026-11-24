@@ -3246,7 +3246,7 @@ def wait_for_telegram_api(max_wait_seconds: int = 1800) -> None:
     backoff = 5
     while time.monotonic() < deadline:
         try:
-            resp = requests.post(url, timeout=20)
+            resp = requests.post(url, timeout=60)
         except requests.RequestException as e:
             logger.warning("Telegram getMe network error (%s); retrying in %ss", type(e).__name__, backoff)
             time.sleep(backoff)
@@ -3262,7 +3262,7 @@ def wait_for_telegram_api(max_wait_seconds: int = 1800) -> None:
             time.sleep(wait)
             continue
         return  # موفق (یا خطای دیگه‌ای مثل توکن اشتباه که خود PTB گزارشش می‌کنه)
-    logger.error("Telegram is still rate-limiting after %ss; continuing anyway", max_wait_seconds)
+    logger.error("Telegram API still not answering properly after %ss; continuing anyway", max_wait_seconds)
 
 
 def main():
