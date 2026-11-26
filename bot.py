@@ -193,16 +193,117 @@ PLAYLIST_MAX_ITEMS = 300    # سقف تعداد ویدیوهایی که از ی�
 # ------------------------------------------------------------------
 # کیبورد پایین صفحه (Reply Keyboard)
 # ------------------------------------------------------------------
-BTN_HELP = "📖 راهنما"
-BTN_ABOUT = "ℹ️ درباره ربات"
-BTN_MUSIC = "🎵 جستجوی موزیک"
-BTN_ACCOUNT = "👤 حساب من"
+# ------------------------------------------------------------------
+# چندزبانه (i18n): متن‌ها داخل locales/<کد>.json هستن؛ T("کلید", متغیر=...) متن زبانِ کاربرِ فعلی رو برمی‌گردونه
+# ------------------------------------------------------------------
+import contextvars
+from contextlib import contextmanager
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_MUSIC, BTN_ACCOUNT], [BTN_HELP, BTN_ABOUT]],
-    resize_keyboard=True,   # دکمه‌ها رو کوچیک و جمع‌وجور نشون می‌ده
-    is_persistent=True,     # همیشه روی صفحه بمونه
-)
+LANGS = [  # (کد، اسم بومی، پرچم). اگه بیشتر از ۱۰ زبان بشه، خودکار صفحه‌ی بعدی با دکمه‌ی «بعدی» ساخته می‌شه
+    ("fa", "فارسی", "🇮🇷"), ("en", "English", "🇬🇧"), ("tr", "Türkçe", "🇹🇷"),
+    ("ru", "Русский", "🇷🇺"), ("es", "Español", "🇪🇸"), ("fr", "Français", "🇫🇷"),
+]
+LANG_CODES = [c for c, _, _ in LANGS]
+DEFAULT_LANG = "fa"
+LANG_PAGE_SIZE = 10
+LOCALES_DIR = Path(__file__).resolve().parent / "locales"
+LANG_PROMPT = "🌐 Please choose your language\n🌐 زبان خود را انتخاب کنید"
+
+
+# ترجمه‌ها (فارسی + ۵ زبان) داخل همین فایل هستن تا فقط با یه فایل کار کنه. اگه پوشه‌ی locales/ کنار فایل
+# باشه و <کد>.json داشته باشه، اون فایل جای ترجمه‌ی داخلی رو می‌گیره (برای اضافه‌کردن زبان یا ویرایش آسون).
+_EMBEDDED_LOCALES = json.loads(r'''{"fa":{"__init__.1":"🔒 این محتوا برای حسابی که ربات با آن وارد شده قابل‌مشاهده نیست (اینستاگرام آن را فقط برای مخاطبان خاص یا با محدودیت سنی نشان می‌دهد).\nپست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد.","__init__.2":"🔒 این محتوا فقط برای مخاطبان خاصی (مثلاً با محدودیت سنی) در اینستاگرام قابل‌مشاهده است و ربات حساب واردشده‌ای برای امتحان دوباره ندارد.\nپست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد.","format_music_entry_label.1":"بدون‌نام","build_music_page.1":"◀️ صفحه قبل","build_music_page.2":"▶️ صفحه بعد","build_music_page.3":"🔍 جستجو در یوتیوب","render.1":"⚙️ در حال پردازش نهایی (تبدیل/ترکیب فایل)...","render.2":"؟","render.3":"  •  {n}s مونده","render.4":"⬇️ در حال دانلود...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (تقریبی)","pick_quality_options.2":"🎬 کیفیت پیش‌فرض{size_txt}","pick_quality_options.3":"🎵 فقط صدا (MP3)","start.1":"درود به روی ماهت 🧘🏾🌚\nمن ربات دانلودرم 🧸\n\nبا من می‌تونی ویدئو ها، موزیک ها و پست های هر پلتفرمی رو که بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\nو همچنین میتونی موزیک پست و ویدئو دلخواهت رو با استفاده از من پیدا و دانلود کنی 🧘🏾🎧\n\nکافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸","help_button.1":"📖 راهنمای کامل ربات\n\n🔗 دانلود از لینک (اینستاگرام / یوتیوب / تیک‌تاک)\n۱. لینک پست، ریلز، استوری اینستاگرام، ویدیو یا شورتز یوتیوب، یا ویدیوی تیک‌تاک رو برام بفرست\n۲. تامبنیل و توضیحات محتوا رو نشونت می‌دم\n۳. زیرش چند دکمه‌ی کیفیت می‌بینی، هرکدوم با حجم دقیق فایل (مثلاً «1080p - 24.3MB»)؛ هرکدوم رو بخوای انتخاب کن\n۴. اگه فقط صدای ویدیو رو می‌خوای (نه خود ویدیو)، دکمه‌ی «🎵 فقط صدا» رو بزن\n۵. حین دانلود یه نوار پیشرفت زنده می‌بینی (درصد، حجم دانلودشده از کل، سرعت)؛ در آخر فایل برات ارسال می‌شه\n\n🎵 جستجوی موزیک (دکمه‌ی «{BTN_MUSIC}»)\n۱. روی دکمه بزن و اسم آهنگ یا فقط اسم خواننده رو بفرست\n۲. اول تو یوتیوب‌میوزیک (کاتالوگ رسمی) می‌گردم؛ اگه اسم خواننده بفرستی، همه‌ی آهنگ‌های شناخته‌شده‌اش از همونجا میاد (برای خواننده‌های خارجی معمولاً کامله)؛ نتیجه‌ها ۱۰تا-۱۰تا صفحه‌بندی شدن با دکمه‌های «◀️ صفحه قبل» / «▶️ صفحه بعد»\n۳. روی اسم هر آهنگ که بزنی، همون دکمه‌های کیفیت/فقط‌صدای بالا براش میاد تا انتخاب کنی\n۴. اگه چیزی پیدا نشد یا کم بود (مثلاً خیلی از آهنگ‌های فارسی تو یوتیوب‌میوزیک نیستن)، پایین لیست دکمه‌ی «🔍 جستجو در یوتیوب» هست؛ بزن تا همون جستجو رو تو یوتیوب عادی هم انجام بدم\n\n📃 پلی‌لیست یوتیوب\nلینک یه پلی‌لیست (همونی که /playlist?list=... داره) رو بفرست؛ اطلاعات پلی‌لیست و ویدیوهاش ۵تا-۵تا صفحه‌بندی می‌شن. روی هر ویدیو بزنی، اطلاعات و تصویرش میاد و می‌تونی کیفیت رو انتخاب و دانلودش کنی. با «▶️ صفحه بعد» و «◀️ صفحه قبل» بین صفحه‌ها برو و آخرش «✅ کارم تموم شد» رو بزن تا دکمه‌ها بسته بشن (اطلاعات پلی‌لیست می‌مونه)\n\n🎞 ارسال خود فایل ویدیو (نه لینک)\nاگه خود کلیپ/ویدیو رو برام بفرستی (مثلاً فایل یه ریلز)، می‌پرسم «چیکار کنم؟» با دو دکمه: «🎵 استخراج صدا» (صدای ویدیو رو mp3 می‌کنم و می‌فرستم) یا «🎧 پیدا کردن آهنگ اصلی» (آهنگ ویدیو رو تشخیص می‌دم و نسخه‌ی رسمیش رو با ویس می‌فرستم)\n• اگه برای ویدیو کپشن بنویسی، تشخیص دقیق‌تر می‌شه\n• دریافت فایل بزرگ‌تر از ۲۰ مگابایت فقط با سرور محلی تلگرام (TELEGRAM_API_ID/HASH) ممکنه\n\n🎧 پیدا کردن آهنگ اصلی یه ویدیو\nزیر دکمه‌های کیفیت هر ویدیو، یه دکمه‌ی «🎵 پیدا کردن آهنگ اصلی ویدیو» هم هست. با زدنش:\n۱. اول چک می‌کنم خود پلتفرم (بیشتر تیک‌تاک) اسم آهنگ رو تو متادیتاش داده یا نه\n۲. اگه نداشت، یه تیکه از صدای خود ویدیو رو می‌گیرم و با سرویس تشخیص آهنگ شناساییش می‌کنم\n۳. بعد از پیدا کردن نسخه‌ی رسمی، خودم هم ویدیو هم نسخه‌ی صوتیش رو با اسم درست و تمیز آهنگ برات می‌فرستم (نیازی به انتخاب دستی نیست)\n۴. اگه پیدا نشد، لااقل اسم خواننده رو (اگه شناسایی شده باشه) بهت می‌گم تا خودت دستی جستجو کنی\n\n👤 حساب، سهمیه و VIP\n• دکمه‌ی «👤 حساب من»: اطلاعات حسابت، تعداد دانلودها، حجم مصرف‌شده‌ی امروز و وضعیت اشتراک\n• هر کاربر روزانه تا {volume} حجم دانلود داره که هر شب نیمه‌شب (به وقت ایران) ریست می‌شه\n• با نوشتن «آیدی» یه آیدی ۸ رقمی اختصاصی می‌گیری؛ اون رو به مدیر بده تا اشتراک VIP (دانلود نامحدود برای چند روز) برات فعال کنه\n\n⚠️ نکات مهم\n• برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست جدید می‌تونی بدی؛ اگه زود بفرستی، می‌گم چند ثانیه صبر کنی\n• پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل دانلود نیستن\n• فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده دارید ازم استفاده کنید؛ مسئولیت رعایت کپی‌رایت با کاربره","about_button.1":"ℹ️ درباره ربات:\n\nاین ربات با کمک yt-dlp از اینستاگرام، یوتیوب و تیک‌تاک دانلود می‌کنه.\nلطفاً فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده دارید ازش استفاده کنید؛ رعایت کپی‌رایت و قوانین پلتفرم‌ها به عهده‌ی خودتونه.","music_button.1":"🎵 اسم آهنگ و خواننده رو بفرست (مثلاً: «Shadmehr Aghili - Bahar»).\nنسخه‌ی رسمیش رو پیدا می‌کنم و برات می‌فرستم.","handle_music_query.1":"یه اسم آهنگ یا خواننده بفرست تا جستجو کنم.","handle_music_query.2":"🔎 دارم تو یوتیوب‌میوزیک دنبال «{query_text}» می‌گردم...","handle_music_query.3":"❌ جستجو با خطا مواجه شد:\n","handle_music_query.4":"تو یوتیوب‌میوزیک چیزی برای «{query_text}» پیدا نشد. می‌تونی از دکمه‌ی پایین تو یوتیوب عادی هم جستجو کنی:","handle_music_query.5":"🎵 نتایج یوتیوب‌میوزیک برای «{query_text}» ({count} مورد) — صفحه ۱ از {total_pages}:\nیکی رو انتخاب کن، یا اگه کافی نبود پایین «جستجو در یوتیوب» رو بزن:","handle_music_page.1":"⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.","handle_music_page.2":"یوتیوب‌میوزیک","handle_music_page.3":"یوتیوب","handle_music_page.4":"🎵 نتایج {source_label} برای «{query}» ({count} مورد) — صفحه {page} از {total_pages}:\nیکی رو انتخاب کن:","handle_music_youtube_fallback.1":"🔎 دارم تو یوتیوب دنبال «{query_text}» می‌گردم...","handle_music_youtube_fallback.2":"تو یوتیوب هم چیزی برای «{query_text}» پیدا نشد.","handle_music_youtube_fallback.3":"🎵 نتایج یوتیوب برای «{query_text}» ({count} مورد) — صفحه ۱ از {total_pages}:\nیکی رو انتخاب کن:","handle_music_pick.1":"⏳ در حال گرفتن اطلاعات...","show_quality_picker.1":"❌ نتونستم اطلاعات این لینک رو بگیرم. ممکنه پست خصوصی باشه یا لینک اشتباه باشه.\nجزئیات خطا: ","show_quality_picker.2":"\nکیفیت مورد نظرت رو انتخاب کن:","show_quality_picker.3":"کیفیت مورد نظرت رو انتخاب کن:","show_quality_picker.4":"…\n\nکیفیت مورد نظرت رو انتخاب کن:","show_quality_picker.5":"🎵 پیدا کردن آهنگ اصلی ویدیو","playlist_info_text.1":"🎞 {count} ویدیو","playlist_info_text.2":" ({skipped} مورد خصوصی/حذف‌شده نادیده گرفته شد)","playlist_page_text.1":"{playlist_info_text}\n\nصفحه {page} از {playlist_total_pages} — یکی رو انتخاب کن:","build_playlist_markup.1":"✅ کارم تموم شد","show_playlist.1":"❌ نتونستم پلی‌لیست رو بخونم. ممکنه خصوصی باشه یا لینک اشتباه باشه.\nجزئیات خطا: ","show_playlist.2":"این پلی‌لیست ویدیوی قابل‌دسترسی نداره (خالیه یا همه‌ی ویدیوهاش خصوصی/حذف‌شده‌ان).","show_playlist.3":"پلی‌لیست","handle_playlist_page.1":"⌛ این پلی‌لیست منقضی شده، لینکش رو دوباره بفرست.","handle_playlist_pick.1":"⏳ دارم اطلاعات ویدیو رو می‌گیرم...","handle_playlist_done.1":"{base}\n\n✅ کارم تموم شد.","handle_message.1":"⏳ دارم پلی‌لیست رو می‌خونم...","handle_message.2":"این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام، ویدیو/شورتز یوتیوب یا ویدیوی تیک‌تاک رو بفرست، یا از دکمه‌ی «{BTN_MUSIC}» برای جستجوی آهنگ استفاده کن.","handle_message.3":"⏳ دارم اطلاعات لینک رو می‌گیرم...","warn_slow_down.1":"⏳ برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست می‌تونی بدی.\nلطفاً {remaining} ثانیه دیگه دوباره بفرست.","quota_problem.1":"📦 سهمیه‌ی امروزت برای این فایل کافی نیست.\nحجم فایل: {volume}\nباقی‌مونده‌ی امروز: {volume2} از {volume3}\n\nسهمیه هر شب نیمه‌شب (به وقت ایران) ریست می‌شه. می‌تونی کیفیت پایین‌تری انتخاب کنی، یا با اشتراک VIP بدون محدودیت دانلود کنی (با نوشتن «آیدی» آیدی ۸ رقمی‌ت رو بگیر و به مدیر بده).","account_button.1":"👤 <b>حساب من</b>","account_button.2":"🏷 نام: {text}","account_button.3":"🔖 آیدی حروفی: {text}","account_button.4":"🔢 آیدی تلگرام: <code>{user_id}</code>","account_button.5":"🆔 آیدی اختصاصی: <code>{public_id}</code>","account_button.6":"📅 تاریخ عضویت: {date}","account_button.7":"⬇️ تعداد دانلود: {downloads_total}","account_button.8":"👑 وضعیت: مدیر (بدون محدودیت)","account_button.9":"💎 اشتراک: VIP فعال تا {date} ({days_left} روز مونده)","account_button.10":"💎 اشتراک: ندارد","account_button.11":"📦 مصرف امروز: {volume} (نامحدود ♾)","account_button.12":"📦 مصرف امروز: {volume} از {volume2} (باقی‌مونده {volume3})","id_command.1":"🆔 آیدی اختصاصی شما: <code>{public_id}</code>\n🔢 آیدی تلگرام: <code>{user_id}</code>\n\nآیدی اختصاصی هویت حساب شماست؛ برای فعال‌سازی اشتراک VIP همین عدد ۸ رقمی رو به مدیر بده.","build_receipt.1":"🧾 <b>فیش فعال‌سازی اشتراک VIP</b>","build_receipt.2":"شماره فیش: <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 کاربر: {text} {text2}","build_receipt.4":"🆔 آیدی: <code>{public_id}</code>","build_receipt.5":"⏳ مدت: {days} روز","build_receipt.6":" (تمدید)","build_receipt.7":"🎁 نوع: اشتراک ماهانه‌ی خودکار (بعد از {AUTO_VIP_AFTER_DAYS} روز عضویت)","build_receipt.8":"👑 نوع: فعال‌سازی توسط مدیر","build_receipt.9":"📅 شروع: {date}","build_receipt.10":"📅 پایان: {date}","build_receipt.11":"💵 ارزش اشتراک: <b>{usd}</b> (هر روز {usd2})","build_receipt.12":"✅ اشتراک فعال شد.","run_auto_vip_check.1":"🎁 اشتراک ماهانه‌ات فعال شد!\nچون بیشتر از {AUTO_VIP_AFTER_DAYS} روزه که با ما هستی، هر {AUTO_VIP_DAYS} روز یه اشتراک {AUTO_VIP_DAYS} روزه‌ی VIP خودکار برات فعال می‌شه.\n\n","run_auto_vip_check.2":"\n\nتا {date} می‌تونی بدون محدودیت حجم دانلود کنی 💎","job_allowed.1":"📦 سهمیه‌ی امروزت تموم شده. نیمه‌شب ریست می‌شه؛ یا با VIP نامحدود دانلود کن («آیدی» بنویس و به مدیر بده).","job_allowed.2":"⏳ برای جلوگیری از اسپم، {remaining} ثانیه دیگه صبر کن و دوباره بزن.","link_markup.1":"🔗 لینک","cleanup_after_send.1":"✅ ارسال شد!","handle_quality_choice.1":"❌ خطای داخلی، دوباره لینک رو بفرست.","handle_quality_choice.2":"⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.","handle_quality_choice.3":"⏳ در حال آماده‌سازی دانلود...","handle_quality_choice.4":"❌ حجم فایل {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB ربات‌های تلگرام رسمی بیشتره. برای فایل‌های بزرگ‌تر باید از Local Bot API Server استفاده کنی (توضیح در README).","handle_quality_choice.5":"📤 در حال ارسال فایل ({size_mb:.0f}MB)...\nفایل‌های بزرگ ممکنه چند دقیقه طول بکشه، صبور باش.","handle_quality_choice.6":"❌ دانلود یا ارسال فایل با خطا مواجه شد:\n","deliver_song.1":"⚠️ حجم ویدیو {video_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه.","deliver_song.2":"📤 در حال ارسال ویدیو ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ در حال دانلود نسخه‌ی صوتی «{label}»...","deliver_song.4":"⚠️ حجم فایل صوتی {audio_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه.","deliver_song.5":"❌ ارسال آهنگ با خطا مواجه شد:\n","recognize_from_audio_file.1":"🎧 در حال تشخیص آهنگ (تیکه‌ی اول)...","recognize_from_audio_file.2":"🎧 در حال تشخیص آهنگ (تیکه‌ی دوم)...","find_and_deliver_song.1":"🎵 آهنگ اصلی: {label}{variant_txt}\n🔎 در حال پیدا کردن نسخه‌ی رسمی...","find_and_deliver_song.2":"\nخواننده: {artist}","find_and_deliver_song.3":"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\nمی‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.","handle_find_song.1":"🤖 در حال بررسی کپشن ویدیو با هوش مصنوعی...","handle_find_song.2":" یا یه GEMINI_API_KEY رایگان از aistudio.google.com بگیر تا از روی کپشن ویدیو حدس بزنم","handle_find_song.3":"ℹ️ نتونستم از متادیتا یا کپشن ویدیو آهنگ رو تشخیص بدم. برای تشخیص از روی خود صدا باید یه AUDD_API_KEY (یا ACRCloud) تنظیم بشه{hint}.","handle_find_song.4":"⬇️ در حال دانلود صدای ویدیو برای تشخیص...","handle_find_song.5":"❌ تشخیص آهنگ با خطا مواجه شد:\n","handle_find_song.6":"❌ نتونستم آهنگ این ویدیو رو تشخیص بدم. شاید صدای پس‌زمینه واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.","handle_uploaded_media.1":"🎵 استخراج صدا","handle_uploaded_media.2":"🎧 پیدا کردن آهنگ اصلی","handle_uploaded_media.3":"🎞 فایلت رو گرفتم. چیکار کنم؟","download_uploaded_file.1":"❌ حجم فایل {size_mb:.1f}MB هست و ربات با سرور رسمی تلگرام فقط تا {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB رو می‌تونه دریافت کنه. برای فایل‌های بزرگ‌تر باید TELEGRAM_API_ID و TELEGRAM_API_HASH ست بشن (سرور محلی).","download_uploaded_file.2":"⬇️ در حال دریافت فایل از تلگرام...","download_uploaded_file.3":"❌ این فایل برای دریافت توسط ربات خیلی بزرگه (سقف ۲۰ مگابایت بدون سرور محلی).","handle_upload_extract_audio.1":"⌛ این درخواست منقضی شده، فایل رو دوباره بفرست.","handle_upload_extract_audio.2":"🎶 در حال استخراج صدا...","handle_upload_extract_audio.3":"❌ حجم فایل صوتی {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB بیشتره.","handle_upload_extract_audio.4":"❌ استخراج صدا با خطا مواجه شد:\n","handle_upload_find_song.1":"🤖 در حال بررسی کپشن با هوش مصنوعی...","handle_upload_find_song.2":"ℹ️ برای تشخیص آهنگ از روی صدای فایل باید یه AUDD_API_KEY (یا ACRCloud) تنظیم بشه.","handle_upload_find_song.3":"❌ نتونستم آهنگ این فایل رو تشخیص بدم. شاید صدای پس‌زمینه واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.","btn.help":"📖 راهنما","btn.about":"ℹ️ درباره ربات","btn.music":"🎵 جستجوی موزیک","btn.account":"👤 حساب من","vip_granted.user":"🎉 اشتراک VIP شما فعال شد!\n\n{receipt}\n\nاز این به بعد تا {date} می‌تونی بدون محدودیت حجم دانلود کنی 💎","vip_cancelled.user":"ℹ️ اشتراک VIP شما توسط مدیر لغو شد.\nاز این به بعد سهمیه‌ی روزانه‌ی عادی ({volume}) برای شما اعمال می‌شه."},"en":{"__init__.1":"🔒 This content isn't visible to the account the bot is logged in with (Instagram only shows it to certain audiences or with an age restriction).\nIt's not a private post or a broken link, but the bot can't download it.","__init__.2":"🔒 This content is only visible to certain audiences (for example with an age restriction) on Instagram, and the bot has no logged-in account to try again.\nIt's not a private post or a broken link, but the bot can't download it.","format_music_entry_label.1":"Untitled","build_music_page.1":"◀️ Previous page","build_music_page.2":"▶️ Next page","build_music_page.3":"🔍 Search on YouTube","render.1":"⚙️ Final processing (converting/merging the file)...","render.2":"?","render.3":"  •  {n}s left","render.4":"⬇️ Downloading...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (approx.)","pick_quality_options.2":"🎬 Default quality{size_txt}","pick_quality_options.3":"🎵 Audio only (MP3)","start.1":"Hey there, friend 🧘🏾🌚\nI'm your downloader bot 🧸\n\nWith me you can download videos, music and posts from almost any platform, with no limits 🧘🏾✨️\n\nYou can also find and download the music, posts and videos you like through me 🧘🏾🎧\n\nJust send me the link to the post you want 🧸","help_button.1":"📖 Complete bot guide\n\n🔗 Download from a link (Instagram / YouTube / TikTok)\n1. Send me the link to an Instagram post, reel or story, a YouTube video or short, or a TikTok video\n2. I'll show you the thumbnail and description\n3. Below it you'll see several quality buttons, each with the exact file size (e.g. “1080p - 24.3MB”); pick whichever you like\n4. If you only want the audio of the video (not the video itself), tap «🎵 Audio only»\n5. While downloading you'll see a live progress bar (percentage, downloaded size of total, speed); when it's done the file is sent to you\n\n🎵 Music search («{BTN_MUSIC}» button)\n1. Tap the button and send a song name or just an artist name\n2. I search YouTube Music (the official catalog) first; if you send an artist name, all their known songs come from there (usually complete for international artists); results are paginated 10 at a time with the «◀️ Previous page» / «▶️ Next page» buttons\n3. Tap any song and you get the same quality / audio-only buttons as above\n4. If nothing is found or there are too few results (for example many Persian songs aren't on YouTube Music), there's a «🔍 Search on YouTube» button below the list; tap it and I'll run the same search on regular YouTube\n\n📃 YouTube playlists\nSend the link of a playlist (the kind that contains /playlist?list=...); the playlist info and its videos are paginated 5 at a time. Tap a video to see its info and thumbnail, then choose a quality and download it. Use «▶️ Next page» and «◀️ Previous page» to move between pages and finally tap «✅ I'm done» to close the buttons (the playlist info stays)\n\n🎞 Sending the video file itself (not a link)\nIf you send me a clip/video file itself (for example a reel file), I'll ask “What should I do?” with two buttons: «🎵 Extract audio» (I convert the video's sound to mp3 and send it) or «🎧 Find the original song» (I identify the song in the video and send you its official version as a voice/audio file)\n• If you write a caption for the video, identification becomes more accurate\n• Receiving files larger than 20 MB is only possible with a local Telegram server (TELEGRAM_API_ID/HASH)\n\n🎧 Finding a video's original song\nUnder each video's quality buttons there is also a «🎵 Find the video's original song» button. When you tap it:\n1. First I check whether the platform itself (mostly TikTok) provides the song name in its metadata\n2. If not, I take a piece of the video's audio and identify it with a song-recognition service\n3. Once the official version is found, I send you both the video and its audio version with the proper, clean song name (no manual selection needed)\n4. If it isn't found, I'll at least tell you the artist's name (if identified) so you can search manually\n\n👤 Account, quota and VIP\n• The «👤 My account» button: your account info, number of downloads, today's used volume and subscription status\n• Every user can download up to {volume} per day, which resets every night at midnight (Iran time)\n• By writing «id» you get a unique 8-digit ID; give it to the admin to activate a VIP subscription (unlimited downloads for some days)\n\n⚠️ Important notes\n• To prevent spam, you can only send one new request every {REQUEST_COOLDOWN_SECONDS} seconds; if you send too fast, I'll tell you how many seconds to wait\n• Private posts or restricted videos can't be downloaded without cookie settings\n• Please use me only for your own content or content you're allowed to use; copyright compliance is the user's responsibility","about_button.1":"ℹ️ About the bot:\n\nThis bot downloads from Instagram, YouTube and TikTok using yt-dlp.\nPlease use it only for your own content or content you have permission to use; complying with copyright and platform rules is your own responsibility.","music_button.1":"🎵 Send the song name and artist (for example: «Shadmehr Aghili - Bahar»).\nI'll find the official version and send it to you.","handle_music_query.1":"Send a song or artist name and I'll search for it.","handle_music_query.2":"🔎 Searching YouTube Music for «{query_text}»...","handle_music_query.3":"❌ The search failed:\n","handle_music_query.4":"Nothing found on YouTube Music for «{query_text}». You can also search regular YouTube with the button below:","handle_music_query.5":"🎵 YouTube Music results for «{query_text}» ({count} items) — page 1 of {total_pages}:\nPick one, or if that's not enough, tap «Search on YouTube» below:","handle_music_page.1":"⌛ This search has expired. Please use the music search button again.","handle_music_page.2":"YouTube Music","handle_music_page.3":"YouTube","handle_music_page.4":"🎵 {source_label} results for «{query}» ({count} items) — page {page} of {total_pages}:\nPick one:","handle_music_youtube_fallback.1":"🔎 Searching YouTube for «{query_text}»...","handle_music_youtube_fallback.2":"Nothing found on regular YouTube either for «{query_text}».","handle_music_youtube_fallback.3":"🎵 YouTube results for «{query_text}» ({count} items) — page 1 of {total_pages}:\nPick one:","handle_music_pick.1":"⏳ Getting the info...","show_quality_picker.1":"❌ I couldn't get the info for this link. The post may be private or the link may be wrong.\nError details: ","show_quality_picker.2":"\nChoose the quality you want:","show_quality_picker.3":"Choose the quality you want:","show_quality_picker.4":"…\n\nChoose the quality you want:","show_quality_picker.5":"🎵 Find the video's original song","playlist_info_text.1":"🎞 {count} videos","playlist_info_text.2":" ({skipped} private/deleted items were skipped)","playlist_page_text.1":"{playlist_info_text}\n\nPage {page} of {playlist_total_pages} — pick one:","build_playlist_markup.1":"✅ I'm done","show_playlist.1":"❌ I couldn't read the playlist. It may be private or the link may be wrong.\nError details: ","show_playlist.2":"This playlist has no accessible videos (it's empty or all of its videos are private/deleted).","show_playlist.3":"Playlist","handle_playlist_page.1":"⌛ This playlist has expired, please send its link again.","handle_playlist_pick.1":"⏳ Getting the video info...","handle_playlist_done.1":"{base}\n\n✅ Done.","handle_message.1":"⏳ Reading the playlist...","handle_message.2":"That isn't a valid link. Send a link to an Instagram post/reel/story, a YouTube video/short or a TikTok video, or use the «{BTN_MUSIC}» button to search for a song.","handle_message.3":"⏳ Getting the link info...","warn_slow_down.1":"⏳ To prevent spam, you can only send one new request every {REQUEST_COOLDOWN_SECONDS} seconds.\nPlease send it again in {remaining} seconds.","quota_problem.1":"📦 Today's quota isn't enough for this file.\nFile size: {volume}\nRemaining today: {volume2} of {volume3}\n\nThe quota resets every night at midnight (Iran time). You can choose a lower quality, or download without limits with a VIP subscription (write «id» to get your 8-digit ID and give it to the admin).","account_button.1":"👤 <b>My account</b>","account_button.2":"🏷 Name: {text}","account_button.3":"🔖 Username: {text}","account_button.4":"🔢 Telegram ID: <code>{user_id}</code>","account_button.5":"🆔 Unique ID: <code>{public_id}</code>","account_button.6":"📅 Member since: {date}","account_button.7":"⬇️ Downloads: {downloads_total}","account_button.8":"👑 Status: Admin (no limits)","account_button.9":"💎 Subscription: VIP active until {date} ({days_left} days left)","account_button.10":"💎 Subscription: none","account_button.11":"📦 Used today: {volume} (unlimited ♾)","account_button.12":"📦 Used today: {volume} of {volume2} ({volume3} left)","id_command.1":"🆔 Your unique ID: <code>{public_id}</code>\n🔢 Telegram ID: <code>{user_id}</code>\n\nThe unique ID identifies your account; give this 8-digit number to the admin to activate a VIP subscription.","build_receipt.1":"🧾 <b>VIP subscription activation receipt</b>","build_receipt.2":"Receipt no.: <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 User: {text} {text2}","build_receipt.4":"🆔 ID: <code>{public_id}</code>","build_receipt.5":"⏳ Duration: {days} days","build_receipt.6":" (renewal)","build_receipt.7":"🎁 Type: automatic monthly subscription (after {AUTO_VIP_AFTER_DAYS} days of membership)","build_receipt.8":"👑 Type: activated by the admin","build_receipt.9":"📅 Start: {date}","build_receipt.10":"📅 End: {date}","build_receipt.11":"💵 Subscription value: <b>{usd}</b> ({usd2} per day)","build_receipt.12":"✅ Subscription activated.","run_auto_vip_check.1":"🎁 Your monthly subscription is active!\nSince you've been with us for more than {AUTO_VIP_AFTER_DAYS} days, a {AUTO_VIP_DAYS}-day VIP subscription is activated for you automatically every {AUTO_VIP_DAYS} days.\n\n","run_auto_vip_check.2":"\n\nUntil {date} you can download with no volume limit 💎","job_allowed.1":"📦 Today's quota is used up. It resets at midnight; or download without limits with VIP (write «id» and give it to the admin).","job_allowed.2":"⏳ To prevent spam, wait {remaining} more seconds and try again.","link_markup.1":"🔗 Link","cleanup_after_send.1":"✅ Sent!","handle_quality_choice.1":"❌ Internal error, please send the link again.","handle_quality_choice.2":"⌛ This request has expired, please send the link again.","handle_quality_choice.3":"⏳ Preparing the download...","handle_quality_choice.4":"❌ The file is {size_mb:.1f}MB, which is above the {MAX_TELEGRAM_UPLOAD_MB}MB limit of official Telegram bots. For larger files you need to use a Local Bot API Server (see the README).","handle_quality_choice.5":"📤 Sending the file ({size_mb:.0f}MB)...\nLarge files may take a few minutes, please be patient.","handle_quality_choice.6":"❌ The download or upload failed:\n","deliver_song.1":"⚠️ The video is {video_size_mb:.1f}MB, which is above Telegram's {MAX_TELEGRAM_UPLOAD_MB}MB limit.","deliver_song.2":"📤 Sending the video ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ Downloading the audio version of «{label}»...","deliver_song.4":"⚠️ The audio file is {audio_size_mb:.1f}MB, which is above Telegram's {MAX_TELEGRAM_UPLOAD_MB}MB limit.","deliver_song.5":"❌ Sending the song failed:\n","recognize_from_audio_file.1":"🎧 Identifying the song (first clip)...","recognize_from_audio_file.2":"🎧 Identifying the song (second clip)...","find_and_deliver_song.1":"🎵 Original song: {label}{variant_txt}\n🔎 Looking for the official version...","find_and_deliver_song.2":"\nArtist: {artist}","find_and_deliver_song.3":"❌ I couldn't find the official version of «{title}».{artist_txt}\nYou can try the «🎵 Music search» button with a more exact name.","handle_find_song.1":"🤖 Checking the video's caption with AI...","handle_find_song.2":" or get a free GEMINI_API_KEY from aistudio.google.com so I can guess from the video's caption","handle_find_song.3":"ℹ️ I couldn't identify the song from the video's metadata or caption. To identify it from the audio itself, an AUDD_API_KEY (or ACRCloud) must be configured{hint}.","handle_find_song.4":"⬇️ Downloading the video's audio for identification...","handle_find_song.5":"❌ Song identification failed:\n","handle_find_song.6":"❌ I couldn't identify this video's song. The background sound may not have been clear, or the song isn't in the recognition service's database.","handle_uploaded_media.1":"🎵 Extract audio","handle_uploaded_media.2":"🎧 Find the original song","handle_uploaded_media.3":"🎞 I got your file. What should I do?","download_uploaded_file.1":"❌ The file is {size_mb:.1f}MB and, with the official Telegram server, the bot can only receive files up to {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB. For larger files, TELEGRAM_API_ID and TELEGRAM_API_HASH must be set (local server).","download_uploaded_file.2":"⬇️ Receiving the file from Telegram...","download_uploaded_file.3":"❌ This file is too large for the bot to receive (the limit is 20 MB without a local server).","handle_upload_extract_audio.1":"⌛ This request has expired, please send the file again.","handle_upload_extract_audio.2":"🎶 Extracting the audio...","handle_upload_extract_audio.3":"❌ The audio file is {size_mb:.1f}MB, which is above the {MAX_TELEGRAM_UPLOAD_MB}MB limit.","handle_upload_extract_audio.4":"❌ Audio extraction failed:\n","handle_upload_find_song.1":"🤖 Checking the caption with AI...","handle_upload_find_song.2":"ℹ️ To identify a song from the file's audio, an AUDD_API_KEY (or ACRCloud) must be configured.","handle_upload_find_song.3":"❌ I couldn't identify this file's song. The background sound may not have been clear, or the song isn't in the recognition service's database.","btn.help":"📖 Help","btn.about":"ℹ️ About","btn.music":"🎵 Music search","btn.account":"👤 My account","vip_granted.user":"🎉 Your VIP subscription is active!\n\n{receipt}\n\nFrom now on, until {date}, you can download with no volume limit 💎","vip_cancelled.user":"ℹ️ Your VIP subscription was cancelled by the admin.\nFrom now on, the normal daily quota ({volume}) applies to you."},"tr":{"__init__.1":"🔒 Bu içerik, botun giriş yaptığı hesap tarafından görüntülenemiyor (Instagram bunu yalnızca belirli kitlelere veya yaş sınırıyla gösteriyor).\nÖzel bir gönderi ya da bozuk bir bağlantı değil, ancak bot bunu indiremiyor.","__init__.2":"🔒 Bu içerik Instagram'da yalnızca belirli kitleler için (örneğin yaş sınırıyla) görüntülenebiliyor ve botun yeniden denemek için giriş yapmış bir hesabı yok.\nÖzel bir gönderi ya da bozuk bir bağlantı değil, ancak bot bunu indiremiyor.","format_music_entry_label.1":"Adsız","build_music_page.1":"◀️ Önceki sayfa","build_music_page.2":"▶️ Sonraki sayfa","build_music_page.3":"🔍 YouTube'da ara","render.1":"⚙️ Son işlemler yapılıyor (dosya dönüştürme/birleştirme)...","render.2":"?","render.3":"  •  {n}sn kaldı","render.4":"⬇️ İndiriliyor...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (yaklaşık)","pick_quality_options.2":"🎬 Varsayılan kalite{size_txt}","pick_quality_options.3":"🎵 Sadece ses (MP3)","start.1":"Selam dostum 🧘🏾🌚\nBen senin indirme botunum 🧸\n\nBenimle hemen her platformdan video, müzik ve gönderileri sınırsız indirebilirsin 🧘🏾✨️\n\nAyrıca istediğin müziği, gönderiyi ve videoyu benimle bulup indirebilirsin 🧘🏾🎧\n\nSadece istediğin gönderinin bağlantısını bana göndermen yeterli 🧸","help_button.1":"📖 Botun tam rehberi\n\n🔗 Bağlantıdan indirme (Instagram / YouTube / TikTok)\n1. Bana bir Instagram gönderisi, reels ya da hikaye, bir YouTube videosu veya shorts, ya da bir TikTok videosunun bağlantısını gönder\n2. Sana küçük resmi ve açıklamayı gösteririm\n3. Altında birkaç kalite düğmesi görürsün, her biri dosyanın tam boyutuyla (örneğin “1080p - 24.3MB”); istediğini seç\n4. Videonun sadece sesini istiyorsan (videonun kendisini değil), «🎵 Sadece ses» düğmesine bas\n5. İndirirken canlı bir ilerleme çubuğu görürsün (yüzde, toplamdan indirilen boyut, hız); sonunda dosya sana gönderilir\n\n🎵 Müzik arama («{BTN_MUSIC}» düğmesi)\n1. Düğmeye bas ve bir şarkı adı ya da sadece sanatçı adı gönder\n2. Önce YouTube Music'te (resmi katalog) ararım; sanatçı adı gönderirsen bilinen tüm şarkıları oradan gelir (yabancı sanatçılar için genelde eksiksizdir); sonuçlar 10'ar 10'ar «◀️ Önceki sayfa» / «▶️ Sonraki sayfa» düğmeleriyle sayfalanır\n3. Herhangi bir şarkıya dokunursan yukarıdaki kalite / sadece ses düğmeleri onun için de çıkar\n4. Hiçbir şey bulunamazsa ya da az çıkarsa (örneğin birçok Farsça şarkı YouTube Music'te yok), listenin altında «🔍 YouTube'da ara» düğmesi var; bas, aynı aramayı normal YouTube'da da yapayım\n\n📃 YouTube oynatma listeleri\nBir oynatma listesinin bağlantısını gönder (/playlist?list=... içeren); liste bilgisi ve videoları 5'er 5'er sayfalanır. Bir videoya dokunursan bilgisi ve görseli gelir, kaliteyi seçip indirebilirsin. «▶️ Sonraki sayfa» ve «◀️ Önceki sayfa» ile sayfalar arasında gez, sonunda düğmeleri kapatmak için «✅ İşim bitti» düğmesine bas (liste bilgisi kalır)\n\n🎞 Video dosyasının kendisini gönderme (bağlantı değil)\nKlibin/videonun kendisini gönderirsen (örneğin bir reels dosyası), iki düğmeyle “Ne yapayım?” diye sorarım: «🎵 Sesi çıkar» (videonun sesini mp3 yapıp gönderirim) veya «🎧 Orijinal şarkıyı bul» (videodaki şarkıyı tanır ve resmi sürümünü ses olarak gönderirim)\n• Videoya bir açıklama yazarsan tanıma daha doğru olur\n• 20 MB'dan büyük dosyaları almak yalnızca yerel Telegram sunucusuyla (TELEGRAM_API_ID/HASH) mümkün\n\n🎧 Bir videonun orijinal şarkısını bulma\nHer videonun kalite düğmelerinin altında bir de «🎵 Videonun orijinal şarkısını bul» düğmesi var. Ona basınca:\n1. Önce platformun (çoğunlukla TikTok) şarkı adını meta verisinde verip vermediğine bakarım\n2. Vermemişse videonun sesinden bir parça alıp şarkı tanıma servisiyle tanırım\n3. Resmi sürüm bulunduktan sonra hem videoyu hem ses sürümünü doğru ve temiz şarkı adıyla sana gönderirim (elle seçmeye gerek yok)\n4. Bulunamazsa, en azından sanatçının adını (tanınmışsa) söylerim ki kendin arayabilesin\n\n👤 Hesap, kota ve VIP\n• «👤 Hesabım» düğmesi: hesap bilgilerin, indirme sayın, bugün kullanılan hacim ve abonelik durumu\n• Her kullanıcı günde {volume} indirme hacmine sahiptir; bu her gece yarısı (İran saatiyle) sıfırlanır\n• «id» yazarak 8 haneli özel bir kimlik alırsın; VIP aboneliğini (birkaç gün sınırsız indirme) açması için bunu yöneticiye ver\n\n⚠️ Önemli notlar\n• Spam'i önlemek için her {REQUEST_COOLDOWN_SECONDS} saniyede yalnızca bir yeni istek gönderebilirsin; çok hızlı gönderirsen kaç saniye beklemen gerektiğini söylerim\n• Özel gönderiler veya kısıtlı videolar, çerez ayarı olmadan indirilemez\n• Lütfen beni yalnızca kendi içeriğiniz veya kullanma izniniz olan içerikler için kullanın; telif hakkına uymak kullanıcının sorumluluğundadır","about_button.1":"ℹ️ Bot hakkında:\n\nBu bot, yt-dlp yardımıyla Instagram, YouTube ve TikTok'tan indirme yapar.\nLütfen yalnızca kendi içeriğiniz veya kullanma izniniz olan içerikler için kullanın; telif haklarına ve platform kurallarına uymak size aittir.","music_button.1":"🎵 Şarkı adını ve sanatçıyı gönder (örneğin: «Shadmehr Aghili - Bahar»).\nResmi sürümünü bulup sana göndereceğim.","handle_music_query.1":"Aramam için bir şarkı ya da sanatçı adı gönder.","handle_music_query.2":"🔎 YouTube Music'te «{query_text}» aranıyor...","handle_music_query.3":"❌ Arama başarısız oldu:\n","handle_music_query.4":"YouTube Music'te «{query_text}» için bir şey bulunamadı. Aşağıdaki düğmeyle normal YouTube'da da arayabilirsin:","handle_music_query.5":"🎵 «{query_text}» için YouTube Music sonuçları ({count} sonuç) — sayfa 1 / {total_pages}:\nBirini seç, yetmezse aşağıdaki «YouTube'da ara» düğmesine bas:","handle_music_page.1":"⌛ Bu aramanın süresi doldu, lütfen müzik arama düğmesini tekrar kullan.","handle_music_page.2":"YouTube Music","handle_music_page.3":"YouTube","handle_music_page.4":"🎵 «{query}» için {source_label} sonuçları ({count} sonuç) — sayfa {page} / {total_pages}:\nBirini seç:","handle_music_youtube_fallback.1":"🔎 YouTube'da «{query_text}» aranıyor...","handle_music_youtube_fallback.2":"Normal YouTube'da da «{query_text}» için bir şey bulunamadı.","handle_music_youtube_fallback.3":"🎵 «{query_text}» için YouTube sonuçları ({count} sonuç) — sayfa 1 / {total_pages}:\nBirini seç:","handle_music_pick.1":"⏳ Bilgiler alınıyor...","show_quality_picker.1":"❌ Bu bağlantının bilgilerini alamadım. Gönderi özel olabilir ya da bağlantı yanlış olabilir.\nHata ayrıntısı: ","show_quality_picker.2":"\nİstediğin kaliteyi seç:","show_quality_picker.3":"İstediğin kaliteyi seç:","show_quality_picker.4":"…\n\nİstediğin kaliteyi seç:","show_quality_picker.5":"🎵 Videonun orijinal şarkısını bul","playlist_info_text.1":"🎞 {count} video","playlist_info_text.2":" ({skipped} özel/silinmiş öğe atlandı)","playlist_page_text.1":"{playlist_info_text}\n\nSayfa {page} / {playlist_total_pages} — birini seç:","build_playlist_markup.1":"✅ İşim bitti","show_playlist.1":"❌ Oynatma listesini okuyamadım. Özel olabilir ya da bağlantı yanlış olabilir.\nHata ayrıntısı: ","show_playlist.2":"Bu oynatma listesinde erişilebilir video yok (boş ya da tüm videoları özel/silinmiş).","show_playlist.3":"Oynatma listesi","handle_playlist_page.1":"⌛ Bu oynatma listesinin süresi doldu, lütfen bağlantısını tekrar gönder.","handle_playlist_pick.1":"⏳ Video bilgileri alınıyor...","handle_playlist_done.1":"{base}\n\n✅ İşim bitti.","handle_message.1":"⏳ Oynatma listesi okunuyor...","handle_message.2":"Bu geçerli bir bağlantı değil. Bir Instagram gönderisi/reels/hikaye, bir YouTube videosu/shorts ya da TikTok videosu bağlantısı gönder, veya şarkı aramak için «{BTN_MUSIC}» düğmesini kullan.","handle_message.3":"⏳ Bağlantı bilgileri alınıyor...","warn_slow_down.1":"⏳ Spam'i önlemek için her {REQUEST_COOLDOWN_SECONDS} saniyede yalnızca bir yeni istek gönderebilirsin.\nLütfen {remaining} saniye sonra tekrar gönder.","quota_problem.1":"📦 Bugünkü kotan bu dosya için yetmiyor.\nDosya boyutu: {volume}\nBugün kalan: {volume3} üzerinden {volume2}\n\nKota her gece yarısı (İran saatiyle) sıfırlanır. Daha düşük bir kalite seçebilir veya VIP aboneliğiyle sınırsız indirebilirsin («id» yazıp 8 haneli kimliğini al ve yöneticiye ver).","account_button.1":"👤 <b>Hesabım</b>","account_button.2":"🏷 Ad: {text}","account_button.3":"🔖 Kullanıcı adı: {text}","account_button.4":"🔢 Telegram kimliği: <code>{user_id}</code>","account_button.5":"🆔 Özel kimlik: <code>{public_id}</code>","account_button.6":"📅 Üyelik tarihi: {date}","account_button.7":"⬇️ İndirme sayısı: {downloads_total}","account_button.8":"👑 Durum: Yönetici (sınırsız)","account_button.9":"💎 Abonelik: {date} tarihine kadar VIP aktif ({days_left} gün kaldı)","account_button.10":"💎 Abonelik: yok","account_button.11":"📦 Bugünkü kullanım: {volume} (sınırsız ♾)","account_button.12":"📦 Bugünkü kullanım: {volume} / {volume2} ({volume3} kaldı)","id_command.1":"🆔 Özel kimliğin: <code>{public_id}</code>\n🔢 Telegram kimliği: <code>{user_id}</code>\n\nÖzel kimlik hesabının kimliğidir; VIP aboneliğini açtırmak için bu 8 haneli sayıyı yöneticiye ver.","build_receipt.1":"🧾 <b>VIP abonelik etkinleştirme makbuzu</b>","build_receipt.2":"Makbuz no: <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 Kullanıcı: {text} {text2}","build_receipt.4":"🆔 Kimlik: <code>{public_id}</code>","build_receipt.5":"⏳ Süre: {days} gün","build_receipt.6":" (uzatma)","build_receipt.7":"🎁 Tür: otomatik aylık abonelik ({AUTO_VIP_AFTER_DAYS} gün üyelikten sonra)","build_receipt.8":"👑 Tür: yönetici tarafından etkinleştirildi","build_receipt.9":"📅 Başlangıç: {date}","build_receipt.10":"📅 Bitiş: {date}","build_receipt.11":"💵 Abonelik değeri: <b>{usd}</b> (günlük {usd2})","build_receipt.12":"✅ Abonelik etkinleştirildi.","run_auto_vip_check.1":"🎁 Aylık aboneliğin etkinleşti!\n{AUTO_VIP_AFTER_DAYS} günden fazladır bizimle olduğun için, her {AUTO_VIP_DAYS} günde bir senin için {AUTO_VIP_DAYS} günlük VIP abonelik otomatik olarak etkinleştirilir.\n\n","run_auto_vip_check.2":"\n\n{date} tarihine kadar hacim sınırı olmadan indirebilirsin 💎","job_allowed.1":"📦 Bugünkü kotan bitti. Gece yarısı sıfırlanır; ya da VIP ile sınırsız indir («id» yaz ve yöneticiye ver).","job_allowed.2":"⏳ Spam'i önlemek için {remaining} saniye daha bekle ve tekrar dene.","link_markup.1":"🔗 Bağlantı","cleanup_after_send.1":"✅ Gönderildi!","handle_quality_choice.1":"❌ Dahili hata, lütfen bağlantıyı tekrar gönder.","handle_quality_choice.2":"⌛ Bu isteğin süresi doldu, lütfen bağlantıyı tekrar gönder.","handle_quality_choice.3":"⏳ İndirme hazırlanıyor...","handle_quality_choice.4":"❌ Dosya {size_mb:.1f}MB ve resmi Telegram botlarının {MAX_TELEGRAM_UPLOAD_MB}MB sınırını aşıyor. Daha büyük dosyalar için bir Yerel Bot API Sunucusu kullanman gerekir (README'ye bak).","handle_quality_choice.5":"📤 Dosya gönderiliyor ({size_mb:.0f}MB)...\nBüyük dosyalar birkaç dakika sürebilir, lütfen sabırlı ol.","handle_quality_choice.6":"❌ İndirme veya gönderme başarısız oldu:\n","deliver_song.1":"⚠️ Videonun boyutu {video_size_mb:.1f}MB ve Telegram'ın {MAX_TELEGRAM_UPLOAD_MB}MB sınırını aşıyor.","deliver_song.2":"📤 Video gönderiliyor ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ «{label}» şarkısının ses sürümü indiriliyor...","deliver_song.4":"⚠️ Ses dosyasının boyutu {audio_size_mb:.1f}MB ve Telegram'ın {MAX_TELEGRAM_UPLOAD_MB}MB sınırını aşıyor.","deliver_song.5":"❌ Şarkı gönderilemedi:\n","recognize_from_audio_file.1":"🎧 Şarkı tanınıyor (ilk parça)...","recognize_from_audio_file.2":"🎧 Şarkı tanınıyor (ikinci parça)...","find_and_deliver_song.1":"🎵 Orijinal şarkı: {label}{variant_txt}\n🔎 Resmi sürüm aranıyor...","find_and_deliver_song.2":"\nSanatçı: {artist}","find_and_deliver_song.3":"❌ «{title}» şarkısının resmi sürümünü bulamadım.{artist_txt}\nDaha doğru bir adla «🎵 Müzik ara» düğmesini deneyebilirsin.","handle_find_song.1":"🤖 Videonun açıklaması yapay zekâ ile inceleniyor...","handle_find_song.2":" ya da aistudio.google.com'dan ücretsiz bir GEMINI_API_KEY al, böylece videonun açıklamasından tahmin edebileyim","handle_find_song.3":"ℹ️ Şarkıyı videonun meta verisinden veya açıklamasından tanıyamadım. Sesin kendisinden tanımak için bir AUDD_API_KEY (veya ACRCloud) ayarlanmalı{hint}.","handle_find_song.4":"⬇️ Tanıma için videonun sesi indiriliyor...","handle_find_song.5":"❌ Şarkı tanıma başarısız oldu:\n","handle_find_song.6":"❌ Bu videonun şarkısını tanıyamadım. Arka plan sesi net olmayabilir veya şarkı tanıma servisinin veritabanında yok.","handle_uploaded_media.1":"🎵 Sesi çıkar","handle_uploaded_media.2":"🎧 Orijinal şarkıyı bul","handle_uploaded_media.3":"🎞 Dosyanı aldım. Ne yapayım?","download_uploaded_file.1":"❌ Dosya {size_mb:.1f}MB ve resmi Telegram sunucusuyla bot yalnızca {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB'a kadar dosya alabiliyor. Daha büyük dosyalar için TELEGRAM_API_ID ve TELEGRAM_API_HASH ayarlanmalı (yerel sunucu).","download_uploaded_file.2":"⬇️ Dosya Telegram'dan alınıyor...","download_uploaded_file.3":"❌ Bu dosya botun alması için çok büyük (yerel sunucu olmadan sınır 20 MB).","handle_upload_extract_audio.1":"⌛ Bu isteğin süresi doldu, lütfen dosyayı tekrar gönder.","handle_upload_extract_audio.2":"🎶 Ses çıkarılıyor...","handle_upload_extract_audio.3":"❌ Ses dosyası {size_mb:.1f}MB ve {MAX_TELEGRAM_UPLOAD_MB}MB sınırını aşıyor.","handle_upload_extract_audio.4":"❌ Ses çıkarma başarısız oldu:\n","handle_upload_find_song.1":"🤖 Açıklama yapay zekâ ile inceleniyor...","handle_upload_find_song.2":"ℹ️ Dosyanın sesinden şarkı tanımak için bir AUDD_API_KEY (veya ACRCloud) ayarlanmalı.","handle_upload_find_song.3":"❌ Bu dosyanın şarkısını tanıyamadım. Arka plan sesi net olmayabilir veya şarkı tanıma servisinin veritabanında yok.","btn.help":"📖 Yardım","btn.about":"ℹ️ Hakkında","btn.music":"🎵 Müzik ara","btn.account":"👤 Hesabım","vip_granted.user":"🎉 VIP aboneliğin etkinleşti!\n\n{receipt}\n\nBundan sonra {date} tarihine kadar hacim sınırı olmadan indirebilirsin 💎","vip_cancelled.user":"ℹ️ VIP aboneliğin yönetici tarafından iptal edildi.\nBundan sonra normal günlük kotan ({volume}) geçerli."},"ru":{"__init__.1":"🔒 Этот контент недоступен для аккаунта, под которым вошёл бот (Instagram показывает его только определённой аудитории или с возрастным ограничением).\nЭто не приватный пост и не битая ссылка, но бот не может его скачать.","__init__.2":"🔒 Этот контент в Instagram виден только определённой аудитории (например, с возрастным ограничением), а у бота нет авторизованного аккаунта для повторной попытки.\nЭто не приватный пост и не битая ссылка, но бот не может его скачать.","format_music_entry_label.1":"Без названия","build_music_page.1":"◀️ Предыдущая страница","build_music_page.2":"▶️ Следующая страница","build_music_page.3":"🔍 Искать на YouTube","render.1":"⚙️ Финальная обработка (конвертация/объединение файла)...","render.2":"?","render.3":"  •  осталось {n} с","render.4":"⬇️ Скачивание...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (примерно)","pick_quality_options.2":"🎬 Качество по умолчанию{size_txt}","pick_quality_options.3":"🎵 Только звук (MP3)","start.1":"Привет, друг 🧘🏾🌚\nЯ твой бот-загрузчик 🧸\n\nСо мной ты можешь без ограничений скачивать видео, музыку и посты почти с любой платформы 🧘🏾✨️\n\nА ещё через меня можно найти и скачать нужную музыку, пост или видео 🧘🏾🎧\n\nПросто отправь мне ссылку на нужный пост 🧸","help_button.1":"📖 Полное руководство по боту\n\n🔗 Скачивание по ссылке (Instagram / YouTube / TikTok)\n1. Отправь мне ссылку на пост, рилс или сторис Instagram, видео или шортс YouTube, либо видео TikTok\n2. Я покажу тебе миниатюру и описание\n3. Под ними появится несколько кнопок качества, каждая с точным размером файла (например, «1080p - 24.3MB»); выбери любую\n4. Если тебе нужен только звук видео (а не само видео), нажми «🎵 Только звук»\n5. Во время загрузки ты увидишь живой индикатор прогресса (проценты, скачанный объём из общего, скорость); в конце файл будет отправлен тебе\n\n🎵 Поиск музыки (кнопка «{BTN_MUSIC}»)\n1. Нажми на кнопку и отправь название песни или просто имя исполнителя\n2. Сначала я ищу в YouTube Music (официальный каталог); если отправишь имя исполнителя, все его известные песни придут оттуда (для зарубежных исполнителей обычно полностью); результаты разбиты по 10 на страницу с кнопками «◀️ Предыдущая страница» / «▶️ Следующая страница»\n3. Нажми на любую песню, и для неё появятся те же кнопки качества / только звук\n4. Если ничего не найдено или результатов мало (например, многих персидских песен нет в YouTube Music), под списком есть кнопка «🔍 Искать на YouTube»; нажми, и я выполню тот же поиск на обычном YouTube\n\n📃 Плейлисты YouTube\nОтправь ссылку на плейлист (содержащую /playlist?list=...); информация о плейлисте и его видео разбиваются по 5 на страницу. Нажми на видео, и появятся его информация и картинка, а ты сможешь выбрать качество и скачать. Листай страницы кнопками «▶️ Следующая страница» и «◀️ Предыдущая страница», а в конце нажми «✅ Я закончил», чтобы убрать кнопки (информация о плейлисте останется)\n\n🎞 Отправка самого видеофайла (не ссылки)\nЕсли ты отправишь сам клип/видео (например, файл рилса), я спрошу «Что делать?» с двумя кнопками: «🎵 Извлечь звук» (превращу звук видео в mp3 и отправлю) или «🎧 Найти оригинальную песню» (распознаю песню из видео и отправлю её официальную версию аудиофайлом)\n• Если напишешь подпись к видео, распознавание будет точнее\n• Приём файлов больше 20 МБ возможен только с локальным сервером Telegram (TELEGRAM_API_ID/HASH)\n\n🎧 Поиск оригинальной песни из видео\nПод кнопками качества каждого видео есть ещё кнопка «🎵 Найти оригинальную песню видео». После нажатия:\n1. Сначала я проверяю, указала ли сама платформа (чаще всего TikTok) название песни в метаданных\n2. Если нет, я беру фрагмент звука из видео и распознаю его сервисом распознавания музыки\n3. Найдя официальную версию, я сам отправлю тебе и видео, и его аудиоверсию с правильным чистым названием песни (выбирать вручную не нужно)\n4. Если не найдено, я хотя бы назову имя исполнителя (если он распознан), чтобы ты поискал сам\n\n👤 Аккаунт, квота и VIP\n• Кнопка «👤 Мой аккаунт»: данные аккаунта, число загрузок, объём, использованный сегодня, и статус подписки\n• Каждый пользователь может скачивать до {volume} в день; квота сбрасывается каждую ночь в полночь (по времени Ирана)\n• Написав «id», ты получишь уникальный 8-значный идентификатор; передай его администратору, чтобы он активировал VIP-подписку (безлимитные загрузки на несколько дней)\n\n⚠️ Важные замечания\n• Для защиты от спама можно отправлять только один новый запрос раз в {REQUEST_COOLDOWN_SECONDS} секунд; если отправишь слишком быстро, я скажу, сколько секунд подождать\n• Приватные посты и видео с ограничениями нельзя скачать без настройки cookie\n• Пожалуйста, используйте меня только для своего контента или контента, который вам разрешено использовать; ответственность за соблюдение авторских прав лежит на пользователе","about_button.1":"ℹ️ О боте:\n\nЭтот бот скачивает из Instagram, YouTube и TikTok с помощью yt-dlp.\nПожалуйста, используйте его только для своего контента или контента, который вам разрешено использовать; соблюдение авторских прав и правил платформ лежит на вас.","music_button.1":"🎵 Отправь название песни и исполнителя (например: «Shadmehr Aghili - Bahar»).\nЯ найду официальную версию и пришлю её тебе.","handle_music_query.1":"Отправь название песни или имя исполнителя, и я поищу.","handle_music_query.2":"🔎 Ищу «{query_text}» в YouTube Music...","handle_music_query.3":"❌ Поиск завершился ошибкой:\n","handle_music_query.4":"В YouTube Music по запросу «{query_text}» ничего не найдено. Можно поискать и на обычном YouTube кнопкой ниже:","handle_music_query.5":"🎵 Результаты YouTube Music по запросу «{query_text}» ({count} шт.) — страница 1 из {total_pages}:\nВыбери один или, если этого мало, нажми ниже «Искать на YouTube»:","handle_music_page.1":"⌛ Этот поиск устарел, снова воспользуйся кнопкой поиска музыки.","handle_music_page.2":"YouTube Music","handle_music_page.3":"YouTube","handle_music_page.4":"🎵 Результаты {source_label} по запросу «{query}» ({count} шт.) — страница {page} из {total_pages}:\nВыбери один:","handle_music_youtube_fallback.1":"🔎 Ищу «{query_text}» на YouTube...","handle_music_youtube_fallback.2":"На обычном YouTube по запросу «{query_text}» тоже ничего не найдено.","handle_music_youtube_fallback.3":"🎵 Результаты YouTube по запросу «{query_text}» ({count} шт.) — страница 1 из {total_pages}:\nВыбери один:","handle_music_pick.1":"⏳ Получаю информацию...","show_quality_picker.1":"❌ Не удалось получить информацию по этой ссылке. Возможно, пост приватный или ссылка неверная.\nПодробности ошибки: ","show_quality_picker.2":"\nВыбери нужное качество:","show_quality_picker.3":"Выбери нужное качество:","show_quality_picker.4":"…\n\nВыбери нужное качество:","show_quality_picker.5":"🎵 Найти оригинальную песню видео","playlist_info_text.1":"🎞 Видео: {count}","playlist_info_text.2":" (пропущено приватных/удалённых: {skipped})","playlist_page_text.1":"{playlist_info_text}\n\nСтраница {page} из {playlist_total_pages} — выбери одно:","build_playlist_markup.1":"✅ Я закончил","show_playlist.1":"❌ Не удалось прочитать плейлист. Возможно, он приватный или ссылка неверная.\nПодробности ошибки: ","show_playlist.2":"В этом плейлисте нет доступных видео (он пуст или все видео приватные/удалены).","show_playlist.3":"Плейлист","handle_playlist_page.1":"⌛ Этот плейлист устарел, отправь ссылку на него снова.","handle_playlist_pick.1":"⏳ Получаю информацию о видео...","handle_playlist_done.1":"{base}\n\n✅ Готово.","handle_message.1":"⏳ Читаю плейлист...","handle_message.2":"Это недействительная ссылка. Отправь ссылку на пост/рилс/сторис Instagram, видео/шортс YouTube или видео TikTok, либо используй кнопку «{BTN_MUSIC}» для поиска песни.","handle_message.3":"⏳ Получаю информацию по ссылке...","warn_slow_down.1":"⏳ Для защиты от спама можно отправлять только один новый запрос раз в {REQUEST_COOLDOWN_SECONDS} секунд.\nПожалуйста, отправь снова через {remaining} с.","quota_problem.1":"📦 Сегодняшней квоты не хватает для этого файла.\nРазмер файла: {volume}\nОсталось сегодня: {volume2} из {volume3}\n\nКвота сбрасывается каждую ночь в полночь (по времени Ирана). Можно выбрать качество пониже или скачивать без ограничений с VIP-подпиской (напиши «id», получи свой 8-значный идентификатор и передай его администратору).","account_button.1":"👤 <b>Мой аккаунт</b>","account_button.2":"🏷 Имя: {text}","account_button.3":"🔖 Имя пользователя: {text}","account_button.4":"🔢 Telegram ID: <code>{user_id}</code>","account_button.5":"🆔 Уникальный ID: <code>{public_id}</code>","account_button.6":"📅 Дата регистрации: {date}","account_button.7":"⬇️ Количество загрузок: {downloads_total}","account_button.8":"👑 Статус: администратор (без ограничений)","account_button.9":"💎 Подписка: VIP активна до {date} (осталось дней: {days_left})","account_button.10":"💎 Подписка: нет","account_button.11":"📦 Использовано сегодня: {volume} (безлимит ♾)","account_button.12":"📦 Использовано сегодня: {volume} из {volume2} (осталось {volume3})","id_command.1":"🆔 Твой уникальный ID: <code>{public_id}</code>\n🔢 Telegram ID: <code>{user_id}</code>\n\nУникальный ID — это идентификатор твоего аккаунта; передай этот 8-значный номер администратору для активации VIP-подписки.","build_receipt.1":"🧾 <b>Квитанция об активации VIP-подписки</b>","build_receipt.2":"Номер квитанции: <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 Пользователь: {text} {text2}","build_receipt.4":"🆔 ID: <code>{public_id}</code>","build_receipt.5":"⏳ Срок: {days} дн.","build_receipt.6":" (продление)","build_receipt.7":"🎁 Тип: автоматическая ежемесячная подписка (после {AUTO_VIP_AFTER_DAYS} дн. членства)","build_receipt.8":"👑 Тип: активирована администратором","build_receipt.9":"📅 Начало: {date}","build_receipt.10":"📅 Окончание: {date}","build_receipt.11":"💵 Стоимость подписки: <b>{usd}</b> ({usd2} в день)","build_receipt.12":"✅ Подписка активирована.","run_auto_vip_check.1":"🎁 Твоя ежемесячная подписка активирована!\nПоскольку ты с нами больше {AUTO_VIP_AFTER_DAYS} дн., каждые {AUTO_VIP_DAYS} дн. тебе автоматически активируется VIP-подписка на {AUTO_VIP_DAYS} дн.\n\n","run_auto_vip_check.2":"\n\nДо {date} ты можешь скачивать без ограничения объёма 💎","job_allowed.1":"📦 Сегодняшняя квота исчерпана. Она сбрасывается в полночь; или скачивай без ограничений с VIP (напиши «id» и передай администратору).","job_allowed.2":"⏳ Для защиты от спама подожди ещё {remaining} с и попробуй снова.","link_markup.1":"🔗 Ссылка","cleanup_after_send.1":"✅ Отправлено!","handle_quality_choice.1":"❌ Внутренняя ошибка, отправь ссылку снова.","handle_quality_choice.2":"⌛ Этот запрос устарел, отправь ссылку снова.","handle_quality_choice.3":"⏳ Готовлю загрузку...","handle_quality_choice.4":"❌ Размер файла {size_mb:.1f}MB превышает лимит {MAX_TELEGRAM_UPLOAD_MB}MB для официальных ботов Telegram. Для файлов большего размера нужно использовать локальный сервер Bot API (см. README).","handle_quality_choice.5":"📤 Отправляю файл ({size_mb:.0f}MB)...\nБольшие файлы могут отправляться несколько минут, наберись терпения.","handle_quality_choice.6":"❌ Не удалось скачать или отправить файл:\n","deliver_song.1":"⚠️ Размер видео {video_size_mb:.1f}MB превышает лимит Telegram в {MAX_TELEGRAM_UPLOAD_MB}MB.","deliver_song.2":"📤 Отправляю видео ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ Скачиваю аудиоверсию «{label}»...","deliver_song.4":"⚠️ Размер аудиофайла {audio_size_mb:.1f}MB превышает лимит Telegram в {MAX_TELEGRAM_UPLOAD_MB}MB.","deliver_song.5":"❌ Не удалось отправить песню:\n","recognize_from_audio_file.1":"🎧 Распознаю песню (первый фрагмент)...","recognize_from_audio_file.2":"🎧 Распознаю песню (второй фрагмент)...","find_and_deliver_song.1":"🎵 Оригинальная песня: {label}{variant_txt}\n🔎 Ищу официальную версию...","find_and_deliver_song.2":"\nИсполнитель: {artist}","find_and_deliver_song.3":"❌ Не нашёл официальную версию «{title}».{artist_txt}\nМожешь попробовать кнопку «🎵 Поиск музыки» с более точным названием.","handle_find_song.1":"🤖 Анализирую подпись к видео с помощью ИИ...","handle_find_song.2":" или получи бесплатный GEMINI_API_KEY на aistudio.google.com, чтобы я мог угадывать по подписи к видео","handle_find_song.3":"ℹ️ Не удалось определить песню по метаданным или подписи видео. Чтобы распознавать по самому звуку, нужно настроить AUDD_API_KEY (или ACRCloud){hint}.","handle_find_song.4":"⬇️ Скачиваю звук видео для распознавания...","handle_find_song.5":"❌ Не удалось распознать песню:\n","handle_find_song.6":"❌ Не удалось распознать песню из этого видео. Возможно, фоновый звук был нечётким или песни нет в базе сервиса распознавания.","handle_uploaded_media.1":"🎵 Извлечь звук","handle_uploaded_media.2":"🎧 Найти оригинальную песню","handle_uploaded_media.3":"🎞 Я получил твой файл. Что сделать?","download_uploaded_file.1":"❌ Размер файла {size_mb:.1f}MB, а через официальный сервер Telegram бот может принимать файлы только до {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB. Для файлов большего размера нужно задать TELEGRAM_API_ID и TELEGRAM_API_HASH (локальный сервер).","download_uploaded_file.2":"⬇️ Получаю файл из Telegram...","download_uploaded_file.3":"❌ Этот файл слишком большой для получения ботом (лимит 20 МБ без локального сервера).","handle_upload_extract_audio.1":"⌛ Этот запрос устарел, отправь файл снова.","handle_upload_extract_audio.2":"🎶 Извлекаю звук...","handle_upload_extract_audio.3":"❌ Размер аудиофайла {size_mb:.1f}MB превышает лимит {MAX_TELEGRAM_UPLOAD_MB}MB.","handle_upload_extract_audio.4":"❌ Не удалось извлечь звук:\n","handle_upload_find_song.1":"🤖 Анализирую подпись с помощью ИИ...","handle_upload_find_song.2":"ℹ️ Чтобы распознавать песню по звуку файла, нужно настроить AUDD_API_KEY (или ACRCloud).","handle_upload_find_song.3":"❌ Не удалось распознать песню из этого файла. Возможно, фоновый звук был нечётким или песни нет в базе сервиса распознавания.","btn.help":"📖 Помощь","btn.about":"ℹ️ О боте","btn.music":"🎵 Поиск музыки","btn.account":"👤 Мой аккаунт","vip_granted.user":"🎉 Твоя VIP-подписка активирована!\n\n{receipt}\n\nТеперь до {date} ты можешь скачивать без ограничения объёма 💎","vip_cancelled.user":"ℹ️ Твоя VIP-подписка была отменена администратором.\nТеперь действует обычная дневная квота ({volume})."},"es":{"__init__.1":"🔒 Este contenido no es visible para la cuenta con la que el bot ha iniciado sesión (Instagram solo lo muestra a ciertas audiencias o con restricción de edad).\nNo es una publicación privada ni un enlace roto, pero el bot no puede descargarlo.","__init__.2":"🔒 Este contenido solo es visible en Instagram para ciertas audiencias (por ejemplo, con restricción de edad) y el bot no tiene una cuenta con sesión iniciada para volver a intentarlo.\nNo es una publicación privada ni un enlace roto, pero el bot no puede descargarlo.","format_music_entry_label.1":"Sin título","build_music_page.1":"◀️ Página anterior","build_music_page.2":"▶️ Página siguiente","build_music_page.3":"🔍 Buscar en YouTube","render.1":"⚙️ Procesamiento final (convirtiendo/uniendo el archivo)...","render.2":"?","render.3":"  •  quedan {n}s","render.4":"⬇️ Descargando...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (aprox.)","pick_quality_options.2":"🎬 Calidad predeterminada{size_txt}","pick_quality_options.3":"🎵 Solo audio (MP3)","start.1":"Hola, amigo 🧘🏾🌚\nSoy tu bot descargador 🧸\n\nConmigo puedes descargar vídeos, música y publicaciones de casi cualquier plataforma, sin límites 🧘🏾✨️\n\nTambién puedes encontrar y descargar la música, publicaciones y vídeos que quieras a través de mí 🧘🏾🎧\n\nSolo envíame el enlace de la publicación que quieras 🧸","help_button.1":"📖 Guía completa del bot\n\n🔗 Descargar desde un enlace (Instagram / YouTube / TikTok)\n1. Envíame el enlace de una publicación, reel o historia de Instagram, un vídeo o short de YouTube, o un vídeo de TikTok\n2. Te muestro la miniatura y la descripción\n3. Debajo verás varios botones de calidad, cada uno con el tamaño exacto del archivo (p. ej. «1080p - 24.3MB»); elige el que quieras\n4. Si solo quieres el audio del vídeo (no el vídeo), pulsa «🎵 Solo audio»\n5. Mientras descarga verás una barra de progreso en vivo (porcentaje, tamaño descargado del total, velocidad); al final se te envía el archivo\n\n🎵 Búsqueda de música (botón «{BTN_MUSIC}»)\n1. Pulsa el botón y envía el nombre de una canción o solo el nombre de un artista\n2. Primero busco en YouTube Music (el catálogo oficial); si envías el nombre de un artista, todas sus canciones conocidas vienen de ahí (para artistas internacionales suele estar completo); los resultados se paginan de 10 en 10 con los botones «◀️ Página anterior» / «▶️ Página siguiente»\n3. Si pulsas en cualquier canción, le salen los mismos botones de calidad / solo audio\n4. Si no se encuentra nada o hay pocos resultados (por ejemplo, muchas canciones persas no están en YouTube Music), debajo de la lista hay un botón «🔍 Buscar en YouTube»; púlsalo y haré la misma búsqueda en YouTube normal\n\n📃 Listas de reproducción de YouTube\nEnvía el enlace de una lista de reproducción (el que contiene /playlist?list=...); la información de la lista y sus vídeos se paginan de 5 en 5. Si pulsas un vídeo, aparecen su información y su imagen, y puedes elegir la calidad y descargarlo. Usa «▶️ Página siguiente» y «◀️ Página anterior» para moverte entre páginas y al final pulsa «✅ Terminé» para cerrar los botones (la información de la lista se mantiene)\n\n🎞 Enviar el archivo de vídeo (no un enlace)\nSi me envías el propio clip/vídeo (por ejemplo, el archivo de un reel), te pregunto «¿Qué hago?» con dos botones: «🎵 Extraer audio» (convierto el sonido del vídeo a mp3 y te lo envío) o «🎧 Encontrar la canción original» (reconozco la canción del vídeo y te envío su versión oficial como audio)\n• Si escribes un pie de foto para el vídeo, el reconocimiento será más preciso\n• Recibir archivos de más de 20 MB solo es posible con un servidor local de Telegram (TELEGRAM_API_ID/HASH)\n\n🎧 Encontrar la canción original de un vídeo\nDebajo de los botones de calidad de cada vídeo hay también un botón «🎵 Encontrar la canción original del vídeo». Al pulsarlo:\n1. Primero compruebo si la propia plataforma (sobre todo TikTok) da el nombre de la canción en sus metadatos\n2. Si no, tomo un fragmento del audio del vídeo y lo identifico con un servicio de reconocimiento de música\n3. Una vez encontrada la versión oficial, te envío yo mismo tanto el vídeo como su versión de audio con el nombre correcto y limpio de la canción (no hace falta elegir a mano)\n4. Si no se encuentra, al menos te diré el nombre del artista (si se identificó) para que busques tú\n\n👤 Cuenta, cuota y VIP\n• El botón «👤 Mi cuenta»: los datos de tu cuenta, el número de descargas, el volumen usado hoy y el estado de la suscripción\n• Cada usuario puede descargar hasta {volume} al día, y se reinicia cada noche a medianoche (hora de Irán)\n• Escribiendo «id» obtienes un ID único de 8 dígitos; entrégaselo al administrador para activar una suscripción VIP (descargas ilimitadas durante algunos días)\n\n⚠️ Notas importantes\n• Para evitar el spam, solo puedes enviar una solicitud nueva cada {REQUEST_COOLDOWN_SECONDS} segundos; si envías demasiado rápido, te digo cuántos segundos esperar\n• Las publicaciones privadas o los vídeos restringidos no se pueden descargar sin configurar cookies\n• Usa el bot solo para tu propio contenido o contenido que tengas permiso de usar; el cumplimiento de los derechos de autor es responsabilidad del usuario","about_button.1":"ℹ️ Acerca del bot:\n\nEste bot descarga de Instagram, YouTube y TikTok con ayuda de yt-dlp.\nÚsalo solo para tu propio contenido o contenido que tengas permiso de usar; cumplir los derechos de autor y las normas de las plataformas es responsabilidad tuya.","music_button.1":"🎵 Envía el nombre de la canción y del artista (por ejemplo: «Shadmehr Aghili - Bahar»).\nEncontraré la versión oficial y te la enviaré.","handle_music_query.1":"Envía el nombre de una canción o de un artista y lo busco.","handle_music_query.2":"🔎 Buscando «{query_text}» en YouTube Music...","handle_music_query.3":"❌ La búsqueda falló:\n","handle_music_query.4":"No se encontró nada en YouTube Music para «{query_text}». También puedes buscar en YouTube normal con el botón de abajo:","handle_music_query.5":"🎵 Resultados de YouTube Music para «{query_text}» ({count} elementos) — página 1 de {total_pages}:\nElige uno o, si no es suficiente, pulsa abajo «Buscar en YouTube»:","handle_music_page.1":"⌛ Esta búsqueda ha caducado, usa de nuevo el botón de búsqueda de música.","handle_music_page.2":"YouTube Music","handle_music_page.3":"YouTube","handle_music_page.4":"🎵 Resultados de {source_label} para «{query}» ({count} elementos) — página {page} de {total_pages}:\nElige uno:","handle_music_youtube_fallback.1":"🔎 Buscando «{query_text}» en YouTube...","handle_music_youtube_fallback.2":"Tampoco se encontró nada en YouTube normal para «{query_text}».","handle_music_youtube_fallback.3":"🎵 Resultados de YouTube para «{query_text}» ({count} elementos) — página 1 de {total_pages}:\nElige uno:","handle_music_pick.1":"⏳ Obteniendo la información...","show_quality_picker.1":"❌ No pude obtener la información de este enlace. La publicación puede ser privada o el enlace puede ser incorrecto.\nDetalles del error: ","show_quality_picker.2":"\nElige la calidad que quieras:","show_quality_picker.3":"Elige la calidad que quieras:","show_quality_picker.4":"…\n\nElige la calidad que quieras:","show_quality_picker.5":"🎵 Encontrar la canción original del vídeo","playlist_info_text.1":"🎞 {count} vídeos","playlist_info_text.2":" (se omitieron {skipped} elementos privados/eliminados)","playlist_page_text.1":"{playlist_info_text}\n\nPágina {page} de {playlist_total_pages} — elige uno:","build_playlist_markup.1":"✅ Terminé","show_playlist.1":"❌ No pude leer la lista de reproducción. Puede ser privada o el enlace puede ser incorrecto.\nDetalles del error: ","show_playlist.2":"Esta lista de reproducción no tiene vídeos accesibles (está vacía o todos sus vídeos son privados/eliminados).","show_playlist.3":"Lista de reproducción","handle_playlist_page.1":"⌛ Esta lista de reproducción ha caducado, envía su enlace de nuevo.","handle_playlist_pick.1":"⏳ Obteniendo la información del vídeo...","handle_playlist_done.1":"{base}\n\n✅ Terminé.","handle_message.1":"⏳ Leyendo la lista de reproducción...","handle_message.2":"Ese no es un enlace válido. Envía el enlace de una publicación/reel/historia de Instagram, un vídeo/short de YouTube o un vídeo de TikTok, o usa el botón «{BTN_MUSIC}» para buscar una canción.","handle_message.3":"⏳ Obteniendo la información del enlace...","warn_slow_down.1":"⏳ Para evitar el spam, solo puedes enviar una solicitud nueva cada {REQUEST_COOLDOWN_SECONDS} segundos.\nPor favor, envíala de nuevo en {remaining} segundos.","quota_problem.1":"📦 La cuota de hoy no alcanza para este archivo.\nTamaño del archivo: {volume}\nRestante hoy: {volume2} de {volume3}\n\nLa cuota se reinicia cada noche a medianoche (hora de Irán). Puedes elegir una calidad menor o descargar sin límites con una suscripción VIP (escribe «id» para obtener tu ID de 8 dígitos y entrégaselo al administrador).","account_button.1":"👤 <b>Mi cuenta</b>","account_button.2":"🏷 Nombre: {text}","account_button.3":"🔖 Nombre de usuario: {text}","account_button.4":"🔢 ID de Telegram: <code>{user_id}</code>","account_button.5":"🆔 ID único: <code>{public_id}</code>","account_button.6":"📅 Miembro desde: {date}","account_button.7":"⬇️ Descargas: {downloads_total}","account_button.8":"👑 Estado: administrador (sin límites)","account_button.9":"💎 Suscripción: VIP activa hasta el {date} (quedan {days_left} días)","account_button.10":"💎 Suscripción: ninguna","account_button.11":"📦 Usado hoy: {volume} (ilimitado ♾)","account_button.12":"📦 Usado hoy: {volume} de {volume2} (quedan {volume3})","id_command.1":"🆔 Tu ID único: <code>{public_id}</code>\n🔢 ID de Telegram: <code>{user_id}</code>\n\nEl ID único es la identidad de tu cuenta; entrega este número de 8 dígitos al administrador para activar una suscripción VIP.","build_receipt.1":"🧾 <b>Recibo de activación de la suscripción VIP</b>","build_receipt.2":"N.º de recibo: <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 Usuario: {text} {text2}","build_receipt.4":"🆔 ID: <code>{public_id}</code>","build_receipt.5":"⏳ Duración: {days} días","build_receipt.6":" (renovación)","build_receipt.7":"🎁 Tipo: suscripción mensual automática (tras {AUTO_VIP_AFTER_DAYS} días de membresía)","build_receipt.8":"👑 Tipo: activada por el administrador","build_receipt.9":"📅 Inicio: {date}","build_receipt.10":"📅 Fin: {date}","build_receipt.11":"💵 Valor de la suscripción: <b>{usd}</b> ({usd2} por día)","build_receipt.12":"✅ Suscripción activada.","run_auto_vip_check.1":"🎁 ¡Tu suscripción mensual está activa!\nComo llevas más de {AUTO_VIP_AFTER_DAYS} días con nosotros, cada {AUTO_VIP_DAYS} días se te activa automáticamente una suscripción VIP de {AUTO_VIP_DAYS} días.\n\n","run_auto_vip_check.2":"\n\nHasta el {date} puedes descargar sin límite de volumen 💎","job_allowed.1":"📦 La cuota de hoy se ha agotado. Se reinicia a medianoche; o descarga sin límites con VIP (escribe «id» y entrégaselo al administrador).","job_allowed.2":"⏳ Para evitar el spam, espera {remaining} segundos más e inténtalo de nuevo.","link_markup.1":"🔗 Enlace","cleanup_after_send.1":"✅ ¡Enviado!","handle_quality_choice.1":"❌ Error interno, envía el enlace de nuevo.","handle_quality_choice.2":"⌛ Esta solicitud ha caducado, envía el enlace de nuevo.","handle_quality_choice.3":"⏳ Preparando la descarga...","handle_quality_choice.4":"❌ El archivo pesa {size_mb:.1f}MB y supera el límite de {MAX_TELEGRAM_UPLOAD_MB}MB de los bots oficiales de Telegram. Para archivos más grandes necesitas usar un servidor Local Bot API (consulta el README).","handle_quality_choice.5":"📤 Enviando el archivo ({size_mb:.0f}MB)...\nLos archivos grandes pueden tardar unos minutos, ten paciencia.","handle_quality_choice.6":"❌ La descarga o el envío falló:\n","deliver_song.1":"⚠️ El vídeo pesa {video_size_mb:.1f}MB y supera el límite de {MAX_TELEGRAM_UPLOAD_MB}MB de Telegram.","deliver_song.2":"📤 Enviando el vídeo ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ Descargando la versión de audio de «{label}»...","deliver_song.4":"⚠️ El archivo de audio pesa {audio_size_mb:.1f}MB y supera el límite de {MAX_TELEGRAM_UPLOAD_MB}MB de Telegram.","deliver_song.5":"❌ No se pudo enviar la canción:\n","recognize_from_audio_file.1":"🎧 Reconociendo la canción (primer fragmento)...","recognize_from_audio_file.2":"🎧 Reconociendo la canción (segundo fragmento)...","find_and_deliver_song.1":"🎵 Canción original: {label}{variant_txt}\n🔎 Buscando la versión oficial...","find_and_deliver_song.2":"\nArtista: {artist}","find_and_deliver_song.3":"❌ No encontré la versión oficial de «{title}».{artist_txt}\nPuedes probar el botón «🎵 Buscar música» con un nombre más exacto.","handle_find_song.1":"🤖 Revisando el pie del vídeo con IA...","handle_find_song.2":" o consigue una GEMINI_API_KEY gratuita en aistudio.google.com para que pueda deducirlo a partir del pie del vídeo","handle_find_song.3":"ℹ️ No pude reconocer la canción a partir de los metadatos ni del pie del vídeo. Para reconocerla desde el propio audio hay que configurar una AUDD_API_KEY (o ACRCloud){hint}.","handle_find_song.4":"⬇️ Descargando el audio del vídeo para reconocerlo...","handle_find_song.5":"❌ El reconocimiento de la canción falló:\n","handle_find_song.6":"❌ No pude reconocer la canción de este vídeo. Quizá el sonido de fondo no era claro o la canción no está en la base de datos del servicio de reconocimiento.","handle_uploaded_media.1":"🎵 Extraer audio","handle_uploaded_media.2":"🎧 Encontrar la canción original","handle_uploaded_media.3":"🎞 He recibido tu archivo. ¿Qué hago?","download_uploaded_file.1":"❌ El archivo pesa {size_mb:.1f}MB y, con el servidor oficial de Telegram, el bot solo puede recibir archivos de hasta {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB. Para archivos más grandes hay que configurar TELEGRAM_API_ID y TELEGRAM_API_HASH (servidor local).","download_uploaded_file.2":"⬇️ Recibiendo el archivo desde Telegram...","download_uploaded_file.3":"❌ Este archivo es demasiado grande para que el bot lo reciba (el límite es de 20 MB sin servidor local).","handle_upload_extract_audio.1":"⌛ Esta solicitud ha caducado, envía el archivo de nuevo.","handle_upload_extract_audio.2":"🎶 Extrayendo el audio...","handle_upload_extract_audio.3":"❌ El archivo de audio pesa {size_mb:.1f}MB y supera el límite de {MAX_TELEGRAM_UPLOAD_MB}MB.","handle_upload_extract_audio.4":"❌ La extracción del audio falló:\n","handle_upload_find_song.1":"🤖 Revisando el pie con IA...","handle_upload_find_song.2":"ℹ️ Para reconocer una canción a partir del audio del archivo hay que configurar una AUDD_API_KEY (o ACRCloud).","handle_upload_find_song.3":"❌ No pude reconocer la canción de este archivo. Quizá el sonido de fondo no era claro o la canción no está en la base de datos del servicio de reconocimiento.","btn.help":"📖 Ayuda","btn.about":"ℹ️ Acerca del bot","btn.music":"🎵 Buscar música","btn.account":"👤 Mi cuenta","vip_granted.user":"🎉 ¡Tu suscripción VIP está activa!\n\n{receipt}\n\nA partir de ahora, hasta el {date}, puedes descargar sin límite de volumen 💎","vip_cancelled.user":"ℹ️ Tu suscripción VIP fue cancelada por el administrador.\nA partir de ahora se aplica la cuota diaria normal ({volume})."},"fr":{"__init__.1":"🔒 Ce contenu n'est pas visible pour le compte avec lequel le bot est connecté (Instagram ne l'affiche qu'à certains publics ou avec une restriction d'âge).\nCe n'est ni une publication privée ni un lien cassé, mais le bot ne peut pas le télécharger.","__init__.2":"🔒 Ce contenu n'est visible sur Instagram que par certains publics (par exemple avec une restriction d'âge), et le bot n'a pas de compte connecté pour réessayer.\nCe n'est ni une publication privée ni un lien cassé, mais le bot ne peut pas le télécharger.","format_music_entry_label.1":"Sans titre","build_music_page.1":"◀️ Page précédente","build_music_page.2":"▶️ Page suivante","build_music_page.3":"🔍 Rechercher sur YouTube","render.1":"⚙️ Traitement final (conversion/fusion du fichier)...","render.2":"?","render.3":"  •  {n}s restantes","render.4":"⬇️ Téléchargement...\n[{bar}] {percent:.0f}%\n{line2}","pick_quality_options.1":" (approx.)","pick_quality_options.2":"🎬 Qualité par défaut{size_txt}","pick_quality_options.3":"🎵 Audio uniquement (MP3)","start.1":"Salut l'ami 🧘🏾🌚\nJe suis ton bot de téléchargement 🧸\n\nAvec moi, tu peux télécharger sans limites des vidéos, de la musique et des publications de presque toutes les plateformes 🧘🏾✨️\n\nTu peux aussi trouver et télécharger grâce à moi la musique, les publications et les vidéos que tu veux 🧘🏾🎧\n\nEnvoie-moi simplement le lien de la publication souhaitée 🧸","help_button.1":"📖 Guide complet du bot\n\n🔗 Télécharger depuis un lien (Instagram / YouTube / TikTok)\n1. Envoie-moi le lien d'une publication, d'un reel ou d'une story Instagram, d'une vidéo ou d'un short YouTube, ou d'une vidéo TikTok\n2. Je te montre la miniature et la description\n3. En dessous, tu vois plusieurs boutons de qualité, chacun avec la taille exacte du fichier (par ex. « 1080p - 24.3MB ») ; choisis celui que tu veux\n4. Si tu ne veux que le son de la vidéo (pas la vidéo elle-même), appuie sur « 🎵 Audio uniquement »\n5. Pendant le téléchargement, tu vois une barre de progression en direct (pourcentage, taille téléchargée sur le total, vitesse) ; à la fin, le fichier t'est envoyé\n\n🎵 Recherche de musique (bouton « {BTN_MUSIC} »)\n1. Appuie sur le bouton et envoie un titre de chanson ou simplement un nom d'artiste\n2. Je cherche d'abord dans YouTube Music (le catalogue officiel) ; si tu envoies un nom d'artiste, toutes ses chansons connues viennent de là (généralement complet pour les artistes internationaux) ; les résultats sont paginés par 10 avec les boutons « ◀️ Page précédente » / « ▶️ Page suivante »\n3. Si tu touches une chanson, tu obtiens pour elle les mêmes boutons de qualité / audio uniquement\n4. Si rien n'est trouvé ou s'il y a peu de résultats (par exemple beaucoup de chansons persanes ne sont pas sur YouTube Music), il y a sous la liste un bouton « 🔍 Rechercher sur YouTube » ; appuie dessus et je ferai la même recherche sur YouTube classique\n\n📃 Playlists YouTube\nEnvoie le lien d'une playlist (celui qui contient /playlist?list=...) ; les infos de la playlist et ses vidéos sont paginées par 5. Touche une vidéo pour voir ses infos et son image, puis choisis la qualité et télécharge-la. Utilise « ▶️ Page suivante » et « ◀️ Page précédente » pour naviguer entre les pages et, à la fin, appuie sur « ✅ J'ai terminé » pour fermer les boutons (les infos de la playlist restent)\n\n🎞 Envoyer le fichier vidéo lui-même (pas un lien)\nSi tu m'envoies le clip/la vidéo elle-même (par exemple le fichier d'un reel), je te demande « Que dois-je faire ? » avec deux boutons : « 🎵 Extraire l'audio » (je convertis le son de la vidéo en mp3 et je te l'envoie) ou « 🎧 Trouver la chanson originale » (je reconnais la chanson de la vidéo et je t'envoie sa version officielle en audio)\n• Si tu écris une légende pour la vidéo, la reconnaissance sera plus précise\n• Recevoir des fichiers de plus de 20 Mo n'est possible qu'avec un serveur local Telegram (TELEGRAM_API_ID/HASH)\n\n🎧 Trouver la chanson originale d'une vidéo\nSous les boutons de qualité de chaque vidéo, il y a aussi un bouton « 🎵 Trouver la chanson originale de la vidéo ». Quand tu appuies dessus :\n1. Je vérifie d'abord si la plateforme elle-même (surtout TikTok) donne le nom de la chanson dans ses métadonnées\n2. Sinon, je prends un extrait du son de la vidéo et je l'identifie avec un service de reconnaissance musicale\n3. Une fois la version officielle trouvée, je t'envoie moi-même la vidéo et sa version audio avec le nom correct et propre de la chanson (pas besoin de choisir à la main)\n4. Si elle n'est pas trouvée, je te donne au moins le nom de l'artiste (s'il est identifié) pour que tu cherches toi-même\n\n👤 Compte, quota et VIP\n• Le bouton « 👤 Mon compte » : les infos de ton compte, le nombre de téléchargements, le volume utilisé aujourd'hui et l'état de l'abonnement\n• Chaque utilisateur peut télécharger jusqu'à {volume} par jour, remis à zéro chaque nuit à minuit (heure d'Iran)\n• En écrivant « id », tu obtiens un identifiant unique à 8 chiffres ; donne-le à l'administrateur pour activer un abonnement VIP (téléchargements illimités pendant quelques jours)\n\n⚠️ Remarques importantes\n• Pour éviter le spam, tu ne peux envoyer qu'une nouvelle demande toutes les {REQUEST_COOLDOWN_SECONDS} secondes ; si tu envoies trop vite, je te dis combien de secondes attendre\n• Les publications privées ou les vidéos restreintes ne sont pas téléchargeables sans configuration des cookies\n• Merci de m'utiliser uniquement pour votre propre contenu ou un contenu que vous avez le droit d'utiliser ; le respect du droit d'auteur incombe à l'utilisateur","about_button.1":"ℹ️ À propos du bot :\n\nCe bot télécharge depuis Instagram, YouTube et TikTok grâce à yt-dlp.\nMerci de l'utiliser uniquement pour votre propre contenu ou un contenu que vous avez le droit d'utiliser ; le respect du droit d'auteur et des règles des plateformes vous incombe.","music_button.1":"🎵 Envoie le titre de la chanson et l'artiste (par exemple : « Shadmehr Aghili - Bahar »).\nJe trouve la version officielle et je te l'envoie.","handle_music_query.1":"Envoie un titre de chanson ou un nom d'artiste et je lance la recherche.","handle_music_query.2":"🔎 Recherche de « {query_text} » dans YouTube Music...","handle_music_query.3":"❌ La recherche a échoué :\n","handle_music_query.4":"Rien trouvé sur YouTube Music pour « {query_text} ». Tu peux aussi chercher sur YouTube classique avec le bouton ci-dessous :","handle_music_query.5":"🎵 Résultats YouTube Music pour « {query_text} » ({count} éléments) — page 1 sur {total_pages} :\nChoisis-en un ou, si ça ne suffit pas, appuie ci-dessous sur « Rechercher sur YouTube » :","handle_music_page.1":"⌛ Cette recherche a expiré, utilise à nouveau le bouton de recherche de musique.","handle_music_page.2":"YouTube Music","handle_music_page.3":"YouTube","handle_music_page.4":"🎵 Résultats {source_label} pour « {query} » ({count} éléments) — page {page} sur {total_pages} :\nChoisis-en un :","handle_music_youtube_fallback.1":"🔎 Recherche de « {query_text} » sur YouTube...","handle_music_youtube_fallback.2":"Rien trouvé non plus sur YouTube classique pour « {query_text} ».","handle_music_youtube_fallback.3":"🎵 Résultats YouTube pour « {query_text} » ({count} éléments) — page 1 sur {total_pages} :\nChoisis-en un :","handle_music_pick.1":"⏳ Récupération des informations...","show_quality_picker.1":"❌ Je n'ai pas pu récupérer les informations de ce lien. La publication est peut-être privée ou le lien est peut-être incorrect.\nDétails de l'erreur : ","show_quality_picker.2":"\nChoisis la qualité souhaitée :","show_quality_picker.3":"Choisis la qualité souhaitée :","show_quality_picker.4":"…\n\nChoisis la qualité souhaitée :","show_quality_picker.5":"🎵 Trouver la chanson originale de la vidéo","playlist_info_text.1":"🎞 {count} vidéos","playlist_info_text.2":" ({skipped} éléments privés/supprimés ignorés)","playlist_page_text.1":"{playlist_info_text}\n\nPage {page} sur {playlist_total_pages} — choisis-en un :","build_playlist_markup.1":"✅ J'ai terminé","show_playlist.1":"❌ Je n'ai pas pu lire la playlist. Elle est peut-être privée ou le lien est peut-être incorrect.\nDétails de l'erreur : ","show_playlist.2":"Cette playlist ne contient aucune vidéo accessible (elle est vide ou toutes ses vidéos sont privées/supprimées).","show_playlist.3":"Playlist","handle_playlist_page.1":"⌛ Cette playlist a expiré, renvoie son lien.","handle_playlist_pick.1":"⏳ Récupération des informations de la vidéo...","handle_playlist_done.1":"{base}\n\n✅ Terminé.","handle_message.1":"⏳ Lecture de la playlist...","handle_message.2":"Ce n'est pas un lien valide. Envoie un lien de publication/reel/story Instagram, de vidéo/short YouTube ou de vidéo TikTok, ou utilise le bouton « {BTN_MUSIC} » pour chercher une chanson.","handle_message.3":"⏳ Récupération des informations du lien...","warn_slow_down.1":"⏳ Pour éviter le spam, tu ne peux envoyer qu'une nouvelle demande toutes les {REQUEST_COOLDOWN_SECONDS} secondes.\nMerci de la renvoyer dans {remaining} secondes.","quota_problem.1":"📦 Ton quota du jour ne suffit pas pour ce fichier.\nTaille du fichier : {volume}\nRestant aujourd'hui : {volume2} sur {volume3}\n\nLe quota est remis à zéro chaque nuit à minuit (heure d'Iran). Tu peux choisir une qualité inférieure ou télécharger sans limites avec un abonnement VIP (écris « id » pour obtenir ton identifiant à 8 chiffres et donne-le à l'administrateur).","account_button.1":"👤 <b>Mon compte</b>","account_button.2":"🏷 Nom : {text}","account_button.3":"🔖 Nom d'utilisateur : {text}","account_button.4":"🔢 ID Telegram : <code>{user_id}</code>","account_button.5":"🆔 ID unique : <code>{public_id}</code>","account_button.6":"📅 Membre depuis : {date}","account_button.7":"⬇️ Téléchargements : {downloads_total}","account_button.8":"👑 Statut : administrateur (sans limites)","account_button.9":"💎 Abonnement : VIP actif jusqu'au {date} ({days_left} jours restants)","account_button.10":"💎 Abonnement : aucun","account_button.11":"📦 Utilisé aujourd'hui : {volume} (illimité ♾)","account_button.12":"📦 Utilisé aujourd'hui : {volume} sur {volume2} ({volume3} restants)","id_command.1":"🆔 Ton ID unique : <code>{public_id}</code>\n🔢 ID Telegram : <code>{user_id}</code>\n\nL'ID unique est l'identité de ton compte ; donne ce nombre à 8 chiffres à l'administrateur pour activer un abonnement VIP.","build_receipt.1":"🧾 <b>Reçu d'activation de l'abonnement VIP</b>","build_receipt.2":"N° de reçu : <code>#{receipt_id:05d}</code>","build_receipt.3":"👤 Utilisateur : {text} {text2}","build_receipt.4":"🆔 ID : <code>{public_id}</code>","build_receipt.5":"⏳ Durée : {days} jours","build_receipt.6":" (renouvellement)","build_receipt.7":"🎁 Type : abonnement mensuel automatique (après {AUTO_VIP_AFTER_DAYS} jours d'adhésion)","build_receipt.8":"👑 Type : activé par l'administrateur","build_receipt.9":"📅 Début : {date}","build_receipt.10":"📅 Fin : {date}","build_receipt.11":"💵 Valeur de l'abonnement : <b>{usd}</b> ({usd2} par jour)","build_receipt.12":"✅ Abonnement activé.","run_auto_vip_check.1":"🎁 Ton abonnement mensuel est activé !\nComme tu es avec nous depuis plus de {AUTO_VIP_AFTER_DAYS} jours, un abonnement VIP de {AUTO_VIP_DAYS} jours t'est activé automatiquement tous les {AUTO_VIP_DAYS} jours.\n\n","run_auto_vip_check.2":"\n\nJusqu'au {date}, tu peux télécharger sans limite de volume 💎","job_allowed.1":"📦 Ton quota du jour est épuisé. Il est remis à zéro à minuit ; ou télécharge sans limites avec le VIP (écris « id » et donne-le à l'administrateur).","job_allowed.2":"⏳ Pour éviter le spam, attends encore {remaining} secondes et réessaie.","link_markup.1":"🔗 Lien","cleanup_after_send.1":"✅ Envoyé !","handle_quality_choice.1":"❌ Erreur interne, renvoie le lien.","handle_quality_choice.2":"⌛ Cette demande a expiré, renvoie le lien.","handle_quality_choice.3":"⏳ Préparation du téléchargement...","handle_quality_choice.4":"❌ Le fichier fait {size_mb:.1f}MB et dépasse la limite de {MAX_TELEGRAM_UPLOAD_MB}MB des bots Telegram officiels. Pour des fichiers plus gros, il faut utiliser un serveur Local Bot API (voir le README).","handle_quality_choice.5":"📤 Envoi du fichier ({size_mb:.0f}MB)...\nLes gros fichiers peuvent prendre quelques minutes, sois patient.","handle_quality_choice.6":"❌ Le téléchargement ou l'envoi a échoué :\n","deliver_song.1":"⚠️ La vidéo fait {video_size_mb:.1f}MB et dépasse la limite de {MAX_TELEGRAM_UPLOAD_MB}MB de Telegram.","deliver_song.2":"📤 Envoi de la vidéo ({video_size_mb:.0f}MB)...","deliver_song.3":"⬇️ Téléchargement de la version audio de « {label} »...","deliver_song.4":"⚠️ Le fichier audio fait {audio_size_mb:.1f}MB et dépasse la limite de {MAX_TELEGRAM_UPLOAD_MB}MB de Telegram.","deliver_song.5":"❌ L'envoi de la chanson a échoué :\n","recognize_from_audio_file.1":"🎧 Reconnaissance de la chanson (premier extrait)...","recognize_from_audio_file.2":"🎧 Reconnaissance de la chanson (deuxième extrait)...","find_and_deliver_song.1":"🎵 Chanson originale : {label}{variant_txt}\n🔎 Recherche de la version officielle...","find_and_deliver_song.2":"\nArtiste : {artist}","find_and_deliver_song.3":"❌ Je n'ai pas trouvé la version officielle de « {title} ».{artist_txt}\nTu peux essayer le bouton « 🎵 Recherche musicale » avec un nom plus précis.","handle_find_song.1":"🤖 Analyse de la légende de la vidéo par l'IA...","handle_find_song.2":" ou obtiens une GEMINI_API_KEY gratuite sur aistudio.google.com pour que je puisse deviner à partir de la légende de la vidéo","handle_find_song.3":"ℹ️ Je n'ai pas pu identifier la chanson à partir des métadonnées ou de la légende de la vidéo. Pour l'identifier à partir du son lui-même, il faut configurer une AUDD_API_KEY (ou ACRCloud){hint}.","handle_find_song.4":"⬇️ Téléchargement du son de la vidéo pour la reconnaissance...","handle_find_song.5":"❌ La reconnaissance de la chanson a échoué :\n","handle_find_song.6":"❌ Je n'ai pas pu identifier la chanson de cette vidéo. Le son de fond n'était peut-être pas clair, ou la chanson n'est pas dans la base du service de reconnaissance.","handle_uploaded_media.1":"🎵 Extraire l'audio","handle_uploaded_media.2":"🎧 Trouver la chanson originale","handle_uploaded_media.3":"🎞 J'ai reçu ton fichier. Que dois-je faire ?","download_uploaded_file.1":"❌ Le fichier fait {size_mb:.1f}MB et, avec le serveur officiel de Telegram, le bot ne peut recevoir que des fichiers jusqu'à {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB. Pour des fichiers plus gros, il faut définir TELEGRAM_API_ID et TELEGRAM_API_HASH (serveur local).","download_uploaded_file.2":"⬇️ Réception du fichier depuis Telegram...","download_uploaded_file.3":"❌ Ce fichier est trop gros pour être reçu par le bot (limite de 20 Mo sans serveur local).","handle_upload_extract_audio.1":"⌛ Cette demande a expiré, renvoie le fichier.","handle_upload_extract_audio.2":"🎶 Extraction de l'audio...","handle_upload_extract_audio.3":"❌ Le fichier audio fait {size_mb:.1f}MB et dépasse la limite de {MAX_TELEGRAM_UPLOAD_MB}MB.","handle_upload_extract_audio.4":"❌ L'extraction de l'audio a échoué :\n","handle_upload_find_song.1":"🤖 Analyse de la légende par l'IA...","handle_upload_find_song.2":"ℹ️ Pour identifier une chanson à partir du son du fichier, il faut configurer une AUDD_API_KEY (ou ACRCloud).","handle_upload_find_song.3":"❌ Je n'ai pas pu identifier la chanson de ce fichier. Le son de fond n'était peut-être pas clair, ou la chanson n'est pas dans la base du service de reconnaissance.","btn.help":"📖 Aide","btn.about":"ℹ️ À propos","btn.music":"🎵 Recherche musicale","btn.account":"👤 Mon compte","vip_granted.user":"🎉 Ton abonnement VIP est activé !\n\n{receipt}\n\nÀ partir de maintenant, jusqu'au {date}, tu peux télécharger sans limite de volume 💎","vip_cancelled.user":"ℹ️ Ton abonnement VIP a été annulé par l'administrateur.\nÀ partir de maintenant, le quota quotidien normal ({volume}) s'applique."}}''')
+
+
+def _load_locales() -> dict:
+    data = {code: dict(_EMBEDDED_LOCALES.get(code, {})) for code in LANG_CODES}
+    for code in LANG_CODES:
+        path = LOCALES_DIR / f"{code}.json"
+        try:
+            with open(path, encoding="utf-8") as f:
+                data[code].update(json.load(f))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("could not read locale file %s", path.name)
+    return data
+
+
+LOCALES = _load_locales()
+_current_lang = contextvars.ContextVar("current_lang", default=DEFAULT_LANG)
+_LANG_CHOSEN = {}  # user_id -> کد زبانِ انتخاب‌شده (None = هنوز انتخاب نکرده)
+
+
+def tr(lang: str, key: str, **kw) -> str:
+    """ترجمه‌ی کلید به زبان lang؛ اگه نبود به انگلیسی و بعد فارسی برمی‌گرده."""
+    text = None
+    for code in (lang, "en", DEFAULT_LANG):
+        text = LOCALES.get(code, {}).get(key)
+        if text:
+            break
+    if text is None:
+        return key
+    try:
+        return text.format(**kw) if kw else text
+    except (KeyError, IndexError, ValueError):
+        fallback = LOCALES.get(DEFAULT_LANG, {}).get(key, key)
+        try:
+            return fallback.format(**kw)
+        except Exception:
+            return fallback
+
+
+def T(key: str, **kw) -> str:
+    return tr(_current_lang.get(), key, **kw)
+
+
+def btn(name: str) -> str:
+    return T(f"btn.{name}")
+
+
+def all_btn_labels(name: str) -> list:
+    """برچسب یه دکمه‌ی کیبورد به همه‌ی زبان‌ها (برای تشخیص فشردن دکمه فارغ از زبان)."""
+    return sorted({tr(code, f"btn.{name}") for code in LANG_CODES})
+
+
+@contextmanager
+def lang_scope(lang):
+    token = _current_lang.set(lang if lang in LANG_CODES else DEFAULT_LANG)
+    try:
+        yield
+    finally:
+        _current_lang.reset(token)
+
+
+def btn_regex(name: str):
+    return re.compile("^(?:" + "|".join(re.escape(x) for x in all_btn_labels(name)) + ")$")
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[btn("music"), btn("account")], [btn("help"), btn("about")]],
+        resize_keyboard=True,   # دکمه‌ها رو کوچیک و جمع‌وجور نشون می‌ده
+        is_persistent=True,     # همیشه روی صفحه بمونه
+    )
+
+
+def lang_picker_markup(page: int) -> InlineKeyboardMarkup:
+    """پنل شیشه‌ای انتخاب زبان: صفحه‌ی اول ۱۰ زبان، با دکمه‌ی «بعدی» ۵ زبان بعدی."""
+    pages = (len(LANGS) + LANG_PAGE_SIZE - 1) // LANG_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    rows, row = [], []
+    for code, name, flag in LANGS[page * LANG_PAGE_SIZE:(page + 1) * LANG_PAGE_SIZE]:
+        row.append(InlineKeyboardButton(f"{flag} {name}", callback_data=f"lang|set|{code}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if page < pages - 1:
+        rows.append([InlineKeyboardButton("Next ▶️ | بعدی", callback_data=f"lang|p|{page + 1}")])
+    if page > 0:
+        rows.append([InlineKeyboardButton("◀️ Back | قبلی", callback_data=f"lang|p|{page - 1}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # نگهداری موقت اطلاعات هر لینک تا زمانی که کاربر کیفیت رو انتخاب کنه
@@ -284,15 +385,11 @@ class InstagramAudienceRestricted(Exception):
         self.had_session = had_session
         if had_session:
             msg = (
-                "🔒 این محتوا برای حسابی که ربات با آن وارد شده قابل‌مشاهده نیست "
-                "(اینستاگرام آن را فقط برای مخاطبان خاص یا با محدودیت سنی نشان می‌دهد).\n"
-                "پست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد."
+                T("__init__.1")
             )
         else:
             msg = (
-                "🔒 این محتوا فقط برای مخاطبان خاصی (مثلاً با محدودیت سنی) در "
-                "اینستاگرام قابل‌مشاهده است و ربات حساب واردشده‌ای برای امتحان "
-                "دوباره ندارد.\nپست خصوصی یا لینک خراب نیست، اما ربات امکان دانلودش را ندارد."
+                T("__init__.2")
             )
         super().__init__(msg)
 
@@ -451,7 +548,7 @@ def search_music_list(query: str, limit: int = 50, source: str = "ytmusic"):
 
 
 def format_music_entry_label(entry: dict, number: int) -> str:
-    title = entry.get("title") or "بدون‌نام"
+    title = entry.get("title") or T("format_music_entry_label.1")
     artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
     duration = entry.get("duration")
     dur_txt = ""
@@ -481,16 +578,16 @@ def build_music_page(key: str, entries: list, page: int, source: str = "ytmusic"
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"mpage|{key}|{page - 1}"))
+        nav_row.append(InlineKeyboardButton(T("build_music_page.1"), callback_data=f"mpage|{key}|{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("▶️ صفحه بعد", callback_data=f"mpage|{key}|{page + 1}"))
+        nav_row.append(InlineKeyboardButton(T("build_music_page.2"), callback_data=f"mpage|{key}|{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
 
     # فقط وقتی هنوز رو یوتیوب‌میوزیک هستیم این گزینه رو نشون بده؛ وقتی
     # کاربر خودش زده رو یوتیوب عادی، دیگه نیازی به این دکمه نیست
     if source != "youtube":
-        buttons.append([InlineKeyboardButton("🔍 جستجو در یوتیوب", callback_data=f"myoutube|{key}")])
+        buttons.append([InlineKeyboardButton(T("build_music_page.3"), callback_data=f"myoutube|{key}")])
 
     return InlineKeyboardMarkup(buttons), total_pages
 
@@ -757,16 +854,16 @@ class ProgressState:
 
     def render(self) -> str:
         if self.status == "processing":
-            return "⚙️ در حال پردازش نهایی (تبدیل/ترکیب فایل)..."
+            return T("render.1")
         bar = make_progress_bar(self.percent)
         downloaded_txt = format_size(self.downloaded) or "0KB"
-        total_txt = format_size(self.total) if self.total else "؟"
+        total_txt = format_size(self.total) if self.total else T("render.2")
         line2 = f"{downloaded_txt} / {total_txt}"
         if self.speed:
             line2 += f"  •  {format_size(self.speed)}/s"
         if self.eta:
-            line2 += f"  •  {int(self.eta)}s مونده"
-        return f"⬇️ در حال دانلود...\n[{bar}] {self.percent:.0f}%\n{line2}"
+            line2 += T("render.3", n=int(self.eta))
+        return T("render.4", bar=bar, percent=self.percent, line2=line2)
 
 
 def make_progress_hook(state: ProgressState):
@@ -863,7 +960,7 @@ def pick_quality_options(info: dict):
         exact = f.get("filesize") is not None
         total = video_size + audio_size if video_size else 0
         if total:
-            size_txt = f" - {format_size(total)}" + ("" if exact else " (تقریبی)")
+            size_txt = f" - {format_size(total)}" + ("" if exact else T("pick_quality_options.1"))
         else:
             size_txt = ""
         options.append(
@@ -880,10 +977,10 @@ def pick_quality_options(info: dict):
         best = max(formats, key=lambda f: f.get("height") or 0)
         size = best.get("filesize") or best.get("filesize_approx")
         size_txt = f" - {format_size(size)}" if size else ""
-        options.append({"label": f"🎬 کیفیت پیش‌فرض{size_txt}", "format_id": "best", "kind": "video", "size": size or None})
+        options.append({"label": T("pick_quality_options.2", size_txt=size_txt), "format_id": "best", "kind": "video", "size": size or None})
 
     # گزینه‌ی فقط صدا همیشه اضافه میشه
-    audio_label = "🎵 فقط صدا (MP3)"
+    audio_label = T("pick_quality_options.3")
     if audio_size:
         audio_label += f" - {format_size(audio_size)}"
     options.append({"label": audio_label, "format_id": "bestaudio", "kind": "audio", "size": audio_size or None})
@@ -974,121 +1071,82 @@ def download_media(url: str, format_id: str, kind: str, out_dir: str, progress_s
 # هندلرهای تلگرام
 # ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "درود به روی ماهت 🧘🏾🌚\n"
-        "من ربات دانلودرم 🧸\n\n"
-        "با من می‌تونی ویدئو ها، موزیک ها و پست های هر پلتفرمی رو که"
-        " بخوای بدون محدودیت دانلود کنی 🧘🏾✨️\n\n"
-        "و همچنین میتونی موزیک پست و ویدئو دلخواهت رو با استفاده از من"
-        " پیدا و دانلود کنی 🧘🏾🎧\n\n"
-        "کافیه فقط لینک پستی دلخواهت رو برام بفرستی 🧸",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    user = update.effective_user
+    if _LANG_CHOSEN.get(user.id) is None:
+        # اولین بار (یا هنوز زبان انتخاب نکرده): اول زبان رو بپرس
+        await update.message.reply_text(LANG_PROMPT, reply_markup=lang_picker_markup(0))
+        return
+    await update.message.reply_text(T("start.1"), reply_markup=main_keyboard())
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(LANG_PROMPT, reply_markup=lang_picker_markup(0))
+
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.error import BadRequest
+
+    query = update.callback_query
+    parts = (query.data or "").split("|")
+    if len(parts) == 3 and parts[1] == "p":
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=lang_picker_markup(int(parts[2])))
+        except (ValueError, BadRequest):
+            pass
+        return
+    if len(parts) == 3 and parts[1] == "set" and parts[2] in LANG_CODES:
+        code = parts[2]
+        uid = query.from_user.id
+        await asyncio.to_thread(get_db().set_lang, uid, code)
+        _LANG_CHOSEN[uid] = code
+        _current_lang.set(code)
+        await query.answer()
+        name, flag = next((n, f) for c, n, f in LANGS if c == code)
+        try:
+            await query.edit_message_text(f"✅ {flag} {name}")
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=query.message.chat_id, text=T("start.1"), reply_markup=main_keyboard())
+        return
+    await query.answer()
 
 
 async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 راهنمای کامل ربات\n\n"
-        "🔗 دانلود از لینک (اینستاگرام / یوتیوب / تیک‌تاک)\n"
-        "۱. لینک پست، ریلز، استوری اینستاگرام، ویدیو یا شورتز یوتیوب،"
-        " یا ویدیوی تیک‌تاک رو برام بفرست\n"
-        "۲. تامبنیل و توضیحات محتوا رو نشونت می‌دم\n"
-        "۳. زیرش چند دکمه‌ی کیفیت می‌بینی، هرکدوم با حجم دقیق فایل"
-        " (مثلاً «1080p - 24.3MB»)؛ هرکدوم رو بخوای انتخاب کن\n"
-        "۴. اگه فقط صدای ویدیو رو می‌خوای (نه خود ویدیو)، دکمه‌ی"
-        " «🎵 فقط صدا» رو بزن\n"
-        "۵. حین دانلود یه نوار پیشرفت زنده می‌بینی (درصد، حجم دانلودشده"
-        " از کل، سرعت)؛ در آخر فایل برات ارسال می‌شه\n\n"
-        f"🎵 جستجوی موزیک (دکمه‌ی «{BTN_MUSIC}»)\n"
-        "۱. روی دکمه بزن و اسم آهنگ یا فقط اسم خواننده رو بفرست\n"
-        "۲. اول تو یوتیوب‌میوزیک (کاتالوگ رسمی) می‌گردم؛ اگه اسم خواننده"
-        " بفرستی، همه‌ی آهنگ‌های شناخته‌شده‌اش از همونجا میاد (برای"
-        " خواننده‌های خارجی معمولاً کامله)؛ نتیجه‌ها ۱۰تا-۱۰تا"
-        " صفحه‌بندی شدن با دکمه‌های «◀️ صفحه قبل» / «▶️ صفحه بعد»\n"
-        "۳. روی اسم هر آهنگ که بزنی، همون دکمه‌های کیفیت/فقط‌صدای بالا"
-        " براش میاد تا انتخاب کنی\n"
-        "۴. اگه چیزی پیدا نشد یا کم بود (مثلاً خیلی از آهنگ‌های فارسی"
-        " تو یوتیوب‌میوزیک نیستن)، پایین لیست دکمه‌ی «🔍 جستجو در"
-        " یوتیوب» هست؛ بزن تا همون جستجو رو تو یوتیوب عادی هم انجام"
-        " بدم\n\n"
-        "📃 پلی‌لیست یوتیوب\n"
-        "لینک یه پلی‌لیست (همونی که /playlist?list=... داره) رو بفرست؛ اطلاعات"
-        " پلی‌لیست و ویدیوهاش ۵تا-۵تا صفحه‌بندی می‌شن. روی هر ویدیو بزنی،"
-        " اطلاعات و تصویرش میاد و می‌تونی کیفیت رو انتخاب و دانلودش کنی."
-        " با «▶️ صفحه بعد» و «◀️ صفحه قبل» بین صفحه‌ها برو و آخرش"
-        " «✅ کارم تموم شد» رو بزن تا دکمه‌ها بسته بشن (اطلاعات پلی‌لیست"
-        " می‌مونه)\n\n"
-        "🎞 ارسال خود فایل ویدیو (نه لینک)\n"
-        "اگه خود کلیپ/ویدیو رو برام بفرستی (مثلاً فایل یه ریلز)، می‌پرسم"
-        " «چیکار کنم؟» با دو دکمه: «🎵 استخراج صدا» (صدای ویدیو رو"
-        " mp3 می‌کنم و می‌فرستم) یا «🎧 پیدا کردن آهنگ اصلی» (آهنگ"
-        " ویدیو رو تشخیص می‌دم و نسخه‌ی رسمیش رو با ویس می‌فرستم)\n"
-        "• اگه برای ویدیو کپشن بنویسی، تشخیص دقیق‌تر می‌شه\n"
-        "• دریافت فایل بزرگ‌تر از ۲۰ مگابایت فقط با سرور محلی تلگرام"
-        " (TELEGRAM_API_ID/HASH) ممکنه\n\n"
-        "🎧 پیدا کردن آهنگ اصلی یه ویدیو\n"
-        "زیر دکمه‌های کیفیت هر ویدیو، یه دکمه‌ی «🎵 پیدا کردن آهنگ اصلی"
-        " ویدیو» هم هست. با زدنش:\n"
-        "۱. اول چک می‌کنم خود پلتفرم (بیشتر تیک‌تاک) اسم آهنگ رو تو"
-        " متادیتاش داده یا نه\n"
-        "۲. اگه نداشت، یه تیکه از صدای خود ویدیو رو می‌گیرم و با سرویس"
-        " تشخیص آهنگ شناساییش می‌کنم\n"
-        "۳. بعد از پیدا کردن نسخه‌ی رسمی، خودم هم ویدیو هم نسخه‌ی صوتیش"
-        " رو با اسم درست و تمیز آهنگ برات می‌فرستم (نیازی به انتخاب"
-        " دستی نیست)\n"
-        "۴. اگه پیدا نشد، لااقل اسم خواننده رو (اگه شناسایی شده باشه)"
-        " بهت می‌گم تا خودت دستی جستجو کنی\n\n"
-        "👤 حساب، سهمیه و VIP\n"
-        "• دکمه‌ی «👤 حساب من»: اطلاعات حسابت، تعداد دانلودها، حجم مصرف‌شده‌ی"
-        " امروز و وضعیت اشتراک\n"
-        f"• هر کاربر روزانه تا {format_volume(DAILY_QUOTA_MB * MB)} حجم دانلود داره که"
-        " هر شب نیمه‌شب (به وقت ایران) ریست می‌شه\n"
-        "• با نوشتن «آیدی» یه آیدی ۸ رقمی اختصاصی می‌گیری؛ اون رو به مدیر بده"
-        " تا اشتراک VIP (دانلود نامحدود برای چند روز) برات فعال کنه\n\n"
-        "⚠️ نکات مهم\n"
-        f"• برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست جدید"
-        " می‌تونی بدی؛ اگه زود بفرستی، می‌گم چند ثانیه صبر کنی\n"
-        "• پست‌های خصوصی یا ویدیوهای محدود بدون تنظیم کوکی قابل دانلود"
-        " نیستن\n"
-        "• فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده دارید"
-        " ازم استفاده کنید؛ مسئولیت رعایت کپی‌رایت با کاربره",
-        reply_markup=MAIN_KEYBOARD,
+        T("help_button.1", BTN_MUSIC=btn("music"), volume=format_volume(DAILY_QUOTA_MB * MB), REQUEST_COOLDOWN_SECONDS=REQUEST_COOLDOWN_SECONDS),
+        reply_markup=main_keyboard(),
     )
 
 
 async def about_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ درباره ربات:\n\n"
-        "این ربات با کمک yt-dlp از اینستاگرام، یوتیوب و تیک‌تاک دانلود می‌کنه.\n"
-        "لطفاً فقط برای محتوای خودتون یا محتوایی که اجازه‌ی استفاده"
-        " دارید ازش استفاده کنید؛ رعایت کپی‌رایت و قوانین پلتفرم‌ها به"
-        " عهده‌ی خودتونه.",
-        reply_markup=MAIN_KEYBOARD,
+        T("about_button.1"),
+        reply_markup=main_keyboard(),
     )
 
 
 async def music_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAITING_MUSIC_QUERY.add(update.effective_chat.id)
     await update.message.reply_text(
-        "🎵 اسم آهنگ و خواننده رو بفرست (مثلاً: «Shadmehr Aghili - Bahar»).\n"
-        "نسخه‌ی رسمیش رو پیدا می‌کنم و برات می‌فرستم.",
-        reply_markup=MAIN_KEYBOARD,
+        T("music_button.1"),
+        reply_markup=main_keyboard(),
     )
 
 
 async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
     if not query_text:
-        await update.message.reply_text("یه اسم آهنگ یا خواننده بفرست تا جستجو کنم.")
+        await update.message.reply_text(T("handle_music_query.1"))
         return
 
-    status_msg = await update.message.reply_text(f"🔎 دارم تو یوتیوب‌میوزیک دنبال «{query_text}» می‌گردم...")
+    status_msg = await update.message.reply_text(T("handle_music_query.2", query_text=query_text))
     chat_id = update.effective_chat.id
 
     try:
         entries = await asyncio.to_thread(search_music_list, query_text, 50, "ytmusic")
     except Exception as e:
         logger.exception("search_music_list failed")
-        await status_msg.edit_text("❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        await status_msg.edit_text(T("handle_music_query.3") + str(e)[:300])
         return
 
     key = f"{chat_id}_{status_msg.message_id}"
@@ -1097,16 +1155,14 @@ async def handle_music_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not entries:
         markup, _ = build_music_page(key, [], 0, "ytmusic")
         await status_msg.edit_text(
-            f"تو یوتیوب‌میوزیک چیزی برای «{query_text}» پیدا نشد. می‌تونی از دکمه‌ی"
-            " پایین تو یوتیوب عادی هم جستجو کنی:",
+            T("handle_music_query.4", query_text=query_text),
             reply_markup=markup,
         )
         return
 
     markup, total_pages = build_music_page(key, entries, 0, "ytmusic")
     text = (
-        f"🎵 نتایج یوتیوب‌میوزیک برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
-        "یکی رو انتخاب کن، یا اگه کافی نبود پایین «جستجو در یوتیوب» رو بزن:"
+        T("handle_music_query.5", query_text=query_text, count=len(entries), total_pages=total_pages)
     )
     await status_msg.edit_text(text, reply_markup=markup)
 
@@ -1124,16 +1180,15 @@ async def handle_music_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = MUSIC_SESSIONS.get(key)
     if not session:
-        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        await set_status(query, T("handle_music_page.1"))
         return
 
     entries = session["entries"]
     source = session.get("source", "ytmusic")
-    source_label = "یوتیوب‌میوزیک" if source == "ytmusic" else "یوتیوب"
+    source_label = T("handle_music_page.2") if source == "ytmusic" else T("handle_music_page.3")
     markup, total_pages = build_music_page(key, entries, page, source)
     text = (
-        f"🎵 نتایج {source_label} برای «{session['query']}» ({len(entries)} مورد) — صفحه {page + 1} از {total_pages}:\n"
-        "یکی رو انتخاب کن:"
+        T("handle_music_page.4", source_label=source_label, query=session['query'], count=len(entries), page=page + 1, total_pages=total_pages)
     )
     try:
         await query.edit_message_text(text, reply_markup=markup)
@@ -1154,30 +1209,29 @@ async def handle_music_youtube_fallback(update: Update, context: ContextTypes.DE
 
     session = MUSIC_SESSIONS.get(key)
     if not session:
-        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        await set_status(query, T("handle_music_page.1"))
         return
 
     query_text = session["query"]
-    await set_status(query, f"🔎 دارم تو یوتیوب دنبال «{query_text}» می‌گردم...")
+    await set_status(query, T("handle_music_youtube_fallback.1", query_text=query_text))
 
     try:
         entries = await asyncio.to_thread(search_music_list, query_text, 50, "youtube")
     except Exception as e:
         logger.exception("youtube fallback search failed")
-        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, T("handle_music_query.3") + str(e)[:300])
         return
 
     session["entries"] = entries
     session["source"] = "youtube"
 
     if not entries:
-        await set_status(query, f"تو یوتیوب هم چیزی برای «{query_text}» پیدا نشد.")
+        await set_status(query, T("handle_music_youtube_fallback.2", query_text=query_text))
         return
 
     markup, total_pages = build_music_page(key, entries, 0, "youtube")
     text = (
-        f"🎵 نتایج یوتیوب برای «{query_text}» ({len(entries)} مورد) — صفحه ۱ از {total_pages}:\n"
-        "یکی رو انتخاب کن:"
+        T("handle_music_youtube_fallback.3", query_text=query_text, count=len(entries), total_pages=total_pages)
     )
     await set_status(query, text)
     try:
@@ -1200,7 +1254,7 @@ async def handle_music_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = MUSIC_SESSIONS.get(key)
     if not session:
-        await set_status(query, "⌛ این جستجو منقضی شده، دوباره از دکمه‌ی جستجوی موزیک استفاده کن.")
+        await set_status(query, T("handle_music_page.1"))
         return
 
     entries = session["entries"]
@@ -1213,7 +1267,7 @@ async def handle_music_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_url = f"https://www.youtube.com/watch?v={entry['id']}"
 
     chat_id = query.message.chat_id
-    status_msg = await query.message.reply_text("⏳ در حال گرفتن اطلاعات...")
+    status_msg = await query.message.reply_text(T("handle_music_pick.1"))
     await show_quality_picker(query.message, chat_id, video_url, status_msg, offer_find_song=False)
 
 
@@ -1233,8 +1287,7 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
             err_text = str(e)
         else:
             err_text = (
-                "❌ نتونستم اطلاعات این لینک رو بگیرم. ممکنه پست خصوصی باشه یا"
-                " لینک اشتباه باشه.\nجزئیات خطا: " + str(e)[:300]
+                T("show_quality_picker.1") + str(e)[:300]
             )
         if status_msg:
             await status_msg.edit_text(err_text)
@@ -1257,10 +1310,10 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         caption_lines.append(f"👤 {uploader}")
     if description:
         caption_lines.append(description)
-    caption_lines.append("\nکیفیت مورد نظرت رو انتخاب کن:")
-    caption = "\n\n".join(caption_lines) if caption_lines else "کیفیت مورد نظرت رو انتخاب کن:"
+    caption_lines.append(T("show_quality_picker.2"))
+    caption = "\n\n".join(caption_lines) if caption_lines else T("show_quality_picker.3")
     if len(caption) > 1024:  # سقف کپشن عکس در تلگرام
-        caption = caption[:1000] + "…\n\nکیفیت مورد نظرت رو انتخاب کن:"
+        caption = caption[:1000] + T("show_quality_picker.4")
 
     if status_msg:
         await status_msg.delete()
@@ -1294,7 +1347,7 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         buttons.append([InlineKeyboardButton(o["label"], callback_data=cb_data)])
 
     if offer_find_song:
-        buttons.append([InlineKeyboardButton("🎵 پیدا کردن آهنگ اصلی ویدیو", callback_data=f"song|{key}")])
+        buttons.append([InlineKeyboardButton(T("show_quality_picker.5"), callback_data=f"song|{key}")])
 
     await sent_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1345,9 +1398,9 @@ def playlist_info_text(session: dict) -> str:
     lines = [f"📃 {title}"]
     if session["uploader"]:
         lines.append(f"👤 {session['uploader']}")
-    count_line = f"🎞 {len(session['entries'])} ویدیو"
+    count_line = T("playlist_info_text.1", count=len(session['entries']))
     if session["skipped"]:
-        count_line += f" ({session['skipped']} مورد خصوصی/حذف‌شده نادیده گرفته شد)"
+        count_line += T("playlist_info_text.2", skipped=session['skipped'])
     lines.append(count_line)
     desc = (session["description"] or "").strip()
     if desc:
@@ -1361,8 +1414,7 @@ def playlist_total_pages(session: dict) -> int:
 
 def playlist_page_text(session: dict, page: int) -> str:
     return (
-        f"{playlist_info_text(session)}\n\n"
-        f"صفحه {page + 1} از {playlist_total_pages(session)} — یکی رو انتخاب کن:"
+        T("playlist_page_text.1", playlist_info_text=playlist_info_text(session), page=page + 1, playlist_total_pages=playlist_total_pages(session))
     )
 
 
@@ -1386,13 +1438,13 @@ def build_playlist_markup(key: str, session: dict, page: int) -> InlineKeyboardM
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"plpage|{key}|{page - 1}"))
+        nav.append(InlineKeyboardButton(T("build_music_page.1"), callback_data=f"plpage|{key}|{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("▶️ صفحه بعد", callback_data=f"plpage|{key}|{page + 1}"))
+        nav.append(InlineKeyboardButton(T("build_music_page.2"), callback_data=f"plpage|{key}|{page + 1}"))
     if nav:
         buttons.append(nav)
 
-    buttons.append([InlineKeyboardButton("✅ کارم تموم شد", callback_data=f"pldone|{key}")])
+    buttons.append([InlineKeyboardButton(T("build_playlist_markup.1"), callback_data=f"pldone|{key}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1414,20 +1466,19 @@ async def show_playlist(message, chat_id: int, url: str, status_msg):
     except Exception as e:
         logger.exception("extract_playlist failed")
         await status_msg.edit_text(
-            "❌ نتونستم پلی‌لیست رو بخونم. ممکنه خصوصی باشه یا لینک اشتباه باشه.\n"
-            "جزئیات خطا: " + str(e)[:300]
+            T("show_playlist.1") + str(e)[:300]
         )
         return
 
     entries, skipped = parse_playlist_entries(info)
     if not entries:
-        await status_msg.edit_text("این پلی‌لیست ویدیوی قابل‌دسترسی نداره (خالیه یا همه‌ی ویدیوهاش خصوصی/حذف‌شده‌ان).")
+        await status_msg.edit_text(T("show_playlist.2"))
         return
 
     session = {
         "entries": entries,
         "skipped": skipped,
-        "title": info.get("title") or "پلی‌لیست",
+        "title": info.get("title") or T("show_playlist.3"),
         "uploader": info.get("uploader") or info.get("channel") or "",
         "description": info.get("description") or "",
     }
@@ -1462,7 +1513,7 @@ async def handle_playlist_page(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     session = PLAYLISTS.get(key)
     if not session:
-        await set_status(query, "⌛ این پلی‌لیست منقضی شده، لینکش رو دوباره بفرست.")
+        await set_status(query, T("handle_playlist_page.1"))
         return
     page = max(0, min(page, playlist_total_pages(session) - 1))
     await edit_message_with_markup(
@@ -1481,7 +1532,7 @@ async def handle_playlist_pick(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     session = PLAYLISTS.get(key)
     if not session:
-        await set_status(query, "⌛ این پلی‌لیست منقضی شده، لینکش رو دوباره بفرست.")
+        await set_status(query, T("handle_playlist_page.1"))
         return
     if idx < 0 or idx >= len(session["entries"]):
         return
@@ -1489,7 +1540,7 @@ async def handle_playlist_pick(update: Update, context: ContextTypes.DEFAULT_TYP
     entry = session["entries"][idx]
     url = f"https://www.youtube.com/watch?v={entry['id']}"
     chat_id = query.message.chat_id
-    status_msg = await query.message.reply_text("⏳ دارم اطلاعات ویدیو رو می‌گیرم...")
+    status_msg = await query.message.reply_text(T("handle_playlist_pick.1"))
     await show_quality_picker(query.message, chat_id, url, status_msg)
 
 
@@ -1506,7 +1557,7 @@ async def handle_playlist_done(update: Update, context: ContextTypes.DEFAULT_TYP
         base = playlist_info_text(session)
     else:
         base = query.message.caption or query.message.text or ""
-    await edit_message_with_markup(query, f"{base}\n\n✅ کارم تموم شد.", None)
+    await edit_message_with_markup(query, T("handle_playlist_done.1", base=base), None)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1534,22 +1585,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pl_match = PLAYLIST_URL_RE.search(text)
     if pl_match:
         mark_request(_last_message_at, user_id)
-        status_msg = await update.message.reply_text("⏳ دارم پلی‌لیست رو می‌خونم...")
+        status_msg = await update.message.reply_text(T("handle_message.1"))
         await show_playlist(update.message, chat_id, pl_match.group(0), status_msg)
         return
 
     match = SUPPORTED_URL_RE.search(text)
     if not match:
         await update.message.reply_text(
-            "این یه لینک معتبر نیست. لینک پست/ریلز/استوری اینستاگرام،"
-            " ویدیو/شورتز یوتیوب یا ویدیوی تیک‌تاک رو بفرست، یا از دکمه‌ی"
-            f" «{BTN_MUSIC}» برای جستجوی آهنگ استفاده کن."
+            T("handle_message.2", BTN_MUSIC=btn("music"))
         )
         return
 
     mark_request(_last_message_at, user_id)
     url = match.group(0)
-    status_msg = await update.message.reply_text("⏳ دارم اطلاعات لینک رو می‌گیرم...")
+    status_msg = await update.message.reply_text(T("handle_message.3"))
     await show_quality_picker(
         update.message, chat_id, url, status_msg, user_msg_id=update.message.message_id
     )
@@ -1601,8 +1650,7 @@ async def warn_slow_down(message, user_id, remaining: int):
         return
     _last_warn_at[user_id] = now
     await message.reply_text(
-        f"⏳ برای جلوگیری از اسپم، هر {REQUEST_COOLDOWN_SECONDS} ثانیه فقط یه درخواست"
-        f" می‌تونی بدی.\nلطفاً {remaining} ثانیه دیگه دوباره بفرست."
+        T("warn_slow_down.1", REQUEST_COOLDOWN_SECONDS=REQUEST_COOLDOWN_SECONDS, remaining=remaining)
     )
 
 
@@ -1705,7 +1753,8 @@ CREATE TABLE IF NOT EXISTS users (
     downloads_total INTEGER NOT NULL DEFAULT 0,
     vip_until TEXT,
     auto_vip_granted INTEGER NOT NULL DEFAULT 0,
-    auto_vip_blocked INTEGER NOT NULL DEFAULT 0
+    auto_vip_blocked INTEGER NOT NULL DEFAULT 0,
+    lang TEXT
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id INTEGER NOT NULL, day TEXT NOT NULL,
@@ -1731,7 +1780,8 @@ CREATE TABLE IF NOT EXISTS users (
     downloads_total INTEGER NOT NULL DEFAULT 0,
     vip_until TEXT,
     auto_vip_granted INTEGER NOT NULL DEFAULT 0,
-    auto_vip_blocked INTEGER NOT NULL DEFAULT 0
+    auto_vip_blocked INTEGER NOT NULL DEFAULT 0,
+    lang TEXT
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id BIGINT NOT NULL, day TEXT NOT NULL,
@@ -1849,6 +1899,7 @@ class Database:
             if self.is_pg:
                 t.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_vip_granted INTEGER NOT NULL DEFAULT 0")
                 t.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_vip_blocked INTEGER NOT NULL DEFAULT 0")
+                t.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS lang TEXT")
                 t.exec("ALTER TABLE vip_log ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'admin'")
             else:
                 cols = {r["name"] for r in t.exec("PRAGMA table_info(users)").fetchall()}
@@ -1856,6 +1907,8 @@ class Database:
                     t.exec("ALTER TABLE users ADD COLUMN auto_vip_granted INTEGER NOT NULL DEFAULT 0")
                 if "auto_vip_blocked" not in cols:
                     t.exec("ALTER TABLE users ADD COLUMN auto_vip_blocked INTEGER NOT NULL DEFAULT 0")
+                if "lang" not in cols:
+                    t.exec("ALTER TABLE users ADD COLUMN lang TEXT")
                 cols = {r["name"] for r in t.exec("PRAGMA table_info(vip_log)").fetchall()}
                 if "source" not in cols:
                     t.exec("ALTER TABLE vip_log ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'")
@@ -1891,6 +1944,21 @@ class Database:
 
     def get_user(self, user_id: int):
         return self.run(lambda t: t.exec("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone())
+
+    def set_lang(self, user_id: int, lang: str):
+        self.run(lambda t: t.exec("UPDATE users SET lang=? WHERE user_id=?", (lang, user_id)))
+
+    def count_users(self) -> int:
+        row = self.run(lambda t: t.exec("SELECT COUNT(*) AS c FROM users").fetchone())
+        return int(row["c"]) if row else 0
+
+    def list_users(self, offset: int, limit: int):
+        """کاربرها از جدیدترین به قدیمی‌ترین (برای لیست صفحه‌بندی‌شده‌ی پنل مدیر)."""
+        return self.run(
+            lambda t: t.exec(
+                "SELECT * FROM users ORDER BY joined_at DESC, user_id DESC LIMIT ? OFFSET ?", (limit, offset)
+            ).fetchall()
+        )
 
     def get_user_by_public_id(self, public_id: str):
         return self.run(lambda t: t.exec("SELECT * FROM users WHERE public_id=?", (public_id,)).fetchone())
@@ -2064,12 +2132,7 @@ def quota_problem(user_id: int, size_bytes: int):
     if remaining is None or size_bytes <= remaining:
         return None
     return (
-        "📦 سهمیه‌ی امروزت برای این فایل کافی نیست.\n"
-        f"حجم فایل: {format_volume(size_bytes)}\n"
-        f"باقی‌مونده‌ی امروز: {format_volume(remaining)} از {format_volume(DAILY_QUOTA_MB * MB)}\n\n"
-        "سهمیه هر شب نیمه‌شب (به وقت ایران) ریست می‌شه. می‌تونی کیفیت پایین‌تری"
-        " انتخاب کنی، یا با اشتراک VIP بدون محدودیت دانلود کنی (با نوشتن «آیدی»"
-        " آیدی ۸ رقمی‌ت رو بگیر و به مدیر بده)."
+        T("quota_problem.1", volume=format_volume(size_bytes), volume2=format_volume(remaining), volume3=format_volume(DAILY_QUOTA_MB * MB))
     )
 
 
@@ -2105,7 +2168,14 @@ async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.is_bot:
         return
     try:
-        await asyncio.to_thread(get_db().upsert_user, user.id, user.first_name, user.last_name, user.username)
+        row = await asyncio.to_thread(get_db().upsert_user, user.id, user.first_name, user.last_name, user.username)
+        try:
+            lang = row["lang"] if row is not None else None
+        except (KeyError, IndexError):
+            lang = None
+        lang = lang if lang in LANG_CODES else None
+        _LANG_CHOSEN[user.id] = lang
+        _current_lang.set(lang or DEFAULT_LANG)  # بقیه‌ی هندلرهای همین آپدیت به همین زبان جواب می‌دن
     except Exception:
         logger.exception("track_user failed")
 
@@ -2118,33 +2188,32 @@ async def account_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip_end = db_.vip_until(user.id)
 
     lines = [
-        "👤 <b>حساب من</b>",
+        T("account_button.1"),
         "━━━━━━━━━━━━━━",
-        f"🏷 نام: {html.escape(display_name(row))}",
-        f"🔖 آیدی حروفی: {html.escape(username_text(row))}",
-        f"🔢 آیدی تلگرام: <code>{user.id}</code>",
-        f"🆔 آیدی اختصاصی: <code>{row['public_id']}</code>",
-        f"📅 تاریخ عضویت: {fmt_date(from_iso(row['joined_at']))}",
-        f"⬇️ تعداد دانلود: {row['downloads_total']}",
+        T("account_button.2", text=html.escape(display_name(row))),
+        T("account_button.3", text=html.escape(username_text(row))),
+        T("account_button.4", user_id=user.id),
+        T("account_button.5", public_id=row['public_id']),
+        T("account_button.6", date=fmt_date(from_iso(row['joined_at']))),
+        T("account_button.7", downloads_total=row['downloads_total']),
         "━━━━━━━━━━━━━━",
     ]
     if is_admin(user.id):
-        lines.append("👑 وضعیت: مدیر (بدون محدودیت)")
+        lines.append(T("account_button.8"))
     elif vip_end:
         days_left = max(1, math.ceil((vip_end - utcnow()).total_seconds() / 86400))
-        lines.append(f"💎 اشتراک: VIP فعال تا {fmt_date(vip_end)} ({days_left} روز مونده)")
+        lines.append(T("account_button.9", date=fmt_date(vip_end), days_left=days_left))
     else:
-        lines.append("💎 اشتراک: ندارد")
+        lines.append(T("account_button.10"))
 
     if user_is_vip(user.id):
-        lines.append(f"📦 مصرف امروز: {format_volume(used)} (نامحدود ♾)")
+        lines.append(T("account_button.11", volume=format_volume(used)))
     else:
         total = DAILY_QUOTA_MB * MB
         lines.append(
-            f"📦 مصرف امروز: {format_volume(used)} از {format_volume(total)}"
-            f" (باقی‌مونده {format_volume(max(0, total - used))})"
+            T("account_button.12", volume=format_volume(used), volume2=format_volume(total), volume3=format_volume(max(0, total - used)))
         )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2152,12 +2221,9 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     row = await asyncio.to_thread(get_db().upsert_user, user.id, user.first_name, user.last_name, user.username)
     await update.message.reply_text(
-        f"🆔 آیدی اختصاصی شما: <code>{row['public_id']}</code>\n"
-        f"🔢 آیدی تلگرام: <code>{user.id}</code>\n\n"
-        "آیدی اختصاصی هویت حساب شماست؛ برای فعال‌سازی اشتراک VIP همین عدد ۸ رقمی"
-        " رو به مدیر بده.",
+        T("id_command.1", public_id=row['public_id'], user_id=user.id),
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=main_keyboard(),
     )
 
 
@@ -2230,11 +2296,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ADMIN_CANCEL_MARKUP,
         )
     elif action == "info":
-        ADMIN_STATE[admin_id] = {"step": "await_id", "action": "info"}
-        await query.edit_message_text(
-            "👤 مشخصات کاربر\n\nآیدی ۸ رقمی کاربر رو بفرست.",
-            reply_markup=ADMIN_CANCEL_MARKUP,
-        )
+        ADMIN_STATE.pop(admin_id, None)
+        await admin_show_user_list(query, 0)
+    elif action.startswith("ul|"):
+        try:
+            await admin_show_user_list(query, int(action.split("|")[1]))
+        except ValueError:
+            pass
+    elif action.startswith("u|"):
+        try:
+            _, uid_s, page_s = action.split("|")
+            await admin_show_user(query, int(uid_s), int(page_s))
+        except ValueError:
+            pass
     elif action == "cxl_yes":
         await admin_confirm_cancel(query, context, admin_id)
     elif action == "cancel":
@@ -2248,25 +2322,81 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_receipt(row, info: dict) -> str:
     days = info["days"]
     lines = [
-        "🧾 <b>فیش فعال‌سازی اشتراک VIP</b>",
+        T("build_receipt.1"),
         "━━━━━━━━━━━━━━",
-        f"شماره فیش: <code>#{info['receipt_id']:05d}</code>",
-        f"👤 کاربر: {html.escape(display_name(row))} {html.escape(username_text(row))}",
-        f"🆔 آیدی: <code>{row['public_id']}</code>",
-        f"⏳ مدت: {days} روز" + (" (تمدید)" if info["extended"] else ""),
+        T("build_receipt.2", receipt_id=info['receipt_id']),
+        T("build_receipt.3", text=html.escape(display_name(row)), text2=html.escape(username_text(row))),
+        T("build_receipt.4", public_id=row['public_id']),
+        T("build_receipt.5", days=days) + (T("build_receipt.6") if info["extended"] else ""),
         (
-            f"🎁 نوع: اشتراک ماهانه‌ی خودکار (بعد از {AUTO_VIP_AFTER_DAYS} روز عضویت)"
+            T("build_receipt.7", AUTO_VIP_AFTER_DAYS=AUTO_VIP_AFTER_DAYS)
             if info.get("auto")
-            else "👑 نوع: فعال‌سازی توسط مدیر"
+            else T("build_receipt.8")
         ),
-        f"📅 شروع: {fmt_date(info['start'], with_time=True)}",
-        f"📅 پایان: {fmt_date(info['end'], with_time=True)}",
+        T("build_receipt.9", date=fmt_date(info['start'], with_time=True)),
+        T("build_receipt.10", date=fmt_date(info['end'], with_time=True)),
         "━━━━━━━━━━━━━━",
-        f"💵 ارزش اشتراک: <b>{fmt_usd(vip_value_usd(days))}</b>"
-        f" (هر روز {fmt_usd(vip_value_usd(1))})",
-        "✅ اشتراک فعال شد.",
+        T("build_receipt.11", usd=fmt_usd(vip_value_usd(days)), usd2=fmt_usd(vip_value_usd(1))),
+        T("build_receipt.12"),
     ]
     return "\n".join(lines)
+
+
+ADMIN_USERS_PER_PAGE = 5
+
+
+async def admin_show_user_list(query, page: int):
+    """لیست کاربرها، هر صفحه ۵ نفر؛ با دکمه‌ی «بعدی» / «قبلی» بین صفحه‌ها می‌گرده."""
+    from telegram.error import BadRequest
+
+    db_ = get_db()
+    total = await asyncio.to_thread(db_.count_users)
+    pages = max(1, math.ceil(total / ADMIN_USERS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    users = await asyncio.to_thread(db_.list_users, page * ADMIN_USERS_PER_PAGE, ADMIN_USERS_PER_PAGE)
+    now = utcnow()
+    rows = []
+    for u in users:
+        days = max(0, (now - from_iso(u["joined_at"])).days)
+        label = f"👤 {display_name(u)} {username_text(u)} · {days} روز"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"adm|u|{u['user_id']}|{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"adm|ul|{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"adm|ul|{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm|cancel")])
+    text = (
+        f"👥 لیست کاربران (کل: {total})\n"
+        f"صفحه {page + 1} از {pages} — برای دیدن مشخصات، روی کاربر بزن:"
+        if users
+        else "👥 هنوز کاربری ثبت نشده."
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    except BadRequest:
+        pass
+
+
+async def admin_show_user(query, user_id: int, page: int):
+    """مشخصات یه کاربر (از روی لیست)، با دکمه‌ی برگشت به همون صفحه‌ی لیست."""
+    from telegram.error import BadRequest
+
+    row = await asyncio.to_thread(get_db().get_user, user_id)
+    back = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"adm|ul|{page}")],
+        [InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm|cancel")],
+    ])
+    if not row:
+        text, mode = "❌ این کاربر پیدا نشد.", None
+    else:
+        text, mode = await asyncio.to_thread(build_user_info, row), ParseMode.HTML
+    try:
+        await query.edit_message_text(text, parse_mode=mode, reply_markup=back)
+    except BadRequest:
+        pass
 
 
 def build_user_info(row) -> str:
@@ -2284,6 +2414,7 @@ def build_user_info(row) -> str:
         f"🏷 نام: {html.escape(display_name(row))} {html.escape(username_text(row))}",
         f"🆔 آیدی اختصاصی: <code>{row['public_id']}</code>",
         f"📅 مدت عضویت: {member_days} روز",
+        "🌐 زبان: " + next((n for c, n, _ in LANGS if c == row["lang"]), "انتخاب نشده"),
         "━━━━━━━━━━━━━━",
         f"⬇️ دانلود امروز: {format_volume(used)}",
     ]
@@ -2319,13 +2450,9 @@ async def admin_confirm_cancel(query, context: ContextTypes.DEFAULT_TYPE, admin_
 
     delivered = True
     try:
-        await context.bot.send_message(
-            chat_id=target,
-            text=(
-                "ℹ️ اشتراک VIP شما توسط مدیر لغو شد.\n"
-                f"از این به بعد سهمیه‌ی روزانه‌ی عادی ({format_volume(DAILY_QUOTA_MB * MB)}) برای شما اعمال می‌شه."
-            ),
-        )
+        with lang_scope(row["lang"] if row else None):
+            notice = T("vip_cancelled.user", volume=format_volume(DAILY_QUOTA_MB * MB))
+        await context.bot.send_message(chat_id=target, text=notice)
     except Exception:
         delivered = False
         logger.info("could not notify the user about VIP cancellation")
@@ -2344,19 +2471,15 @@ async def admin_grant_vip(message, context: ContextTypes.DEFAULT_TYPE, admin_id:
     db_ = get_db()
     info = await asyncio.to_thread(db_.grant_vip, target_user_id, days, admin_id)
     row = db_.get_user(target_user_id)
-    receipt = build_receipt(row, info)
+    with lang_scope("fa"):  # فیش مدیر همیشه فارسیه
+        receipt = build_receipt(row, info)
     ADMIN_STATE.pop(admin_id, None)
 
     delivered = True
     try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=(
-                "🎉 اشتراک VIP شما فعال شد!\n\n" + receipt +
-                f"\n\nاز این به بعد تا {fmt_date(info['end'])} می‌تونی بدون محدودیت حجم دانلود کنی 💎"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        with lang_scope(row["lang"] if row else None):  # فیش کاربر به زبان خودش
+            user_text = T("vip_granted.user", receipt=build_receipt(row, info), date=fmt_date(info["end"]))
+        await context.bot.send_message(chat_id=target_user_id, text=user_text, parse_mode=ParseMode.HTML)
     except Exception:
         delivered = False
         logger.exception("could not notify the VIP user")
@@ -2398,17 +2521,13 @@ async def run_auto_vip_check(bot_) -> int:
             granted += 1
             try:
                 fresh = db_.get_user(uid)
-                await bot_.send_message(
-                    chat_id=uid,
-                    text=(
-                        "🎁 اشتراک ماهانه‌ات فعال شد!\n"
-                        f"چون بیشتر از {AUTO_VIP_AFTER_DAYS} روزه که با ما هستی، هر {AUTO_VIP_DAYS} روز یه اشتراک"
-                        f" {AUTO_VIP_DAYS} روزه‌ی VIP خودکار برات فعال می‌شه.\n\n"
+                with lang_scope(fresh["lang"] if fresh else None):  # به زبان خود کاربر
+                    auto_text = (
+                        T("run_auto_vip_check.1", AUTO_VIP_AFTER_DAYS=AUTO_VIP_AFTER_DAYS, AUTO_VIP_DAYS=AUTO_VIP_DAYS)
                         + build_receipt(fresh, info)
-                        + f"\n\nتا {fmt_date(info['end'])} می‌تونی بدون محدودیت حجم دانلود کنی 💎"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
+                        + T("run_auto_vip_check.2", date=fmt_date(info['end']))
+                    )
+                await bot_.send_message(chat_id=uid, text=auto_text, parse_mode=ParseMode.HTML)
             except Exception:
                 logger.info("could not send the auto-VIP receipt to %s", uid)
             await asyncio.sleep(0.05)
@@ -2531,15 +2650,14 @@ async def job_allowed(query) -> bool:
     quota_left = quota_remaining_bytes(query.from_user.id)
     if quota_left is not None and quota_left <= 0:
         await query.answer(
-            "📦 سهمیه‌ی امروزت تموم شده. نیمه‌شب ریست می‌شه؛ یا با VIP نامحدود دانلود"
-            " کن («آیدی» بنویس و به مدیر بده).",
+            T("job_allowed.1"),
             show_alert=True,
         )
         return False
     remaining = cooldown_remaining(_last_job_at, query.from_user.id)
     if remaining:
         await query.answer(
-            f"⏳ برای جلوگیری از اسپم، {remaining} ثانیه دیگه صبر کن و دوباره بزن.",
+            T("job_allowed.2", remaining=remaining),
             show_alert=True,
         )
         return False
@@ -2556,7 +2674,7 @@ def normalize_link(url: str) -> str:
 
 def link_markup(url: str) -> InlineKeyboardMarkup:
     """یه دکمه‌ی شیشه‌ای «🔗 لینک» که با زدنش لینک اصلی باز می‌شه."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 لینک", url=normalize_link(url))]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(T("link_markup.1"), url=normalize_link(url))]])
 
 
 async def delete_quietly(message) -> bool:
@@ -2574,7 +2692,7 @@ async def cleanup_after_send(context, query, user_msg_id=None):
     اگه پاک کردن ممکن نبود، فقط یه ✅ نشون می‌ده.
     """
     if not await delete_quietly(query.message):
-        await set_status(query, "✅ ارسال شد!")
+        await set_status(query, T("cleanup_after_send.1"))
     if user_msg_id:
         try:
             await context.bot.delete_message(chat_id=query.message.chat_id, message_id=user_msg_id)
@@ -2645,12 +2763,12 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         _, key, format_id, kind = query.data.split("|", 3)
     except ValueError:
-        await set_status(query, "❌ خطای داخلی، دوباره لینک رو بفرست.")
+        await set_status(query, T("handle_quality_choice.1"))
         return
 
     entry = PENDING.get(key)
     if not entry:
-        await set_status(query, "⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.")
+        await set_status(query, T("handle_quality_choice.2"))
         return
 
     url = entry["url"]
@@ -2665,7 +2783,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
     state = ProgressState()
-    await set_status(query, "⏳ در حال آماده‌سازی دانلود...")
+    await set_status(query, T("handle_quality_choice.3"))
 
     tmp_dir = tempfile.mkdtemp(prefix="dl_")
     stop_event = asyncio.Event()
@@ -2685,9 +2803,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         if size_mb > MAX_TELEGRAM_UPLOAD_MB:
             await set_status(
                 query,
-                f"❌ حجم فایل {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB"
-                " ربات‌های تلگرام رسمی بیشتره. برای فایل‌های بزرگ‌تر باید از"
-                " Local Bot API Server استفاده کنی (توضیح در README).",
+                T("handle_quality_choice.4", size_mb=size_mb, MAX_TELEGRAM_UPLOAD_MB=MAX_TELEGRAM_UPLOAD_MB),
             )
             return
 
@@ -2698,8 +2814,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         sending_text = (
-            f"📤 در حال ارسال فایل ({size_mb:.0f}MB)...\n"
-            "فایل‌های بزرگ ممکنه چند دقیقه طول بکشه، صبور باش."
+            T("handle_quality_choice.5", size_mb=size_mb)
         )
         await set_status(query, sending_text)
         chat_id = query.message.chat_id
@@ -2724,7 +2839,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.exception("download/send failed")
         stop_event.set()
-        await set_status(query, "❌ دانلود یا ارسال فایل با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, T("handle_quality_choice.6") + str(e)[:300])
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         PENDING.pop(key, None)
@@ -2758,12 +2873,12 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         v_problem = quota_problem(uid, v_bytes)
         if video_size_mb > MAX_TELEGRAM_UPLOAD_MB:
             await query.message.reply_text(
-                f"⚠️ حجم ویدیو {video_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
+                T("deliver_song.1", video_size_mb=video_size_mb, MAX_TELEGRAM_UPLOAD_MB=MAX_TELEGRAM_UPLOAD_MB)
             )
         elif v_problem:
             await query.message.reply_text(v_problem)
         else:
-            video_text = f"📤 در حال ارسال ویدیو ({video_size_mb:.0f}MB)..."
+            video_text = T("deliver_song.2", video_size_mb=video_size_mb)
             await set_status(query, video_text)
             await with_heartbeat(
                 query, video_text,
@@ -2776,14 +2891,14 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
             sent_any = True
 
         # --- نسخه‌ی صوتی ---
-        await set_status(query, f"⬇️ در حال دانلود نسخه‌ی صوتی «{label}»...")
+        await set_status(query, T("deliver_song.3", label=label))
         audio_path = await asyncio.to_thread(download_media, url, "bestaudio", "audio", tmp_dir)
         a_bytes = os.path.getsize(audio_path)
         audio_size_mb = a_bytes / 1024 / 1024
         a_problem = quota_problem(uid, a_bytes)
         if audio_size_mb > MAX_TELEGRAM_UPLOAD_MB:
             await query.message.reply_text(
-                f"⚠️ حجم فایل صوتی {audio_size_mb:.1f}MB هست و بیشتر از سقف {MAX_TELEGRAM_UPLOAD_MB}MB تلگرامه."
+                T("deliver_song.4", audio_size_mb=audio_size_mb, MAX_TELEGRAM_UPLOAD_MB=MAX_TELEGRAM_UPLOAD_MB)
             )
         elif a_problem:
             await query.message.reply_text(a_problem)
@@ -2801,7 +2916,7 @@ async def deliver_song(query, context, chat_id: int, url: str, title: str, artis
         return sent_any
     except Exception as e:
         logger.exception("deliver_song failed")
-        await set_status(query, "❌ ارسال آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, T("deliver_song.5") + str(e)[:300])
         return False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2875,7 +2990,7 @@ async def recognize_snippet(snippet_path: str):
 
 async def recognize_from_audio_file(query, audio_path: str, duration: float, tmp_dir: str):
     """تشخیص آهنگ از روی یه فایل صوتی/ویدیویی (Shazam، AudD، ACRCloud؛ تیکه‌ی اول و وسط)."""
-    await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی اول)...")
+    await set_status(query, T("recognize_from_audio_file.1"))
     snippet1 = await asyncio.to_thread(
         make_snippet, audio_path, tmp_dir, 0, SONG_SNIPPET_SECONDS, "snip1"
     )
@@ -2884,7 +2999,7 @@ async def recognize_from_audio_file(query, audio_path: str, duration: float, tmp
     # اگه تیکه‌ی اول (که ممکنه فقط حرف زدن باشه) جواب نداد و فایل
     # به‌اندازه‌ی کافی طولانیه، یه تیکه‌ی دیگه از وسطش رو هم امتحان کن
     if not result and duration and duration > 40:
-        await set_status(query, "🎧 در حال تشخیص آهنگ (تیکه‌ی دوم)...")
+        await set_status(query, T("recognize_from_audio_file.2"))
         mid_start = max(0, (duration / 2) - (SONG_SNIPPET_SECONDS / 2))
         snippet2 = await asyncio.to_thread(
             make_snippet, audio_path, tmp_dir, mid_start, SONG_SNIPPET_SECONDS, "snip2"
@@ -2898,7 +3013,7 @@ async def find_and_deliver_song(query, context, chat_id: int, title: str, artist
     label = f"{title} - {artist}" if artist else title
     variant_txt = f" ({variant})" if variant else ""
     await set_status(
-        query, f"🎵 آهنگ اصلی: {label}{variant_txt}\n🔎 در حال پیدا کردن نسخه‌ی رسمی..."
+        query, T("find_and_deliver_song.1", label=label, variant_txt=variant_txt)
     )
 
     search_query = label if not variant else f"{label} {variant}"
@@ -2906,15 +3021,14 @@ async def find_and_deliver_song(query, context, chat_id: int, title: str, artist
         best = await asyncio.to_thread(search_music, search_query)
     except Exception as e:
         logger.exception("search_music failed in find_and_deliver_song")
-        await set_status(query, "❌ جستجو با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, T("handle_music_query.3") + str(e)[:300])
         return False
 
     if not best:
-        artist_txt = f"\nخواننده: {artist}" if artist else ""
+        artist_txt = T("find_and_deliver_song.2", artist=artist) if artist else ""
         await set_status(
             query,
-            f"❌ نسخه‌ی رسمی «{title}» رو پیدا نکردم.{artist_txt}\n"
-            "می‌تونی از دکمه‌ی «🎵 جستجوی موزیک» با اسم دقیق‌تر امتحان کنی.",
+            T("find_and_deliver_song.3", title=title, artist_txt=artist_txt),
         )
         return False
 
@@ -2934,12 +3048,12 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _, key = query.data.split("|", 1)
     except ValueError:
-        await set_status(query, "❌ خطای داخلی، دوباره لینک رو بفرست.")
+        await set_status(query, T("handle_quality_choice.1"))
         return
 
     entry = PENDING.get(key)
     if not entry:
-        await set_status(query, "⌛ این درخواست منقضی شده، لطفاً لینک رو دوباره بفرست.")
+        await set_status(query, T("handle_quality_choice.2"))
         return
 
     url = entry["url"]
@@ -2957,7 +3071,7 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # و رایگان‌تر از تشخیص از روی صدا، و برای آهنگ‌های فارسی/گمنام هم
     # بهتر جواب می‌ده)
     if not title and GEMINI_API_KEY:
-        await set_status(query, "🤖 در حال بررسی کپشن ویدیو با هوش مصنوعی...")
+        await set_status(query, T("handle_find_song.1"))
         try:
             ai_result = await asyncio.to_thread(
                 ai_identify_song,
@@ -2975,27 +3089,24 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not title:
         if not has_audio_recognition():
             hint = (
-                " یا یه GEMINI_API_KEY رایگان از aistudio.google.com بگیر تا"
-                " از روی کپشن ویدیو حدس بزنم"
+                T("handle_find_song.2")
                 if not GEMINI_API_KEY
                 else ""
             )
             await set_status(
                 query,
-                "ℹ️ نتونستم از متادیتا یا کپشن ویدیو آهنگ رو تشخیص بدم. برای"
-                " تشخیص از روی خود صدا باید یه AUDD_API_KEY (یا ACRCloud)"
-                f" تنظیم بشه{hint}.",
+                T("handle_find_song.3", hint=hint),
             )
             return
 
-        await set_status(query, "⬇️ در حال دانلود صدای ویدیو برای تشخیص...")
+        await set_status(query, T("handle_find_song.4"))
         tmp_dir = tempfile.mkdtemp(prefix="song_id_")
         try:
             full_audio_path, duration = await asyncio.to_thread(download_full_audio, url, tmp_dir)
             result = await recognize_from_audio_file(query, full_audio_path, duration, tmp_dir)
         except Exception as e:
             logger.exception("find_song audio recognition failed")
-            await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+            await set_status(query, T("handle_find_song.5") + str(e)[:300])
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3003,8 +3114,7 @@ async def handle_find_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not result:
             await set_status(
                 query,
-                "❌ نتونستم آهنگ این ویدیو رو تشخیص بدم. شاید صدای پس‌زمینه"
-                " واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.",
+                T("handle_find_song.6"),
             )
             return
         title, artist = result
@@ -3065,10 +3175,10 @@ async def handle_uploaded_media(update: Update, context: ContextTypes.DEFAULT_TY
         "caption": message.caption or "",
     }
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎵 استخراج صدا", callback_data=f"fa|{key}")],
-        [InlineKeyboardButton("🎧 پیدا کردن آهنگ اصلی", callback_data=f"fs|{key}")],
+        [InlineKeyboardButton(T("handle_uploaded_media.1"), callback_data=f"fa|{key}")],
+        [InlineKeyboardButton(T("handle_uploaded_media.2"), callback_data=f"fs|{key}")],
     ])
-    await message.reply_text("🎞 فایلت رو گرفتم. چیکار کنم؟", reply_markup=markup, reply_to_message_id=message.message_id)
+    await message.reply_text(T("handle_uploaded_media.3"), reply_markup=markup, reply_to_message_id=message.message_id)
 
 
 async def download_uploaded_file(query, context, entry: dict, tmp_dir: str):
@@ -3077,13 +3187,11 @@ async def download_uploaded_file(query, context, entry: dict, tmp_dir: str):
     if not LOCAL_API_URL and size_mb > TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB:
         await set_status(
             query,
-            f"❌ حجم فایل {size_mb:.1f}MB هست و ربات با سرور رسمی تلگرام فقط تا"
-            f" {TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB}MB رو می‌تونه دریافت کنه. برای فایل‌های"
-            " بزرگ‌تر باید TELEGRAM_API_ID و TELEGRAM_API_HASH ست بشن (سرور محلی).",
+            T("download_uploaded_file.1", size_mb=size_mb, TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB=TELEGRAM_CLOUD_DOWNLOAD_LIMIT_MB),
         )
         return None
 
-    await set_status(query, "⬇️ در حال دریافت فایل از تلگرام...")
+    await set_status(query, T("download_uploaded_file.2"))
     try:
         tg_file = await context.bot.get_file(entry["file_id"])
         ext = Path(entry["name"]).suffix or ".mp4"
@@ -3091,7 +3199,7 @@ async def download_uploaded_file(query, context, entry: dict, tmp_dir: str):
         await tg_file.download_to_drive(path)
     except BadRequest as e:
         if "too big" in str(e).lower():
-            await set_status(query, "❌ این فایل برای دریافت توسط ربات خیلی بزرگه (سقف ۲۰ مگابایت بدون سرور محلی).")
+            await set_status(query, T("download_uploaded_file.3"))
             return None
         raise
     return path
@@ -3107,7 +3215,7 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
         return
     entry = UPLOADS.get(key)
     if not entry:
-        await set_status(query, "⌛ این درخواست منقضی شده، فایل رو دوباره بفرست.")
+        await set_status(query, T("handle_upload_extract_audio.1"))
         return
 
     tmp_dir = tempfile.mkdtemp(prefix="up_audio_")
@@ -3115,12 +3223,12 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
         path = await download_uploaded_file(query, context, entry, tmp_dir)
         if not path:
             return
-        await set_status(query, "🎶 در حال استخراج صدا...")
+        await set_status(query, T("handle_upload_extract_audio.2"))
         mp3_path = await asyncio.to_thread(extract_mp3, path, tmp_dir)
 
         size_mb = os.path.getsize(mp3_path) / 1024 / 1024
         if size_mb > MAX_TELEGRAM_UPLOAD_MB:
-            await set_status(query, f"❌ حجم فایل صوتی {size_mb:.1f}MB هست و از سقف {MAX_TELEGRAM_UPLOAD_MB}MB بیشتره.")
+            await set_status(query, T("handle_upload_extract_audio.3", size_mb=size_mb, MAX_TELEGRAM_UPLOAD_MB=MAX_TELEGRAM_UPLOAD_MB))
             return
 
         mp3_bytes = os.path.getsize(mp3_path)
@@ -3138,7 +3246,7 @@ async def handle_upload_extract_audio(update: Update, context: ContextTypes.DEFA
         await cleanup_after_send(context, query)
     except Exception as e:
         logger.exception("upload extract audio failed")
-        await set_status(query, "❌ استخراج صدا با خطا مواجه شد:\n" + str(e)[:300])
+        await set_status(query, T("handle_upload_extract_audio.4") + str(e)[:300])
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         UPLOADS.pop(key, None)
@@ -3154,7 +3262,7 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
         return
     entry = UPLOADS.get(key)
     if not entry:
-        await set_status(query, "⌛ این درخواست منقضی شده، فایل رو دوباره بفرست.")
+        await set_status(query, T("handle_upload_extract_audio.1"))
         return
 
     chat_id = query.message.chat_id
@@ -3162,7 +3270,7 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
 
     # اگه کاربر کپشن یا اسم فایل گذاشته، اول Gemini اون رو بررسی کنه
     if GEMINI_API_KEY and (entry["caption"] or entry["name"]):
-        await set_status(query, "🤖 در حال بررسی کپشن با هوش مصنوعی...")
+        await set_status(query, T("handle_upload_find_song.1"))
         try:
             ai_result = await asyncio.to_thread(
                 ai_identify_song, entry["name"], entry["caption"], ""
@@ -3177,8 +3285,7 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
         if not has_audio_recognition():
             await set_status(
                 query,
-                "ℹ️ برای تشخیص آهنگ از روی صدای فایل باید یه AUDD_API_KEY (یا"
-                " ACRCloud) تنظیم بشه.",
+                T("handle_upload_find_song.2"),
             )
             UPLOADS.pop(key, None)
             return
@@ -3192,7 +3299,7 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
             result = await recognize_from_audio_file(query, path, duration, tmp_dir)
         except Exception as e:
             logger.exception("upload find song failed")
-            await set_status(query, "❌ تشخیص آهنگ با خطا مواجه شد:\n" + str(e)[:300])
+            await set_status(query, T("handle_find_song.5") + str(e)[:300])
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3200,8 +3307,7 @@ async def handle_upload_find_song(update: Update, context: ContextTypes.DEFAULT_
         if not result:
             await set_status(
                 query,
-                "❌ نتونستم آهنگ این فایل رو تشخیص بدم. شاید صدای پس‌زمینه"
-                " واضح نبود یا آهنگ تو دیتابیس سرویس تشخیص نیست.",
+                T("handle_upload_find_song.3"),
             )
             UPLOADS.pop(key, None)
             return
@@ -3321,10 +3427,12 @@ def main():
     # هر کاربری که با ربات کار کنه خودکار ثبت‌نام می‌شه
     app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"), help_button))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ABOUT)}$"), about_button))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_MUSIC)}$"), music_button))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ACCOUNT)}$"), account_button))
+    app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang\|"))
+    app.add_handler(MessageHandler(filters.Regex(btn_regex("help")), help_button))
+    app.add_handler(MessageHandler(filters.Regex(btn_regex("about")), about_button))
+    app.add_handler(MessageHandler(filters.Regex(btn_regex("music")), music_button))
+    app.add_handler(MessageHandler(filters.Regex(btn_regex("account")), account_button))
     app.add_handler(CommandHandler("me", account_button))
     app.add_handler(MessageHandler(
         filters.Regex(re.compile(r"^\s*(آیدی|ایدی|id)\s*$", re.IGNORECASE)), id_command
