@@ -233,6 +233,7 @@ def _load_locales() -> dict:
 
 _EXTRA_LOCALES = {
     "fa": {
+        "yt.bot_check": '❌ یوتیوب الان ربات رو شناسایی کرده و این ویدیو رو نمی\u200cده. چند دقیقه دیگه دوباره امتحان کن؛ مدیر هم مطلع شد.',
         "ig.login_wall": '❌ اینستاگرام الان به ربات اجازه\u200cی دیدن این پست رو نمی\u200cده (ورود لازمه یا محدودیت سرعت). چند دقیقه دیگه دوباره امتحان کن؛ اگه تکرار شد، به مدیر ربات خبر بده.',
         "ext.btn": "🌐 دانلود خارجی (لینک مستقیم)",
         "ext.unavailable": "❌ دانلود خارجی فعلاً فعال نیست.",
@@ -249,6 +250,7 @@ _EXTRA_LOCALES = {
         "ext.failed": "❌ دانلود خارجی انجام نشد:\n",
     },
     "en": {
+        "yt.bot_check": '❌ YouTube is currently blocking the bot from getting this video. Try again in a few minutes; the admin has been notified.',
         "ig.login_wall": "❌ Instagram isn't letting the bot view this post right now (login required or rate limit). Try again in a few minutes; if it keeps happening, let the bot admin know.",
         "ext.btn": "🌐 External download (direct link)",
         "ext.unavailable": "❌ External download isn't available right now.",
@@ -265,6 +267,7 @@ _EXTRA_LOCALES = {
         "ext.failed": "❌ The external download failed:\n",
     },
     "tr": {
+        "yt.bot_check": '❌ YouTube şu anda botun bu videoyu almasını engelliyor. Birkaç dakika sonra tekrar dene; yönetici bilgilendirildi.',
         "ig.login_wall": '❌ Instagram şu anda botun bu gönderiyi görmesine izin vermiyor (giriş gerekli ya da hız sınırı). Birkaç dakika sonra tekrar dene; devam ederse bot yöneticisine haber ver.',
         "ext.btn": "🌐 Harici indirme (doğrudan bağlantı)",
         "ext.unavailable": "❌ Harici indirme şu anda kullanılamıyor.",
@@ -281,6 +284,7 @@ _EXTRA_LOCALES = {
         "ext.failed": "❌ Harici indirme başarısız oldu:\n",
     },
     "ru": {
+        "yt.bot_check": '❌ YouTube сейчас не даёт боту получить это видео. Попробуй снова через несколько минут; администратор уведомлён.',
         "ig.login_wall": '❌ Instagram сейчас не позволяет боту открыть этот пост (нужен вход или превышен лимит запросов). Попробуй снова через несколько минут; если повторится, сообщи администратору бота.',
         "ext.btn": "🌐 Внешняя загрузка (прямая ссылка)",
         "ext.unavailable": "❌ Внешняя загрузка сейчас недоступна.",
@@ -297,6 +301,7 @@ _EXTRA_LOCALES = {
         "ext.failed": "❌ Внешняя загрузка не удалась:\n",
     },
     "es": {
+        "yt.bot_check": '❌ YouTube está bloqueando ahora mismo al bot para obtener este vídeo. Inténtalo de nuevo en unos minutos; el administrador ha sido avisado.',
         "ig.login_wall": '❌ Instagram no deja que el bot vea esta publicación ahora mismo (se requiere inicio de sesión o hay un límite de velocidad). Inténtalo de nuevo en unos minutos; si se repite, avisa al administrador del bot.',
         "ext.btn": "🌐 Descarga externa (enlace directo)",
         "ext.unavailable": "❌ La descarga externa no está disponible ahora mismo.",
@@ -313,6 +318,7 @@ _EXTRA_LOCALES = {
         "ext.failed": "❌ La descarga externa falló:\n",
     },
     "fr": {
+        "yt.bot_check": "❌ YouTube empêche actuellement le bot de récupérer cette vidéo. Réessaie dans quelques minutes ; l'administrateur a été prévenu.",
         "ig.login_wall": "❌ Instagram ne laisse pas le bot consulter cette publication pour le moment (connexion requise ou limite de débit). Réessaie dans quelques minutes ; si cela se répète, préviens l'administrateur du bot.",
         "ext.btn": "🌐 Téléchargement externe (lien direct)",
         "ext.unavailable": "❌ Le téléchargement externe n'est pas disponible pour le moment.",
@@ -504,13 +510,22 @@ class InstagramLoginWall(Exception):
         super().__init__(T("ig.login_wall"))
 
 
+class YouTubeBotCheck(Exception):
+    """یوتیوب حتی با کوکی (اگه داشتیم) و کلاینت جایگزین هم «ثابت کن ربات نیستی» داد."""
+
+    def __init__(self):
+        super().__init__(T("yt.bot_check"))
+
+
 ALT_YOUTUBE_CLIENT = "android_vr"  # کلاینت جایگزین که معمولاً PO Token نمی‌خواد
+_YT_PROBLEM = {"count": 0, "at": 0.0, "last_alert": 0.0}
 
 IG_LOGIN_WALL_SIGNS = (
     "redirected to the login page", "anonymously", "login required", "you need to log in",
     "log in to access", "use --cookies", "rate-limit", "rate limit",
+    "http error 401", "unauthorized",  # کوکی هست ولی اینستاگرام نشستش رو قبول نمی‌کنه (منقضی/باطل)
 )
-_IG_WALL = {"count": 0, "had_cookies": False, "last_alert": 0.0}
+_IG_WALL = {"count": 0, "had_cookies": False, "last_alert": 0.0, "at": 0.0}
 
 
 def _cookies_available() -> bool:
@@ -529,6 +544,7 @@ def _ig_login_wall(err_text: str) -> bool:
 def _note_ig_login_wall(had_cookies: bool) -> None:
     _IG_WALL["count"] += 1
     _IG_WALL["had_cookies"] = had_cookies
+    _IG_WALL["at"] = time.time()
 
 
 def _looks_like_bot_check(err_text: str) -> bool:
@@ -602,6 +618,10 @@ def _run_with_cookie_fallback(func, *args, **kwargs):
             last_error = e
             if not _is_retryable(str(e)):
                 raise
+    if _looks_like_bot_check(str(last_error).lower()):
+        _YT_PROBLEM["count"] += 1
+        _YT_PROBLEM["at"] = time.time()
+        raise YouTubeBotCheck() from last_error
     raise last_error
 
 
@@ -1428,9 +1448,15 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         if isinstance(e, InstagramLoginWall):
             err_text = str(e)
             try:
-                await alert_admins_ig_problem(message.get_bot())
+                asyncio.create_task(alert_admins_ig_problem(message.get_bot()))
             except Exception:
                 logger.exception("could not alert admins about the Instagram login wall")
+        elif isinstance(e, YouTubeBotCheck):
+            err_text = str(e)
+            try:
+                asyncio.create_task(alert_admins_yt_problem(message.get_bot()))
+            except Exception:
+                logger.exception("could not alert admins about the YouTube bot check")
         elif isinstance(e, InstagramAudienceRestricted):
             err_text = str(e)
         else:
@@ -3066,57 +3092,264 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         PENDING.pop(key, None)
 
 
-def cookie_status_text() -> str:
-    """وضعیت فایل کوکی (بدون نمایش هیچ مقدار محرمانه‌ای)."""
-    if not _cookies_available():
-        return "🍪 فایل کوکی: وجود نداره."
-    cookies = {}
-    try:
-        with open(COOKIES_FILE, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("#HttpOnly_"):
-                    line = line[len("#HttpOnly_"):]
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    cookies[(parts[0].lstrip("."), parts[5])] = parts[4]
-    except Exception:
-        return "🍪 فایل کوکی خونده نشد."
-    ig = {n: e for (d, n), e in cookies.items() if d.endswith("instagram.com")}
-    google_ok = any(d.endswith(("youtube.com", "google.com")) and n in ("SID", "__Secure-1PSID", "LOGIN_INFO") for (d, n) in cookies)
-    lines = ["🍪 وضعیت کوکی:"]
-    if "sessionid" not in ig:
-        lines.append("• اینستاگرام: sessionid نیست ❌ (لاگین نیست)")
-    else:
-        try:
-            exp = int(float(ig["sessionid"] or 0))
-        except ValueError:
-            exp = 0
-        if exp and exp < time.time():
-            lines.append("• اینستاگرام: sessionid منقضی شده ❌")
-        elif exp:
-            lines.append(f"• اینستاگرام: sessionid هست (تا حدود {max(0, int((exp - time.time()) // 86400))} روز دیگه)")
+# --------------------------------------------------------------------------------------
+# کوکی‌ها: ربات فایل کوکی رو می‌خونه و می‌فهمه مال اینستاگرامه یا یوتیوب/گوگل؛ هر کدوم جدا ذخیره می‌شه،
+# پس با فرستادن کوکی یوتیوب، کوکی اینستاگرام پاک نمی‌شه (و برعکس). فایل ترکیبی برای yt-dlp ساخته می‌شه.
+# --------------------------------------------------------------------------------------
+COOKIE_LABELS = {"instagram": "📸 اینستاگرام", "youtube": "▶️ یوتیوب/گوگل", "other": "🌐 بقیه‌ی سایت‌ها"}
+YT_LOGIN_COOKIES = ("SID", "__Secure-1PSID", "__Secure-3PSID", "SAPISID", "__Secure-1PAPISID", "LOGIN_INFO")
+_COOKIE_STORE = {"instagram": [], "youtube": [], "other": []}  # خط‌های فرمت Netscape
+_COOKIE_META = {}  # platform -> {"updated": iso یا None, "source": "admin"|"env"}
+COOKIE_TIP_IG = (
+    "نکته: بعد از export از اینستاگرام «Logout» نزن؛ خروج نشست رو باطل می‌کنه. بهترین راه: توی یه پنجره‌ی "
+    "ناشناس (Incognito) لاگین کن، کوکی رو export بگیر و پنجره رو بدون Logout ببند. از حساب جداگانه استفاده کن."
+)
+COOKIE_TIP_YT = (
+    "نکته: توی پنجره‌ی ناشناس (Incognito) لاگین یوتیوب کن، تب رو به youtube.com/robots.txt ببر، کوکی "
+    "youtube.com رو export بگیر و پنجره رو ببند (Logout نزن)؛ این‌طوری یوتیوب کوکی رو عوض نمی‌کنه."
+)
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def _cookie_platform(domain: str) -> str:
+    d = domain.lstrip(".").lower()
+    if d.endswith("instagram.com"):
+        return "instagram"
+    if d.endswith(("youtube.com", "google.com")):
+        return "youtube"
+    return "other"
+
+
+def _parse_cookies(text: str) -> list:
+    """فایل Netscape رو می‌خونه؛ هر کوکی: platform, domain, name, value, expiry, line (خط اصلی)."""
+    out = []
+    for raw in text.splitlines():
+        body = raw.strip()
+        if not body:
+            continue
+        if body.startswith("#HttpOnly_"):
+            fields = body[len("#HttpOnly_"):]
+        elif body.startswith("#"):
+            continue
         else:
-            lines.append("• اینستاگرام: sessionid هست")
-    lines.append("• یوتیوب/گوگل: " + ("کوکی ورود هست" if google_ok else "کوکی ورود نیست"))
-    return "\n".join(lines)
+            fields = body
+        parts = fields.split("\t")
+        if len(parts) < 7:
+            continue
+        try:
+            expiry = int(float(parts[4] or 0))
+        except ValueError:
+            expiry = 0
+        out.append({"platform": _cookie_platform(parts[0]), "domain": parts[0], "name": parts[5],
+                    "value": parts[6], "expiry": expiry, "line": body})
+    return out
 
 
-async def alert_admins_ig_problem(bot_):
-    """حداکثر ساعتی یه بار به مدیرها خبر می‌ده که اینستاگرام لینک‌ها رو رد می‌کنه."""
-    if time.time() - _IG_WALL["last_alert"] < 3600:
+def _login_cookies(platform: str) -> list:
+    names = ("sessionid",) if platform == "instagram" else YT_LOGIN_COOKIES
+    return [c for c in _parse_cookies("\n".join(_COOKIE_STORE[platform])) if c["name"] in names]
+
+
+def _expiry_state(found: list):
+    """('none'|'expired'|'ok'|'session', روزهای مونده)."""
+    if not found:
+        return "none", None
+    exps = [c["expiry"] for c in found if c["expiry"]]
+    if exps and min(exps) < time.time():
+        return "expired", None
+    if exps:
+        return "ok", int((min(exps) - time.time()) // 86400)
+    return "session", None
+
+
+def _jar(platform: str) -> dict:
+    return {c["name"]: c["value"] for c in _parse_cookies("\n".join(_COOKIE_STORE[platform]))}
+
+
+def _write_merged_cookies() -> bool:
+    global COOKIES_FILE
+    lines = [ln for p in ("instagram", "youtube", "other") for ln in _COOKIE_STORE[p]]
+    if not lines:
+        return False
+    path = os.path.join(tempfile.gettempdir(), "ytdlp_cookies.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n")
+    COOKIES_FILE = path
+    return True
+
+
+def load_cookies_from_db() -> bool:
+    """موقع بالا اومدن: کوکی‌های متغیر محیطی (پایه) + کوکی‌هایی که مدیر فرستاده (جایگزین هر پلتفرم)."""
+    for p in _COOKIE_STORE:
+        _COOKIE_STORE[p] = []
+    _COOKIE_META.clear()
+    if _cookies_available():
+        try:
+            with open(COOKIES_FILE, encoding="utf-8", errors="ignore") as f:
+                for c in _parse_cookies(f.read()):
+                    _COOKIE_STORE[c["platform"]].append(c["line"])
+            for p, lines in _COOKIE_STORE.items():
+                if lines:
+                    _COOKIE_META[p] = {"updated": None, "source": "env"}
+        except Exception:
+            logger.exception("could not read the base cookie file")
+    db_ = get_db()
+    try:
+        legacy = db_.kv_get("cookies_txt")  # نسخه‌ی قبلی که یه فایل واحد نگه می‌داشت
+        if legacy:
+            by = {}
+            for c in _parse_cookies(legacy):
+                by.setdefault(c["platform"], []).append(c["line"])
+            for p, lines in by.items():
+                db_.kv_set(f"cookies_{p}", "\n".join(lines))
+                db_.kv_set(f"cookies_ts_{p}", to_iso(utcnow()))
+            db_.kv_delete("cookies_txt")
+        for p in _COOKIE_STORE:
+            text = db_.kv_get(f"cookies_{p}")
+            if text:
+                _COOKIE_STORE[p] = [ln for ln in text.splitlines() if ln.strip()]
+                _COOKIE_META[p] = {"updated": db_.kv_get(f"cookies_ts_{p}"), "source": "admin"}
+    except Exception:
+        logger.exception("could not read stored cookies")
+    return _write_merged_cookies()
+
+
+def instagram_session_check():
+    """از خود اینستاگرام می‌پرسه با این کوکی لاگینیم یا نه: ("ok"|"invalid"|"limited"|"unknown"|"none", توضیح)."""
+    jar = _jar("instagram")
+    if not _COOKIE_STORE["instagram"]:
+        return "none", ""
+    if "sessionid" not in jar:
+        return "invalid", "no sessionid"
+    headers = {
+        "User-Agent": _UA, "X-IG-App-ID": "936619743392459", "X-CSRFToken": jar.get("csrftoken", ""),
+        "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/",
+    }
+    try:
+        r = requests.get("https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+                         cookies=jar, headers=headers, timeout=20, allow_redirects=False)
+    except requests.RequestException as e:
+        return "unknown", type(e).__name__
+    if r.status_code == 200:
+        try:
+            return "ok", r.json()["user"]["username"]
+        except Exception:
+            return "ok", ""
+    if r.status_code in (301, 302, 303, 307, 308, 400, 401, 403):
+        return "invalid", f"HTTP {r.status_code}"
+    if r.status_code == 429:
+        return "limited", "HTTP 429"
+    return "unknown", f"HTTP {r.status_code}"
+
+
+def youtube_session_check():
+    """صفحه‌ی اصلی یوتیوب رو با کوکی می‌گیره و نشون «LOGGED_IN» رو می‌خونه."""
+    if not _COOKIE_STORE["youtube"]:
+        return "none", ""
+    jar = _jar("youtube")
+    if not any(n in jar for n in YT_LOGIN_COOKIES):
+        return "invalid", "no login cookie"
+    jar.setdefault("SOCS", "CAI")  # صفحه‌ی رضایت اروپا رو رد می‌کنه
+    try:
+        r = requests.get("https://www.youtube.com/", cookies=jar,
+                         headers={"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9"}, timeout=25)
+    except requests.RequestException as e:
+        return "unknown", type(e).__name__
+    if '"LOGGED_IN":true' in r.text:
+        return "ok", ""
+    if '"LOGGED_IN":false' in r.text:
+        return "invalid", "not logged in"
+    if r.status_code == 429:
+        return "limited", "HTTP 429"
+    return "unknown", f"HTTP {r.status_code}"
+
+
+def session_check_text(platform: str, state: str, detail: str) -> str:
+    who = "اینستاگرام" if platform == "instagram" else "یوتیوب"
+    if state == "none":
+        return ""
+    if state == "ok":
+        return f"تست زنده: ✅ {who} این نشست رو قبول می‌کنه" + (f" (@{detail})" if detail else "")
+    if state == "invalid":
+        return f"تست زنده: ❌ {who} این نشست رو قبول نمی‌کنه ({detail})"
+    if state == "limited":
+        return f"تست زنده: ⚠️ {who} موقتاً محدودیت سرعت گذاشته ({detail})"
+    return f"تست زنده: نامشخص ({detail})"
+
+
+def _ago(ts: float) -> str:
+    d = max(0, int(time.time() - ts))
+    if d < 90:
+        return "همین الان"
+    if d < 5400:
+        return f"{d // 60} دقیقه پیش"
+    if d < 172800:
+        return f"{d // 3600} ساعت پیش"
+    return f"{d // 86400} روز پیش"
+
+
+async def cookie_report() -> str:
+    """گزارش وضعیت کوکی اینستاگرام و یوتیوب (با تست زنده)."""
+    ig_live, yt_live = await asyncio.gather(
+        asyncio.to_thread(instagram_session_check), asyncio.to_thread(youtube_session_check)
+    )
+    lives = {"instagram": ig_live, "youtube": yt_live}
+    problems = {"instagram": _IG_WALL, "youtube": _YT_PROBLEM}
+    out = ["🍪 وضعیت کوکی‌ها"]
+    bad_platforms = []
+    for p in ("instagram", "youtube"):
+        out.append("")
+        if not _COOKIE_STORE[p]:
+            out.append(COOKIE_LABELS[p] + "\n• کوکی ندارم ❌ — فایل کوکی بفرست")
+            bad_platforms.append(p)
+            continue
+        lines, bad = [COOKIE_LABELS[p]], False
+        state, days = _expiry_state(_login_cookies(p))
+        if state == "none":
+            lines.append("• کوکیِ ورود توش نیست ❌")
+            bad = True
+        elif state == "expired":
+            lines.append("• کوکی‌های ورود منقضی شدن ❌")
+            bad = True
+        elif state == "ok":
+            lines.append(f"• کوکی ورود هست (تا حدود {days} روز دیگه)")
+        else:
+            lines.append("• کوکی ورود هست (نشست مرورگر)")
+        meta = _COOKIE_META.get(p, {})
+        if meta.get("updated"):
+            try:
+                lines.append("• آخرین بروزرسانی: " + _ago(from_iso(meta["updated"]).timestamp()))
+            except Exception:
+                pass
+        elif meta.get("source") == "env":
+            lines.append("• منبع: تنظیمات سرور (COOKIES_FILE_B64)")
+        lv_state, lv_detail = lives[p]
+        live = session_check_text(p, lv_state, lv_detail)
+        if live:
+            lines.append("• " + live)
+        if lv_state == "invalid":
+            bad = True
+        prob = problems[p]
+        if prob["count"]:
+            lines.append(f"• خطای ثبت‌شده از زمان بالا اومدن ربات: {prob['count']} بار؛ آخرینش {_ago(prob['at'])}")
+            if time.time() - prob["at"] < 1800 and lv_state != "ok":
+                bad = True
+        lines.append("➡️ نتیجه: " + ("❌ باید کوکی عوض بشه" if bad else "✅ سالم به نظر می‌رسه"))
+        if bad:
+            bad_platforms.append(p)
+        out.extend(lines)
+    if _COOKIE_STORE["other"]:
+        out.append(f"\n🌐 کوکی سایت‌های دیگه: {len(_COOKIE_STORE['other'])} تا")
+    for p in bad_platforms:
+        out.append("\n" + (COOKIE_TIP_IG if p == "instagram" else COOKIE_TIP_YT))
+    return "\n".join(out)
+
+
+async def _alert_admins(bot_, state: dict, headline: str):
+    if time.time() - state["last_alert"] < 3600:  # حداکثر ساعتی یک بار
         return
-    _IG_WALL["last_alert"] = time.time()
-    reason = (
-        "با این‌که کوکی داریم، اینستاگرام ما رو به صفحه‌ی ورود فرستاد؛ یعنی نشست کوکی باطل/منقضی شده."
-        if _IG_WALL["had_cookies"] else "کوکی اینستاگرام ست نیست، و بدون ورود اینستاگرام سرور رو محدود کرده."
-    )
-    text = (
-        "⚠️ اینستاگرام لینک‌ها رو برای ربات رد می‌کنه (ورود لازمه).\n" + reason + "\n\n" + cookie_status_text()
-        + "\n\nراه‌حل: کوکی تازه‌ی اینستاگرام (cookies.txt، فرمت Netscape) رو همین‌جا برای ربات بفرست."
-    )
+    state["last_alert"] = time.time()
+    text = headline + "\n\n" + await cookie_report() + "\n\nفایل cookies.txt تازه رو همین‌جا برای ربات بفرست."
     for admin_id in ADMIN_IDS:
         try:
             await bot_.send_message(chat_id=admin_id, text=text)
@@ -3124,50 +3357,28 @@ async def alert_admins_ig_problem(bot_):
             pass
 
 
-def _cookie_path() -> str:
-    return os.path.join(tempfile.gettempdir(), "ytdlp_cookies.txt")
+async def alert_admins_ig_problem(bot_):
+    await _alert_admins(bot_, _IG_WALL, "⚠️ اینستاگرام لینک‌ها رو برای ربات رد می‌کنه (ورود لازمه / نشست باطله).")
 
 
-def load_cookies_from_db() -> bool:
-    """اگه مدیر قبلاً فایل کوکی فرستاده باشه، موقع بالا اومدن ربات همون استفاده می‌شه (جای متغیر محیطی)."""
-    global COOKIES_FILE
-    try:
-        text = get_db().kv_get("cookies_txt")
-    except Exception:
-        logger.exception("could not read stored cookies")
-        return False
-    if not text:
-        return False
-    path = _cookie_path()
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    COOKIES_FILE = path
-    return True
-
-
-def _looks_like_cookie_file(text: str) -> bool:
-    if "# Netscape HTTP Cookie File" in text:
-        return True
-    return any(
-        len(ln.split("\t")) >= 7 and ("instagram.com" in ln or "youtube.com" in ln or "google.com" in ln)
-        for ln in text.splitlines()
-    )
+async def alert_admins_yt_problem(bot_):
+    await _alert_admins(bot_, _YT_PROBLEM, "⚠️ یوتیوب ربات رو شناسایی کرده («ثابت کن ربات نیستی»).")
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cookies (فقط مدیر): وضعیت کوکی اینستاگرام و یوتیوب."""
     if not is_admin(update.effective_user.id):
         return
-    await update.message.reply_text(
-        cookie_status_text()
-        + "\n\nبرای عوض کردن کوکی، فایل cookies.txt (فرمت Netscape) رو همین‌جا برای ربات بفرست؛ "
-        "همون لحظه فعال می‌شه و پیام فایل هم پاک می‌شه.\n"
-        "نکته: برای اینستاگرام از یه حساب جداگانه استفاده کن، نه حساب اصلی‌ت."
-    )
+    wait = await update.message.reply_text("⏳ دارم کوکی‌ها رو تست می‌کنم...")
+    text = await cookie_report() + "\n\nبرای عوض کردن کوکی، فایل cookies.txt رو همین‌جا برای ربات بفرست."
+    try:
+        await wait.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
 
 
 async def cookies_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فایل کوکی که مدیر می‌فرسته رو ذخیره و فعال می‌کنه (فقط مدیر؛ بقیه‌ی فایل‌ها نادیده گرفته می‌شن)."""
-    global COOKIES_FILE
+    """فایل کوکی مدیر رو می‌خونه، پلتفرم‌ها رو تشخیص می‌ده و هر کدوم رو جدا بررسی/ذخیره می‌کنه."""
     user = update.effective_user
     doc = update.message.document
     if not user or not is_admin(user.id) or not doc or (doc.file_size or 0) > 1_000_000:
@@ -3177,18 +3388,51 @@ async def cookies_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = bytes(await tg_file.download_as_bytearray()).decode("utf-8", errors="ignore")
     except Exception:
         return
-    if not _looks_like_cookie_file(text):
-        return
-    if "sessionid" not in text and "SID" not in text:
-        await update.message.reply_text("❌ این فایل کوکیِ ورود نداره (نه sessionid اینستاگرام، نه SID گوگل). بعد از لاگین دوباره export بگیر.")
-        return
-    await asyncio.to_thread(get_db().kv_set, "cookies_txt", text)
-    path = _cookie_path()
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    COOKIES_FILE = path
-    _IG_WALL["last_alert"] = 0.0
-    await update.message.reply_text("✅ کوکی جدید ذخیره و فعال شد.\n" + cookie_status_text())
+    parsed = _parse_cookies(text)
+    if not parsed:
+        if "# Netscape HTTP Cookie File" in text:
+            await update.message.reply_text("❌ توی این فایل هیچ کوکی‌ای پیدا نکردم.")
+        return  # فایل دیگه‌ای بوده؛ کاری باهاش نداریم
+    by = {}
+    for c in parsed:
+        by.setdefault(c["platform"], []).append(c)
+    results, saved = [], []
+    for p in ("instagram", "youtube", "other"):
+        items = by.get(p)
+        if not items:
+            continue
+        label = COOKIE_LABELS[p]
+        if p != "other":
+            names = ("sessionid",) if p == "instagram" else YT_LOGIN_COOKIES
+            found = [c for c in items if c["name"] in names]
+            if not found:
+                results.append(f"{label}: ❌ کوکیِ ورود توش نیست (موقع export لاگین نبودی). کوکی قبلی دست‌نخورده موند؛ لاگین کن و دوباره export بگیر.")
+                continue
+            exps = [c["expiry"] for c in found if c["expiry"]]
+            if exps and min(exps) < time.time():
+                results.append(f"{label}: ❌ کوکی‌های این فایل منقضی شدن. کوکی قبلی دست‌نخورده موند؛ تازه export بگیر.")
+                continue
+        _COOKIE_STORE[p] = [c["line"] for c in items]
+        _COOKIE_META[p] = {"updated": to_iso(utcnow()), "source": "admin"}
+        await asyncio.to_thread(get_db().kv_set, f"cookies_{p}", "\n".join(_COOKIE_STORE[p]))
+        await asyncio.to_thread(get_db().kv_set, f"cookies_ts_{p}", _COOKIE_META[p]["updated"])
+        saved.append(p)
+    if saved:
+        await asyncio.to_thread(_write_merged_cookies)
+        _IG_WALL["last_alert"] = 0.0
+        _YT_PROBLEM["last_alert"] = 0.0
+    tips = []
+    for p in saved:
+        if p == "other":
+            results.append(f"{COOKIE_LABELS[p]}: ✅ {len(_COOKIE_STORE[p])} کوکی ذخیره شد.")
+            continue
+        state, detail = await asyncio.to_thread(instagram_session_check if p == "instagram" else youtube_session_check)
+        live = session_check_text(p, state, detail)
+        results.append(f"{COOKIE_LABELS[p]}: ✅ ذخیره و فعال شد.\n   {live}")
+        if state == "invalid":
+            results[-1] += "\n   ⚠️ ذخیره شد ولی به نظر کار نمی‌کنه؛ کوکی تازه‌ای بده."
+            tips.append(COOKIE_TIP_IG if p == "instagram" else COOKIE_TIP_YT)
+    await update.message.reply_text("🍪 نتیجه‌ی فایل کوکی:\n\n" + "\n\n".join(results) + ("\n\n" + "\n".join(tips) if tips else ""))
     try:
         await update.message.delete()  # فایل کوکی توی چت نمونه
     except Exception:
