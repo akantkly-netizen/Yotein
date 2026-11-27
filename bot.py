@@ -217,6 +217,8 @@ _EMBEDDED_LOCALES = json.loads(r'''{"fa":{"__init__.1":"🔒 این محتوا �
 
 def _load_locales() -> dict:
     data = {code: dict(_EMBEDDED_LOCALES.get(code, {})) for code in LANG_CODES}
+    for code, extra in _EXTRA_LOCALES.items():
+        data.setdefault(code, {}).update(extra)
     for code in LANG_CODES:
         path = LOCALES_DIR / f"{code}.json"
         try:
@@ -227,6 +229,106 @@ def _load_locales() -> dict:
         except Exception:
             logger.exception("could not read locale file %s", path.name)
     return data
+
+
+_EXTRA_LOCALES = {
+    "fa": {
+        "ig.login_wall": '❌ اینستاگرام الان به ربات اجازه\u200cی دیدن این پست رو نمی\u200cده (ورود لازمه یا محدودیت سرعت). چند دقیقه دیگه دوباره امتحان کن؛ اگه تکرار شد، به مدیر ربات خبر بده.',
+        "ext.btn": "🌐 دانلود خارجی (لینک مستقیم)",
+        "ext.unavailable": "❌ دانلود خارجی فعلاً فعال نیست.",
+        "ext.limit_reached": "⛔ سهمیه‌ی دانلود خارجی امروزت تموم شده ({used} از {limit}). فردا دوباره امتحان کن.",
+        "ext.vip_hint": "\n💎 کاربرهای VIP روزی تا {vip_limit} بار و تا {vip_volume} می‌تونن از این قابلیت استفاده کنن.",
+        "ext.too_big": "❌ هیچ‌کدوم از کیفیت‌های این ویدیو توی سقف دانلود خارجی تو ({limit}) جا نمی‌شه.",
+        "ext.busy": "⏳ الان چند دانلود خارجی در حال انجامه؛ چند دقیقه‌ی دیگه دوباره امتحان کن.",
+        "ext.start": "🌐 دانلود خارجی شروع شد.\nکیفیت انتخابی: {quality}\nاول روی سرور دانلود می‌شه و بعد روی گوگل درایو آپلود می‌شه.",
+        "ext.uploading": "⬆️ در حال آپلود روی گوگل درایو...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ حجم نهایی فایل ({volume}) از سقف مجاز ({limit}) بیشتره. یه کیفیت پایین‌تر رو امتحان کن.",
+        "ext.ready": "✅ فایل آماده‌ست!\n📁 {name}\n📦 حجم: {volume}\n\n⏳ این لینک تا {minutes} دقیقه (تا ساعت {time}) معتبره و بعدش فایل از درایو پاک می‌شه.\nروی دکمه‌ی زیر بزن تا دانلود شروع بشه.\n\n📊 دانلود خارجی امروز: {used} از {limit}",
+        "ext.link_btn": "⬇️ دانلود",
+        "ext.expired": "⌛ مهلت این لینک تموم شد و فایل پاک شد. برای گرفتن دوباره، لینک ویدیو رو دوباره بفرست.",
+        "ext.failed": "❌ دانلود خارجی انجام نشد:\n",
+    },
+    "en": {
+        "ig.login_wall": "❌ Instagram isn't letting the bot view this post right now (login required or rate limit). Try again in a few minutes; if it keeps happening, let the bot admin know.",
+        "ext.btn": "🌐 External download (direct link)",
+        "ext.unavailable": "❌ External download isn't available right now.",
+        "ext.limit_reached": "⛔ You've used up today's external downloads ({used} of {limit}). Try again tomorrow.",
+        "ext.vip_hint": "\n💎 VIP users can use this up to {vip_limit} times a day and up to {vip_volume}.",
+        "ext.too_big": "❌ None of this video's qualities fit within your external download limit ({limit}).",
+        "ext.busy": "⏳ Several external downloads are running right now; please try again in a few minutes.",
+        "ext.start": "🌐 External download started.\nSelected quality: {quality}\nIt's downloaded on the server first, then uploaded to Google Drive.",
+        "ext.uploading": "⬆️ Uploading to Google Drive...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ The final file size ({volume}) is above the allowed limit ({limit}). Try a lower quality.",
+        "ext.ready": "✅ Your file is ready!\n📁 {name}\n📦 Size: {volume}\n\n⏳ This link is valid for {minutes} minutes (until {time}); after that the file is deleted from the drive.\nTap the button below to start the download.\n\n📊 External downloads today: {used} of {limit}",
+        "ext.link_btn": "⬇️ Download",
+        "ext.expired": "⌛ This link has expired and the file was deleted. To get it again, send the video link again.",
+        "ext.failed": "❌ The external download failed:\n",
+    },
+    "tr": {
+        "ig.login_wall": '❌ Instagram şu anda botun bu gönderiyi görmesine izin vermiyor (giriş gerekli ya da hız sınırı). Birkaç dakika sonra tekrar dene; devam ederse bot yöneticisine haber ver.',
+        "ext.btn": "🌐 Harici indirme (doğrudan bağlantı)",
+        "ext.unavailable": "❌ Harici indirme şu anda kullanılamıyor.",
+        "ext.limit_reached": "⛔ Bugünkü harici indirme hakkın doldu ({used}/{limit}). Yarın tekrar dene.",
+        "ext.vip_hint": "\n💎 VIP kullanıcılar bunu günde {vip_limit} kereye kadar ve {vip_volume} boyuta kadar kullanabilir.",
+        "ext.too_big": "❌ Bu videonun hiçbir kalitesi harici indirme sınırına ({limit}) sığmıyor.",
+        "ext.busy": "⏳ Şu anda birkaç harici indirme sürüyor; lütfen birkaç dakika sonra tekrar dene.",
+        "ext.start": "🌐 Harici indirme başladı.\nSeçilen kalite: {quality}\nÖnce sunucuya indirilir, sonra Google Drive'a yüklenir.",
+        "ext.uploading": "⬆️ Google Drive'a yükleniyor...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ Dosyanın son boyutu ({volume}) izin verilen sınırı ({limit}) aşıyor. Daha düşük bir kalite dene.",
+        "ext.ready": "✅ Dosyan hazır!\n📁 {name}\n📦 Boyut: {volume}\n\n⏳ Bu bağlantı {minutes} dakika (saat {time}'e kadar) geçerli; sonrasında dosya Drive'dan silinir.\nİndirmeyi başlatmak için aşağıdaki düğmeye bas.\n\n📊 Bugünkü harici indirmeler: {used}/{limit}",
+        "ext.link_btn": "⬇️ İndir",
+        "ext.expired": "⌛ Bu bağlantının süresi doldu ve dosya silindi. Tekrar almak için video bağlantısını yeniden gönder.",
+        "ext.failed": "❌ Harici indirme başarısız oldu:\n",
+    },
+    "ru": {
+        "ig.login_wall": '❌ Instagram сейчас не позволяет боту открыть этот пост (нужен вход или превышен лимит запросов). Попробуй снова через несколько минут; если повторится, сообщи администратору бота.',
+        "ext.btn": "🌐 Внешняя загрузка (прямая ссылка)",
+        "ext.unavailable": "❌ Внешняя загрузка сейчас недоступна.",
+        "ext.limit_reached": "⛔ Лимит внешних загрузок на сегодня исчерпан ({used} из {limit}). Попробуй завтра.",
+        "ext.vip_hint": "\n💎 VIP-пользователи могут использовать это до {vip_limit} раз в день и для файлов до {vip_volume}.",
+        "ext.too_big": "❌ Ни одно из качеств этого видео не укладывается в твой лимит внешней загрузки ({limit}).",
+        "ext.busy": "⏳ Сейчас выполняется несколько внешних загрузок; попробуй снова через несколько минут.",
+        "ext.start": "🌐 Внешняя загрузка началась.\nВыбранное качество: {quality}\nСначала файл скачивается на сервер, затем загружается в Google Диск.",
+        "ext.uploading": "⬆️ Загружаю в Google Диск...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ Итоговый размер файла ({volume}) превышает допустимый лимит ({limit}). Попробуй качество пониже.",
+        "ext.ready": "✅ Файл готов!\n📁 {name}\n📦 Размер: {volume}\n\n⏳ Ссылка действует {minutes} мин. (до {time}), после этого файл удаляется с диска.\nНажми кнопку ниже, чтобы начать загрузку.\n\n📊 Внешних загрузок сегодня: {used} из {limit}",
+        "ext.link_btn": "⬇️ Скачать",
+        "ext.expired": "⌛ Срок действия ссылки истёк, файл удалён. Чтобы получить его снова, отправь ссылку на видео ещё раз.",
+        "ext.failed": "❌ Внешняя загрузка не удалась:\n",
+    },
+    "es": {
+        "ig.login_wall": '❌ Instagram no deja que el bot vea esta publicación ahora mismo (se requiere inicio de sesión o hay un límite de velocidad). Inténtalo de nuevo en unos minutos; si se repite, avisa al administrador del bot.',
+        "ext.btn": "🌐 Descarga externa (enlace directo)",
+        "ext.unavailable": "❌ La descarga externa no está disponible ahora mismo.",
+        "ext.limit_reached": "⛔ Has agotado las descargas externas de hoy ({used} de {limit}). Inténtalo de nuevo mañana.",
+        "ext.vip_hint": "\n💎 Los usuarios VIP pueden usarla hasta {vip_limit} veces al día y hasta {vip_volume}.",
+        "ext.too_big": "❌ Ninguna de las calidades de este vídeo cabe en tu límite de descarga externa ({limit}).",
+        "ext.busy": "⏳ Hay varias descargas externas en curso; inténtalo de nuevo en unos minutos.",
+        "ext.start": "🌐 Descarga externa iniciada.\nCalidad elegida: {quality}\nPrimero se descarga en el servidor y luego se sube a Google Drive.",
+        "ext.uploading": "⬆️ Subiendo a Google Drive...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ El tamaño final del archivo ({volume}) supera el límite permitido ({limit}). Prueba con una calidad menor.",
+        "ext.ready": "✅ ¡Tu archivo está listo!\n📁 {name}\n📦 Tamaño: {volume}\n\n⏳ Este enlace es válido {minutes} minutos (hasta las {time}); después el archivo se elimina de Drive.\nPulsa el botón de abajo para iniciar la descarga.\n\n📊 Descargas externas hoy: {used} de {limit}",
+        "ext.link_btn": "⬇️ Descargar",
+        "ext.expired": "⌛ Este enlace ha caducado y el archivo se eliminó. Para obtenerlo de nuevo, envía otra vez el enlace del vídeo.",
+        "ext.failed": "❌ La descarga externa falló:\n",
+    },
+    "fr": {
+        "ig.login_wall": "❌ Instagram ne laisse pas le bot consulter cette publication pour le moment (connexion requise ou limite de débit). Réessaie dans quelques minutes ; si cela se répète, préviens l'administrateur du bot.",
+        "ext.btn": "🌐 Téléchargement externe (lien direct)",
+        "ext.unavailable": "❌ Le téléchargement externe n'est pas disponible pour le moment.",
+        "ext.limit_reached": "⛔ Tu as épuisé tes téléchargements externes du jour ({used} sur {limit}). Réessaie demain.",
+        "ext.vip_hint": "\n💎 Les utilisateurs VIP peuvent l'utiliser jusqu'à {vip_limit} fois par jour et jusqu'à {vip_volume}.",
+        "ext.too_big": "❌ Aucune des qualités de cette vidéo ne rentre dans ta limite de téléchargement externe ({limit}).",
+        "ext.busy": "⏳ Plusieurs téléchargements externes sont en cours ; réessaie dans quelques minutes.",
+        "ext.start": "🌐 Téléchargement externe lancé.\nQualité choisie : {quality}\nLe fichier est d'abord téléchargé sur le serveur, puis envoyé sur Google Drive.",
+        "ext.uploading": "⬆️ Envoi vers Google Drive...\n[{bar}] {percent:.0f}%\n{line2}",
+        "ext.too_big_after": "❌ La taille finale du fichier ({volume}) dépasse la limite autorisée ({limit}). Essaie une qualité inférieure.",
+        "ext.ready": "✅ Ton fichier est prêt !\n📁 {name}\n📦 Taille : {volume}\n\n⏳ Ce lien est valable {minutes} minutes (jusqu'à {time}) ; ensuite le fichier est supprimé du Drive.\nAppuie sur le bouton ci-dessous pour lancer le téléchargement.\n\n📊 Téléchargements externes aujourd'hui : {used} sur {limit}",
+        "ext.link_btn": "⬇️ Télécharger",
+        "ext.expired": "⌛ Ce lien a expiré et le fichier a été supprimé. Pour le récupérer, renvoie le lien de la vidéo.",
+        "ext.failed": "❌ Le téléchargement externe a échoué :\n",
+    },
+}
 
 
 LOCALES = _load_locales()
@@ -394,7 +496,39 @@ class InstagramAudienceRestricted(Exception):
         super().__init__(msg)
 
 
+class InstagramLoginWall(Exception):
+    """اینستاگرام درخواست رو به صفحه‌ی ورود فرستاده (محدودیت سرعت ناشناس، یا کوکی منقضی/باطل)."""
+
+    def __init__(self, had_cookies: bool):
+        self.had_cookies = had_cookies
+        super().__init__(T("ig.login_wall"))
+
+
 ALT_YOUTUBE_CLIENT = "android_vr"  # کلاینت جایگزین که معمولاً PO Token نمی‌خواد
+
+IG_LOGIN_WALL_SIGNS = (
+    "redirected to the login page", "anonymously", "login required", "you need to log in",
+    "log in to access", "use --cookies", "rate-limit", "rate limit",
+)
+_IG_WALL = {"count": 0, "had_cookies": False, "last_alert": 0.0}
+
+
+def _cookies_available() -> bool:
+    return bool(COOKIES_FILE and Path(COOKIES_FILE).exists())
+
+
+def _is_instagram_url(args) -> bool:
+    return bool(args) and isinstance(args[0], str) and "instagram.com" in args[0].lower()
+
+
+def _ig_login_wall(err_text: str) -> bool:
+    t = err_text.lower()
+    return "instagram" in t and any(sg in t for sg in IG_LOGIN_WALL_SIGNS)
+
+
+def _note_ig_login_wall(had_cookies: bool) -> None:
+    _IG_WALL["count"] += 1
+    _IG_WALL["had_cookies"] = had_cookies
 
 
 def _looks_like_bot_check(err_text: str) -> bool:
@@ -430,23 +564,31 @@ def _retry_audience_restricted_once(func, first_error, *args, **kwargs):
 
 def _run_with_cookie_fallback(func, *args, **kwargs):
     """
-    اول بدون کوکی و با کلاینت پیش‌فرض امتحان می‌کنه. اگه خطا «ثابت کن ربات
-    نیستی» یا ۴۰۳ بود، به ترتیب تلاش‌های بعدی رو انجام می‌ده:
-      ۱) با کوکی (اگه داریم)
-      ۲) بدون کوکی با کلاینت جایگزین یوتیوب (android_vr)
+    یوتیوب و بقیه: اول بدون کوکی و با کلاینت پیش‌فرض؛ اگه خطا «ثابت کن ربات نیستی» یا ۴۰۳ بود، به ترتیب
+    با کوکی (اگه داریم) و بعد بدون کوکی با کلاینت جایگزین (android_vr).
+    اینستاگرام: از سرور بدون ورود تقریباً همیشه محدود می‌شه، پس اگه کوکی داریم از همون اول با کوکی می‌ریم.
+    اگه اینستاگرام باز هم به صفحه‌ی ورود فرستاد (کوکی نیست/منقضی شده)، بدون تلاش بی‌فایده خطای روشن می‌دیم.
     برای هر خطای دیگه (لینک اشتباه، پست خصوصی و ...) مستقیم پرتاب می‌شه.
     """
+    ig = _is_instagram_url(args)
+    ig_cookies = ig and _cookies_available()
     try:
-        return func(*args, use_cookies=False, player_client=None, **kwargs)
+        return func(*args, use_cookies=ig_cookies, player_client=None, **kwargs)
     except Exception as first_error:
-        if _is_audience_restricted(str(first_error)):
+        text = str(first_error)
+        if _is_audience_restricted(text):
+            if ig_cookies:  # همین الان با حساب واردشده بودیم؛ اون حساب هم اجازه نداره
+                raise InstagramAudienceRestricted(had_session=True) from first_error
             return _retry_audience_restricted_once(func, first_error, *args, **kwargs)
-        if not _is_retryable(str(first_error)):
+        if ig and _ig_login_wall(text):
+            _note_ig_login_wall(ig_cookies)
+            raise InstagramLoginWall(had_cookies=ig_cookies) from first_error
+        if not _is_retryable(text):
             raise
         last_error = first_error
 
     steps = []
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+    if _cookies_available() and not ig_cookies:
         steps.append((True, None))
     steps.append((False, ALT_YOUTUBE_CLIENT))
 
@@ -1283,7 +1425,13 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
         info = await asyncio.to_thread(extract_info, url)
     except Exception as e:
         logger.exception("extract_info failed")
-        if isinstance(e, InstagramAudienceRestricted):
+        if isinstance(e, InstagramLoginWall):
+            err_text = str(e)
+            try:
+                await alert_admins_ig_problem(message.get_bot())
+            except Exception:
+                logger.exception("could not alert admins about the Instagram login wall")
+        elif isinstance(e, InstagramAudienceRestricted):
             err_text = str(e)
         else:
             err_text = (
@@ -1345,6 +1493,9 @@ async def show_quality_picker(message, chat_id: int, url: str, status_msg=None, 
     for o in options:
         cb_data = f"dl|{key}|{o['format_id']}|{o['kind']}"
         buttons.append([InlineKeyboardButton(o["label"], callback_data=cb_data)])
+
+    if await ext_offer(info, options):
+        buttons.append([InlineKeyboardButton(T("ext.btn"), callback_data=f"ext|{key}")])
 
     if offer_find_song:
         buttons.append([InlineKeyboardButton(T("show_quality_picker.5"), callback_data=f"song|{key}")])
@@ -1767,6 +1918,17 @@ CREATE TABLE IF NOT EXISTS vip_log (
     user_id INTEGER NOT NULL, days INTEGER NOT NULL, granted_by INTEGER,
     granted_at TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'admin'
+);
+CREATE TABLE IF NOT EXISTS external_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL, day TEXT NOT NULL,
+    drive_id TEXT NOT NULL, name TEXT, size_bytes INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    chat_id INTEGER, message_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS kv_store (
+    key TEXT PRIMARY KEY, value TEXT
 )
 """
 
@@ -1794,6 +1956,17 @@ CREATE TABLE IF NOT EXISTS vip_log (
     user_id BIGINT NOT NULL, days INTEGER NOT NULL, granted_by BIGINT,
     granted_at TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'admin'
+);
+CREATE TABLE IF NOT EXISTS external_files (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL, day TEXT NOT NULL,
+    drive_id TEXT NOT NULL, name TEXT, size_bytes BIGINT NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    chat_id BIGINT, message_id BIGINT
+);
+CREATE TABLE IF NOT EXISTS kv_store (
+    key TEXT PRIMARY KEY, value TEXT
 )
 """
 
@@ -1992,6 +2165,48 @@ class Database:
             )
 
         self.run(fn)
+
+    def count_external_today(self, user_id: int) -> int:
+        row = self.run(
+            lambda t: t.exec(
+                "SELECT COUNT(*) AS c FROM external_files WHERE user_id=? AND day=?", (user_id, today_key())
+            ).fetchone()
+        )
+        return int(row["c"]) if row else 0
+
+    def add_external_file(self, user_id: int, drive_id: str, name: str, size_bytes: int, expires_at_iso: str) -> int:
+        def fn(t):
+            return t.exec(
+                "INSERT INTO external_files(user_id, day, drive_id, name, size_bytes, created_at, expires_at)"
+                " VALUES (?,?,?,?,?,?,?) RETURNING id",
+                (user_id, today_key(), drive_id, name, size_bytes, to_iso(utcnow()), expires_at_iso),
+            ).fetchone()["id"]
+
+        return self.run(fn)
+
+    def set_external_message(self, ext_id: int, chat_id: int, message_id: int):
+        self.run(lambda t: t.exec(
+            "UPDATE external_files SET chat_id=?, message_id=? WHERE id=?", (chat_id, message_id, ext_id)))
+
+    def due_external_files(self, now_iso: str, limit: int = 50):
+        return self.run(lambda t: t.exec(
+            "SELECT * FROM external_files WHERE status='active' AND expires_at <= ? ORDER BY expires_at LIMIT ?",
+            (now_iso, limit)).fetchall())
+
+    def mark_external_deleted(self, ext_id: int):
+        self.run(lambda t: t.exec("UPDATE external_files SET status='deleted' WHERE id=?", (ext_id,)))
+
+    def kv_get(self, key: str):
+        row = self.run(lambda t: t.exec("SELECT value FROM kv_store WHERE key=?", (key,)).fetchone())
+        return row["value"] if row else None
+
+    def kv_set(self, key: str, value: str):
+        self.run(lambda t: t.exec(
+            "INSERT INTO kv_store(key, value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=excluded.value",
+            (key, value)))
+
+    def kv_delete(self, key: str):
+        self.run(lambda t: t.exec("DELETE FROM kv_store WHERE key=?", (key,)))
 
     def vip_until(self, user_id: int):
         """تاریخ پایان VIP اگه هنوز فعاله، وگرنه None."""
@@ -2551,6 +2766,12 @@ async def auto_vip_loop(application):
 async def post_init(application):
     """بعد از بالا اومدن ربات اجرا می‌شه: چک دوره‌ای VIP خودکار رو راه می‌اندازه."""
     application.bot_data["auto_vip_task"] = asyncio.create_task(auto_vip_loop(application))
+    application.bot_data["ext_cleanup_task"] = asyncio.create_task(external_cleanup_loop(application))
+    try:
+        if await asyncio.to_thread(load_cookies_from_db):
+            logger.info("cookies: loaded the cookie file stored by an admin")
+    except Exception:
+        logger.exception("loading stored cookies failed")
 
 
 async def admin_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -2843,6 +3064,621 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         PENDING.pop(key, None)
+
+
+def cookie_status_text() -> str:
+    """وضعیت فایل کوکی (بدون نمایش هیچ مقدار محرمانه‌ای)."""
+    if not _cookies_available():
+        return "🍪 فایل کوکی: وجود نداره."
+    cookies = {}
+    try:
+        with open(COOKIES_FILE, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[(parts[0].lstrip("."), parts[5])] = parts[4]
+    except Exception:
+        return "🍪 فایل کوکی خونده نشد."
+    ig = {n: e for (d, n), e in cookies.items() if d.endswith("instagram.com")}
+    google_ok = any(d.endswith(("youtube.com", "google.com")) and n in ("SID", "__Secure-1PSID", "LOGIN_INFO") for (d, n) in cookies)
+    lines = ["🍪 وضعیت کوکی:"]
+    if "sessionid" not in ig:
+        lines.append("• اینستاگرام: sessionid نیست ❌ (لاگین نیست)")
+    else:
+        try:
+            exp = int(float(ig["sessionid"] or 0))
+        except ValueError:
+            exp = 0
+        if exp and exp < time.time():
+            lines.append("• اینستاگرام: sessionid منقضی شده ❌")
+        elif exp:
+            lines.append(f"• اینستاگرام: sessionid هست (تا حدود {max(0, int((exp - time.time()) // 86400))} روز دیگه)")
+        else:
+            lines.append("• اینستاگرام: sessionid هست")
+    lines.append("• یوتیوب/گوگل: " + ("کوکی ورود هست" if google_ok else "کوکی ورود نیست"))
+    return "\n".join(lines)
+
+
+async def alert_admins_ig_problem(bot_):
+    """حداکثر ساعتی یه بار به مدیرها خبر می‌ده که اینستاگرام لینک‌ها رو رد می‌کنه."""
+    if time.time() - _IG_WALL["last_alert"] < 3600:
+        return
+    _IG_WALL["last_alert"] = time.time()
+    reason = (
+        "با این‌که کوکی داریم، اینستاگرام ما رو به صفحه‌ی ورود فرستاد؛ یعنی نشست کوکی باطل/منقضی شده."
+        if _IG_WALL["had_cookies"] else "کوکی اینستاگرام ست نیست، و بدون ورود اینستاگرام سرور رو محدود کرده."
+    )
+    text = (
+        "⚠️ اینستاگرام لینک‌ها رو برای ربات رد می‌کنه (ورود لازمه).\n" + reason + "\n\n" + cookie_status_text()
+        + "\n\nراه‌حل: کوکی تازه‌ی اینستاگرام (cookies.txt، فرمت Netscape) رو همین‌جا برای ربات بفرست."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot_.send_message(chat_id=admin_id, text=text)
+        except Exception:
+            pass
+
+
+def _cookie_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "ytdlp_cookies.txt")
+
+
+def load_cookies_from_db() -> bool:
+    """اگه مدیر قبلاً فایل کوکی فرستاده باشه، موقع بالا اومدن ربات همون استفاده می‌شه (جای متغیر محیطی)."""
+    global COOKIES_FILE
+    try:
+        text = get_db().kv_get("cookies_txt")
+    except Exception:
+        logger.exception("could not read stored cookies")
+        return False
+    if not text:
+        return False
+    path = _cookie_path()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    COOKIES_FILE = path
+    return True
+
+
+def _looks_like_cookie_file(text: str) -> bool:
+    if "# Netscape HTTP Cookie File" in text:
+        return True
+    return any(
+        len(ln.split("\t")) >= 7 and ("instagram.com" in ln or "youtube.com" in ln or "google.com" in ln)
+        for ln in text.splitlines()
+    )
+
+
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        cookie_status_text()
+        + "\n\nبرای عوض کردن کوکی، فایل cookies.txt (فرمت Netscape) رو همین‌جا برای ربات بفرست؛ "
+        "همون لحظه فعال می‌شه و پیام فایل هم پاک می‌شه.\n"
+        "نکته: برای اینستاگرام از یه حساب جداگانه استفاده کن، نه حساب اصلی‌ت."
+    )
+
+
+async def cookies_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فایل کوکی که مدیر می‌فرسته رو ذخیره و فعال می‌کنه (فقط مدیر؛ بقیه‌ی فایل‌ها نادیده گرفته می‌شن)."""
+    global COOKIES_FILE
+    user = update.effective_user
+    doc = update.message.document
+    if not user or not is_admin(user.id) or not doc or (doc.file_size or 0) > 1_000_000:
+        return
+    try:
+        tg_file = await doc.get_file()
+        text = bytes(await tg_file.download_as_bytearray()).decode("utf-8", errors="ignore")
+    except Exception:
+        return
+    if not _looks_like_cookie_file(text):
+        return
+    if "sessionid" not in text and "SID" not in text:
+        await update.message.reply_text("❌ این فایل کوکیِ ورود نداره (نه sessionid اینستاگرام، نه SID گوگل). بعد از لاگین دوباره export بگیر.")
+        return
+    await asyncio.to_thread(get_db().kv_set, "cookies_txt", text)
+    path = _cookie_path()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    COOKIES_FILE = path
+    _IG_WALL["last_alert"] = 0.0
+    await update.message.reply_text("✅ کوکی جدید ذخیره و فعال شد.\n" + cookie_status_text())
+    try:
+        await update.message.delete()  # فایل کوکی توی چت نمونه
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------
+# دانلود خارجی (گوگل درایو): ویدیوهای بلند/سنگین رو آپلود می‌کنه و یه لینک مستقیمِ موقت می‌ده
+# ------------------------------------------------------------------
+import mimetypes
+
+GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "").strip()
+GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "").strip()
+GDRIVE_ENV_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()  # اختیاری؛ وگرنه با /gdrive تو دیتابیس ذخیره می‌شه
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()  # اختیاری: پوشه‌ی مقصد
+GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"  # فقط فایل‌هایی که خود ربات می‌سازه
+GDRIVE_TOKEN_URL = os.environ.get("GDRIVE_TOKEN_URL", "https://oauth2.googleapis.com/token")
+GDRIVE_DEVICE_URL = os.environ.get("GDRIVE_DEVICE_URL", "https://oauth2.googleapis.com/device/code")
+GDRIVE_API = os.environ.get("GDRIVE_API_BASE", "https://www.googleapis.com")
+
+# قانون‌ها (همه با متغیر محیطی قابل تغییرن)
+EXT_MIN_DURATION_SECONDS = int(os.environ.get("EXT_MIN_DURATION_SECONDS", "600"))  # دکمه فقط برای ویدیوی بیشتر از ۱۰ دقیقه
+EXT_MIN_SIZE_MB = int(os.environ.get("EXT_MIN_SIZE_MB", "100"))                    # ... و حجم زیاد
+EXT_NORMAL_MB = int(os.environ.get("EXT_NORMAL_MB", "800"))        # کاربر عادی: تا ۸۰۰ مگ
+EXT_NORMAL_TOL_MB = int(os.environ.get("EXT_NORMAL_TOL_MB", "10"))  # ... و تا ۸۱۰ مگ اشکالی نداره
+EXT_VIP_MB = int(os.environ.get("EXT_VIP_MB", "1500"))             # VIP: ۱ گیگ و ۵۰۰ مگ
+EXT_VIP_TOL_MB = int(os.environ.get("EXT_VIP_TOL_MB", "100"))      # ... و تا ۱۶۰۰ مگ اشکالی نداره
+EXT_NORMAL_MINUTES = int(os.environ.get("EXT_NORMAL_MINUTES", "15"))  # مهلت دانلود لینک
+EXT_VIP_MINUTES = int(os.environ.get("EXT_VIP_MINUTES", "30"))
+EXT_NORMAL_DAILY = int(os.environ.get("EXT_NORMAL_DAILY", "2"))    # تعداد در روز
+EXT_VIP_DAILY = int(os.environ.get("EXT_VIP_DAILY", "10"))
+EXT_MAX_CONCURRENT = int(os.environ.get("EXT_MAX_CONCURRENT", "2"))  # همزمانی کل (حفاظت از دیسک/CPU سرور)
+EXT_CLEANUP_SECONDS = 30
+
+
+class GDriveError(Exception):
+    pass
+
+
+_gd_lock = threading.Lock()
+_gd_token = {"value": None, "exp": 0.0}
+_ext_active = set()
+_gdrive_flow_running = False
+
+
+def _gd_err(resp) -> str:
+    """متن کوتاهِ خطا؛ هیچ توکنی داخلش نیست."""
+    try:
+        j = resp.json()
+        err = j.get("error")
+        if isinstance(err, dict):
+            err = err.get("message") or err.get("status")
+        return f"HTTP {resp.status_code} {str(err or j.get('error_description') or '')[:100]}".strip()
+    except Exception:
+        return f"HTTP {resp.status_code}"
+
+
+def gdrive_refresh_token() -> str:
+    if GDRIVE_ENV_REFRESH_TOKEN:
+        return GDRIVE_ENV_REFRESH_TOKEN
+    try:
+        return get_db().kv_get("gdrive_refresh_token") or ""
+    except Exception:
+        return ""
+
+
+def gdrive_ready() -> bool:
+    return bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and gdrive_refresh_token())
+
+
+def gdrive_access_token(force: bool = False) -> str:
+    with _gd_lock:
+        if not force and _gd_token["value"] and time.time() < _gd_token["exp"] - 60:
+            return _gd_token["value"]
+        refresh = gdrive_refresh_token()
+        if not refresh:
+            raise GDriveError("Google Drive is not connected")
+        r = requests.post(
+            GDRIVE_TOKEN_URL,
+            data={
+                "client_id": GDRIVE_CLIENT_ID, "client_secret": GDRIVE_CLIENT_SECRET,
+                "refresh_token": refresh, "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise GDriveError("token refresh failed: " + _gd_err(r))
+        j = r.json()
+        _gd_token["value"] = j["access_token"]
+        _gd_token["exp"] = time.time() + int(j.get("expires_in", 3600))
+        return _gd_token["value"]
+
+
+def _gd_call(method: str, url: str, **kw):
+    timeout = kw.pop("timeout", 60)
+    base_headers = kw.pop("headers", None) or {}
+    r = None
+    for attempt in (1, 2):
+        headers = dict(base_headers)
+        headers["Authorization"] = "Bearer " + gdrive_access_token(force=(attempt == 2))
+        r = requests.request(method, url, headers=headers, timeout=timeout, **kw)
+        if r.status_code != 401:
+            break
+    return r
+
+
+def _next_offset(resp) -> int:
+    rng = resp.headers.get("Range") or ""
+    m = re.search(r"bytes=0-(\d+)", rng)
+    return int(m.group(1)) + 1 if m else 0
+
+
+def gdrive_upload(path: str, name: str, progress=None) -> str:
+    """آپلود قابل‌ازسرگیری (resumable) تکه‌تکه؛ شناسه‌ی فایل رو برمی‌گردونه."""
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise GDriveError("empty file")
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    meta = {"name": name}
+    if GDRIVE_FOLDER_ID:
+        meta["parents"] = [GDRIVE_FOLDER_ID]
+    r = _gd_call(
+        "POST", f"{GDRIVE_API}/upload/drive/v3/files?uploadType=resumable&fields=id", json=meta,
+        headers={"X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(size)},
+    )
+    if r.status_code != 200 or not r.headers.get("Location"):
+        raise GDriveError("could not start upload: " + _gd_err(r))
+    session = r.headers["Location"]
+    chunk = 16 * 1024 * 1024  # مضرب ۲۵۶ کیلوبایت
+    offset, fails = 0, 0
+    with open(path, "rb") as fh:
+        while True:
+            fh.seek(offset)
+            data = fh.read(min(chunk, size - offset))
+            end = offset + len(data) - 1
+            try:
+                resp = requests.put(
+                    session, data=data, timeout=300,
+                    headers={"Content-Range": f"bytes {offset}-{end}/{size}"},
+                )
+            except requests.RequestException:
+                resp = None
+            if resp is not None and resp.status_code in (200, 201):
+                if progress:
+                    progress(size, size)
+                return resp.json()["id"]
+            if resp is not None and resp.status_code == 308:
+                offset, fails = _next_offset(resp), 0
+                if progress:
+                    progress(offset, size)
+                continue
+            fails += 1
+            retryable = resp is None or resp.status_code in (408, 429, 500, 502, 503, 504)
+            if fails > 5 or not retryable:
+                raise GDriveError("upload failed: " + (_gd_err(resp) if resp is not None else "network error"))
+            time.sleep(min(2 ** fails, 30))
+            try:  # از سرور بپرس تا کجا رسیده
+                st = requests.put(session, headers={"Content-Range": f"bytes */{size}"}, data=b"", timeout=60)
+                if st.status_code in (200, 201):
+                    return st.json()["id"]
+                if st.status_code == 308:
+                    offset = _next_offset(st)
+            except requests.RequestException:
+                pass
+
+
+def gdrive_share_public(file_id: str) -> None:
+    r = _gd_call("POST", f"{GDRIVE_API}/drive/v3/files/{file_id}/permissions", json={"role": "reader", "type": "anyone"})
+    if r.status_code not in (200, 201):
+        raise GDriveError("could not share file: " + _gd_err(r))
+
+
+def gdrive_delete(file_id: str) -> bool:
+    """حذف دائمی (بدون سطل زباله)؛ ۴۰۴ یعنی قبلاً پاک شده."""
+    r = _gd_call("DELETE", f"{GDRIVE_API}/drive/v3/files/{file_id}")
+    if r.status_code in (200, 204, 404):
+        return True
+    raise GDriveError("could not delete file: " + _gd_err(r))
+
+
+def gdrive_direct_link(file_id: str) -> str:
+    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+
+
+def ext_tier(user_id: int) -> dict:
+    """سقف‌ها و مهلت‌ها بر اساس نوع کاربر (مدیر مثل VIP ولی بدون سقف روزانه)."""
+    if user_is_vip(user_id):
+        return {
+            "vip": True, "limit": EXT_VIP_MB * MB, "hard": (EXT_VIP_MB + EXT_VIP_TOL_MB) * MB,
+            "minutes": EXT_VIP_MINUTES, "daily": None if is_admin(user_id) else EXT_VIP_DAILY,
+        }
+    return {
+        "vip": False, "limit": EXT_NORMAL_MB * MB, "hard": (EXT_NORMAL_MB + EXT_NORMAL_TOL_MB) * MB,
+        "minutes": EXT_NORMAL_MINUTES, "daily": EXT_NORMAL_DAILY,
+    }
+
+
+def ext_pick_option(options, hard_bytes: int):
+    """بهترین کیفیتی که تو سقف جا می‌شه؛ اگه حجم هیچ‌کدوم معلوم نیست، کمترین کیفیت (بعداً حجم واقعی چک می‌شه)."""
+    video = [o for o in options if o.get("kind") == "video"]
+    fits = [o for o in video if o.get("size") and o["size"] <= hard_bytes]
+    if fits:
+        return fits[0]
+    unknown = [o for o in video if not o.get("size")]
+    return unknown[-1] if unknown else None
+
+
+async def ext_offer(info: dict, options) -> bool:
+    """دکمه‌ی «دانلود خارجی» فقط برای ویدیوی بلند و سنگین، و فقط وقتی درایو وصله."""
+    if (info.get("duration") or 0) < EXT_MIN_DURATION_SECONDS:
+        return False
+    sizes = [o["size"] for o in options if o.get("kind") == "video" and o.get("size")]
+    if sizes and max(sizes) < EXT_MIN_SIZE_MB * MB:
+        return False
+    return await asyncio.to_thread(gdrive_ready)
+
+
+class UploadState:
+    def __init__(self, total: int):
+        self.total = total
+        self.sent = 0
+        self.started = time.monotonic()
+
+    def update(self, sent: int, total: int):
+        self.sent, self.total = sent, total
+
+    def percent(self) -> float:
+        return self.sent / self.total * 100 if self.total else 0.0
+
+    def render(self) -> str:
+        elapsed = max(time.monotonic() - self.started, 0.001)
+        speed = self.sent / elapsed
+        line2 = f"{format_size(self.sent) or '0KB'} / {format_size(self.total)}"
+        if self.sent and speed:
+            line2 += f"  •  {format_size(speed)}/s"
+        return T("ext.uploading", bar=make_progress_bar(self.percent()), percent=self.percent(), line2=line2)
+
+
+async def run_upload_progress(query, state: UploadState, stop_event: asyncio.Event):
+    last = -100.0
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=PROGRESS_UPDATE_INTERVAL * 2)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        if abs(state.percent() - last) < 4:
+            continue
+        last = state.percent()
+        await set_status(query, state.render())
+
+
+async def handle_external_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    try:
+        _, key = query.data.split("|", 1)
+    except ValueError:
+        await query.answer()
+        return
+    entry = PENDING.get(key)
+    if not entry:
+        await query.answer(T("handle_quality_choice.2"), show_alert=True)
+        return
+    if not await asyncio.to_thread(gdrive_ready):
+        await query.answer(T("ext.unavailable"), show_alert=True)
+        return
+
+    db_ = get_db()
+    tier = ext_tier(uid)
+    used = await asyncio.to_thread(db_.count_external_today, uid)
+    vip_hint = "" if tier["vip"] else T(
+        "ext.vip_hint", vip_limit=EXT_VIP_DAILY, vip_volume=format_volume(EXT_VIP_MB * MB)
+    )
+    if tier["daily"] is not None and used >= tier["daily"]:
+        await query.answer()
+        await query.message.reply_text(T("ext.limit_reached", used=used, limit=tier["daily"]) + vip_hint)
+        return
+    if uid in _ext_active or len(_ext_active) >= EXT_MAX_CONCURRENT:
+        await query.answer(T("ext.busy"), show_alert=True)
+        return
+    remaining = cooldown_remaining(_last_job_at, uid)
+    if remaining:
+        await query.answer(T("job_allowed.2", remaining=remaining), show_alert=True)
+        return
+    opt = ext_pick_option(list(entry.get("options", {}).values()), tier["hard"])
+    if not opt:
+        _last_job_at.pop(uid, None)
+        await query.answer()
+        await query.message.reply_text(T("ext.too_big", limit=format_volume(tier["limit"])) + vip_hint)
+        return
+
+    await query.answer()
+    _ext_active.add(uid)
+    tmp_dir = tempfile.mkdtemp(prefix="ext_")
+    drive_id = None
+    ok = False
+    try:
+        state = ProgressState()
+        await set_status(query, T("ext.start", quality=opt["label"]))
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(run_progress_updates(query, state, stop_event))
+        try:
+            file_path = await asyncio.to_thread(download_media, entry["url"], opt["format_id"], "video", tmp_dir, state)
+        finally:
+            stop_event.set()
+            await progress_task
+
+        size = os.path.getsize(file_path)
+        if size > tier["hard"]:
+            await set_status(query, T("ext.too_big_after", volume=format_volume(size), limit=format_volume(tier["limit"])))
+            _last_job_at.pop(uid, None)
+            return
+
+        name = os.path.basename(file_path)
+        up = UploadState(size)
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(run_upload_progress(query, up, stop_event))
+        try:
+            drive_id = await asyncio.to_thread(gdrive_upload, file_path, name, up.update)
+        finally:
+            stop_event.set()
+            await progress_task
+        await asyncio.to_thread(gdrive_share_public, drive_id)
+
+        expires = utcnow() + timedelta(minutes=tier["minutes"])
+        ext_id = await asyncio.to_thread(db_.add_external_file, uid, drive_id, name, size, to_iso(expires))
+        ok = True  # از اینجا به بعد پاک‌کردن فایل با کار دوره‌ای انجام می‌شه
+        text = T(
+            "ext.ready", name=name[:80], volume=format_volume(size), minutes=tier["minutes"],
+            time=to_local(expires).strftime("%H:%M"), used=used + 1,
+            limit=tier["daily"] if tier["daily"] is not None else "∞",
+        )
+        sent = await query.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(T("ext.link_btn"), url=gdrive_direct_link(drive_id))]])
+        )
+        try:
+            await asyncio.to_thread(db_.set_external_message, ext_id, sent.chat_id, sent.message_id)
+        except Exception:
+            logger.exception("could not store external message id")
+        record_download(uid)
+        await cleanup_after_send(context, query, entry.get("user_msg_id"))
+        PENDING.pop(key, None)
+    except Exception as e:
+        logger.exception("external download failed")
+        _last_job_at.pop(uid, None)
+        if drive_id and not ok:
+            try:
+                await asyncio.to_thread(gdrive_delete, drive_id)
+            except Exception:
+                logger.warning("could not remove a partially shared drive file")
+        await set_status(query, T("ext.failed") + str(e)[:300])
+    finally:
+        _ext_active.discard(uid)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def run_external_cleanup(bot_) -> int:
+    """فایل‌های منقضی‌شده رو از درایو پاک می‌کنه و پیام لینک رو به «منقضی شد» تبدیل می‌کنه."""
+    if not await asyncio.to_thread(gdrive_ready):
+        return 0
+    db_ = get_db()
+    rows = await asyncio.to_thread(db_.due_external_files, to_iso(utcnow()))
+    done = 0
+    for row in rows:
+        try:
+            await asyncio.to_thread(gdrive_delete, row["drive_id"])
+        except Exception as e:
+            logger.warning("drive cleanup failed for #%s (%s); will retry", row["id"], str(e)[:120])
+            continue
+        await asyncio.to_thread(db_.mark_external_deleted, row["id"])
+        done += 1
+        if row["chat_id"] and row["message_id"]:
+            try:
+                urow = await asyncio.to_thread(db_.get_user, row["user_id"])
+                with lang_scope(urow["lang"] if urow else None):
+                    text = T("ext.expired")
+                await bot_.edit_message_text(chat_id=row["chat_id"], message_id=row["message_id"], text=text)
+            except Exception:
+                pass
+    return done
+
+
+async def external_cleanup_loop(application):
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await run_external_cleanup(application.bot)
+        except Exception:
+            logger.exception("external cleanup failed")
+        await asyncio.sleep(EXT_CLEANUP_SECONDS)
+
+
+def gdrive_device_start() -> dict:
+    r = requests.post(GDRIVE_DEVICE_URL, data={"client_id": GDRIVE_CLIENT_ID, "scope": GDRIVE_SCOPE}, timeout=30)
+    if r.status_code != 200:
+        raise GDriveError("device code request failed: " + _gd_err(r))
+    return r.json()
+
+
+def gdrive_device_poll(device_code: str):
+    r = requests.post(
+        GDRIVE_TOKEN_URL,
+        data={
+            "client_id": GDRIVE_CLIENT_ID, "client_secret": GDRIVE_CLIENT_SECRET,
+            "device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        },
+        timeout=30,
+    )
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {}
+
+
+async def _gdrive_device_flow(bot_, chat_id: int):
+    global _gdrive_flow_running
+    _gdrive_flow_running = True
+    try:
+        j = await asyncio.to_thread(gdrive_device_start)
+        wait_min = max(1, int(j.get("expires_in", 900)) // 60)
+        await bot_.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔗 وصل کردن گوگل درایو\n\n"
+                f"1) این لینک رو باز کن: {j.get('verification_url') or j.get('verification_uri')}\n"
+                f"2) این کد رو وارد کن: {j['user_code']}\n"
+                "3) با حساب گوگلی که می‌خوای فایل‌ها توش ذخیره بشه وارد شو و اجازه بده.\n\n"
+                f"منتظر تأیید تو هستم (تا {wait_min} دقیقه)..."
+            ),
+        )
+        deadline = time.monotonic() + int(j.get("expires_in", 900))
+        interval = int(j.get("interval", 5))
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            status, data = await asyncio.to_thread(gdrive_device_poll, j["device_code"])
+            if status == 200 and data.get("refresh_token"):
+                await asyncio.to_thread(get_db().kv_set, "gdrive_refresh_token", data["refresh_token"])
+                with _gd_lock:
+                    _gd_token["value"], _gd_token["exp"] = None, 0.0
+                await bot_.send_message(chat_id=chat_id, text="✅ گوگل درایو وصل شد؛ دانلود خارجی الان فعاله.")
+                return
+            err = data.get("error")
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                interval += 5
+                continue
+            await bot_.send_message(chat_id=chat_id, text=f"❌ وصل شدن انجام نشد ({err or status}). دوباره /gdrive رو بزن.")
+            return
+        await bot_.send_message(chat_id=chat_id, text="⌛ مهلت وارد کردن کد تموم شد. دوباره /gdrive رو بزن.")
+    except Exception as e:
+        logger.exception("gdrive device flow failed")
+        try:
+            await bot_.send_message(chat_id=chat_id, text="❌ خطا در وصل کردن گوگل درایو: " + str(e)[:200])
+        except Exception:
+            pass
+    finally:
+        _gdrive_flow_running = False
+
+
+async def gdrive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فقط مدیر: /gdrive وضعیت یا شروع وصل کردن؛ /gdrive reset قطع اتصال."""
+    if not is_admin(update.effective_user.id):
+        return
+    msg = update.message
+    if not (GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET):
+        await msg.reply_text(
+            "❌ اول دو متغیر GDRIVE_CLIENT_ID و GDRIVE_CLIENT_SECRET رو توی Variables ریلوی بذار "
+            "(از Google Cloud Console، نوع OAuth client: «TVs and Limited Input devices»)، بعد دوباره /gdrive رو بزن."
+        )
+        return
+    if context.args and context.args[0].lower() == "reset":
+        await asyncio.to_thread(get_db().kv_delete, "gdrive_refresh_token")
+        with _gd_lock:
+            _gd_token["value"], _gd_token["exp"] = None, 0.0
+        await msg.reply_text("🔌 اتصال گوگل درایو قطع شد. برای وصل دوباره /gdrive رو بزن.")
+        return
+    if await asyncio.to_thread(gdrive_ready):
+        try:
+            await asyncio.to_thread(gdrive_access_token, True)
+            await msg.reply_text("✅ گوگل درایو وصله و دانلود خارجی فعاله.\nبرای قطع و وصل دوباره: /gdrive reset")
+        except Exception as e:
+            await msg.reply_text(f"⚠️ توکن درایو کار نمی‌کنه ({str(e)[:150]}). /gdrive reset بزن و دوباره وصل کن.")
+        return
+    if _gdrive_flow_running:
+        await msg.reply_text("⏳ یه وصل‌کردنِ قبلی هنوز منتظر تأییده؛ کدی که فرستادم رو وارد کن.")
+        return
+    asyncio.create_task(_gdrive_device_flow(context.bot, msg.chat_id))
 
 
 async def deliver_song(query, context, chat_id: int, url: str, title: str, artist: str = None, user_msg_id=None):
@@ -3450,6 +4286,10 @@ def main():
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl\|"))
+    app.add_handler(CallbackQueryHandler(handle_external_download, pattern=r"^ext\|"))
+    app.add_handler(CommandHandler("gdrive", gdrive_command))
+    app.add_handler(CommandHandler("cookies", cookies_command))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, cookies_document), group=1)
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm\|"))
     app.add_handler(CallbackQueryHandler(admin_days_callback, pattern=r"^admd\|"))
     app.add_handler(CallbackQueryHandler(handle_find_song, pattern=r"^song\|"))
